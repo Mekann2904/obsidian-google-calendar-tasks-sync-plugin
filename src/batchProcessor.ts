@@ -1,11 +1,11 @@
 import { Notice } from 'obsidian';
 import { calendar_v3 } from 'googleapis';
-import { BatchRequestItem, BatchResponseItem } from './types';
+import { BatchRequestItem, BatchResponseItem, GoogleCalendarTasksSyncSettings } from './types';
 
 export class BatchProcessor {
-    private readonly BATCH_SIZE = 1000;
+    private readonly BATCH_SIZE = 100;
 
-    constructor(private calendarId: string) {}
+    constructor(private calendarId: string, private settings: GoogleCalendarTasksSyncSettings) {}
 
     async executeBatches(
         batchRequests: BatchRequestItem[],
@@ -23,19 +23,25 @@ export class BatchProcessor {
         const totalBatches = Math.ceil(batchRequests.length / this.BATCH_SIZE);
 
         if (batchRequests.length === 0) {
-            new Notice('変更なし。', 2000);
+            if (this.settings.showNotices) {
+                new Notice('変更なし。', 2000);
+            }
             return { results: [], created, updated, deleted, errors, skipped };
         }
 
         console.log(`${batchRequests.length} 件を ${totalBatches} バッチで実行`);
-        new Notice('Google に変更を送信中...', 3000);
+        if (this.settings.showNotices) {
+            new Notice('Google に変更を送信中...', 3000);
+        }
         console.time("BatchProcessor: Execute All Batches");
 
         for (let i = 0; i < batchRequests.length; i += this.BATCH_SIZE) {
             const batchChunk = batchRequests.slice(i, i + this.BATCH_SIZE);
             const batchIndex = Math.floor(i / this.BATCH_SIZE) + 1;
             console.log(`バッチ ${batchIndex}/${totalBatches} 実行`);
-            new Notice(`バッチ ${batchIndex}/${totalBatches} を送信中...`, 2000);
+            if (this.settings.showNotices) {
+                new Notice(`バッチ ${batchIndex}/${totalBatches} を送信中...`, 2000);
+            }
 
             try {
                 console.time(`BatchProcessor: Execute Batch ${batchIndex}`);
@@ -81,7 +87,9 @@ export class BatchProcessor {
                 body: { error: { message: error.message || '不明なエラー' } } 
             }));
             allResults.push(...fake);
-            new Notice(`バッチでエラー発生。コンソールを確認してください。`, 10000);
+            if (this.settings.showNotices) {
+                new Notice(`バッチでエラー発生。コンソールを確認してください。`, 10000);
+            }
             return batchChunk.length;
         }
     }

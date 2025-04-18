@@ -11,7 +11,7 @@ export class SyncLogic {
 
     constructor(plugin: GoogleCalendarTasksSyncPlugin) {
         this.plugin = plugin;
-        this.batchProcessor = new BatchProcessor(plugin.settings.calendarId);
+        this.batchProcessor = new BatchProcessor(plugin.settings.calendarId, plugin.settings);
     }
 
     /**
@@ -47,7 +47,10 @@ export class SyncLogic {
         }
 
         console.log(`カレンダー ID: ${this.plugin.settings.calendarId} と同期を開始`);
-        new Notice('同期を開始しました...', 3000);
+        const isManualSync = !this.plugin.settings.autoSync;
+        if (isManualSync && this.plugin.settings.syncNoticeSettings.showManualSyncProgress) {
+            new Notice('同期を開始しました...', 3000);
+        }
 
         let createdCount = 0, updatedCount = 0, deletedCount = 0, skippedCount = 0, errorCount = 0;
         const batchRequests: BatchRequestItem[] = [];
@@ -57,20 +60,26 @@ export class SyncLogic {
 
         try {
             // 1. Obsidian タスク取得
-            new Notice('Obsidian タスクを取得中...', 2000);
+            if (isManualSync && this.plugin.settings.syncNoticeSettings.showManualSyncProgress) {
+                new Notice('Obsidian タスクを取得中...', 2000);
+            }
             console.time("Sync: Fetch Obsidian Tasks");
             const obsidianTasks = await this.plugin.taskParser.getObsidianTasks();
             console.timeEnd("Sync: Fetch Obsidian Tasks");
 
             // 2. Google Calendar イベント取得
-            new Notice('GCal イベントを取得中...', 2000);
+            if (isManualSync && this.plugin.settings.syncNoticeSettings.showManualSyncProgress) {
+                new Notice('GCal イベントを取得中...', 2000);
+            }
             console.time("Sync: Fetch GCal Events");
             existingEvents = await this.plugin.gcalApi.fetchGoogleCalendarEvents();
             googleEventMap = this.mapGoogleEvents(existingEvents, taskMap);
             console.timeEnd("Sync: Fetch GCal Events");
 
             // 3. 作成/更新/キャンセル準備
-            new Notice(`${obsidianTasks.length} 件のタスクを処理中...`, 3000);
+            if (isManualSync && this.plugin.settings.syncNoticeSettings.showManualSyncProgress) {
+                new Notice(`${obsidianTasks.length} 件のタスクを処理中...`, 3000);
+            }
             console.time("Sync: Prepare Batch Requests");
             const { currentObsidianTaskIds, skipped } = this.prepareBatchRequests(
                 obsidianTasks, googleEventMap, taskMap, batchRequests
@@ -113,7 +122,7 @@ export class SyncLogic {
                         delete taskMap[req.obsidianTaskId];
                     }
                 });
-            } else {
+            } else if (isManualSync && this.plugin.settings.syncNoticeSettings.showManualSyncProgress) {
                 new Notice('変更なし。', 2000);
             }
 
@@ -124,8 +133,15 @@ export class SyncLogic {
             await this.plugin.saveData(this.plugin.settings);
 
             const durationSeconds = DateUtils.formatDuration(syncStartTime, syncEndTime);
-            new Notice(`同期完了 (${durationSeconds.toFixed(1)}秒): ${createdCount}追加, ${updatedCount}更新, ${deletedCount}削除, ${skippedCount}スキップ, ${errorCount}エラー`,
-                errorCount ? 15000 : 7000);
+            const shouldShowSummary = 
+                (isManualSync && this.plugin.settings.syncNoticeSettings.showManualSyncProgress) ||
+                (!isManualSync && this.plugin.settings.syncNoticeSettings.showAutoSyncSummary && 
+                 durationSeconds >= this.plugin.settings.syncNoticeSettings.minSyncDurationForNotice);
+            
+			if (shouldShowSummary || (errorCount > 0 && this.plugin.settings.syncNoticeSettings.showErrors)) {
+				new Notice(`同期完了 (${durationSeconds.toFixed(1)}秒): ${createdCount}追加, ${updatedCount}更新, ${deletedCount}削除, ${skippedCount}スキップ, ${errorCount}エラー`,
+					errorCount ? 15000 : 7000);
+            }
         } catch (fatal) {
             console.error('致命的エラー:', fatal);
             new Notice('同期中に致命的エラー発生。コンソールを確認してください。', 15000);

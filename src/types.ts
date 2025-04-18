@@ -40,6 +40,13 @@ export interface GoogleCalendarTasksSyncSettings {
 	defaultEventDurationMinutes: number; // 開始時刻と終了時刻が指定されているが、終了が開始より前の場合に使用するデフォルトのイベント時間 (分)
 	useLoopbackServer: boolean; // 認証にローカルループバックサーバーを使用するか (現在はこの方法のみサポート)
 	loopbackPort: number; // ローカルループバックサーバーが使用するポート番号
+	showNotices: boolean; // 全通知のマスタースイッチ
+	syncNoticeSettings: {
+		showManualSyncProgress: boolean; // 手動同期の進捗表示
+		showAutoSyncSummary: boolean; // 自動同期の要約のみ表示
+		showErrors: boolean; // エラー通知を表示するか
+		minSyncDurationForNotice: number; // 通知を表示する最小同期時間（秒）
+	};
 }
 
 // バッチリクエスト用のインターフェース

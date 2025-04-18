@@ -19,6 +19,13 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 	defaultEventDurationMinutes: 60,
 	useLoopbackServer: true, // 常に true
 	loopbackPort: 3000, // デフォルトポート
+	showNotices: true, // 通知を表示するかどうか
+	syncNoticeSettings: {
+		showManualSyncProgress: true, // 手動同期の進捗表示
+		showAutoSyncSummary: true, // 自動同期の要約のみ表示
+		showErrors: true, // エラー通知を表示するか
+		minSyncDurationForNotice: 10, // 通知を表示する最小同期時間（秒）
+	},
 };
 
 
@@ -290,6 +297,69 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 					this.plugin.settings.syncScheduledDateToDescription = value;
 					await this.plugin.saveData(this.plugin.settings); // saveData で十分
 				}));
+
+		// --- 通知設定セクション ---
+		containerEl.createEl('h3', { text: '通知設定' });
+		// 通知表示トグル
+		new Setting(containerEl)
+			.setName('処理完了通知を表示')
+			.setDesc('バッチ処理完了などの通知を表示するかどうか')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.showNotices)
+				.onChange(async (value) => {
+					this.plugin.settings.showNotices = value;
+					await this.plugin.saveData(this.plugin.settings);
+				}));
+
+		// --- 同期通知設定セクション ---
+		containerEl.createEl('h4', { text: '同期通知設定' });
+		// 手動同期進捗表示
+		new Setting(containerEl)
+			.setName('手動同期の進捗を表示')
+			.setDesc('手動同期時の進捗通知と「変更なし」通知を表示するかどうか')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.syncNoticeSettings.showManualSyncProgress)
+				.onChange(async (value) => {
+					this.plugin.settings.syncNoticeSettings.showManualSyncProgress = value;
+					await this.plugin.saveData(this.plugin.settings);
+				}));
+		// 自動同期要約表示
+		new Setting(containerEl)
+			.setName('自動同期の要約を表示')
+			.setDesc('自動同期完了時の要約通知を表示するかどうか')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.syncNoticeSettings.showAutoSyncSummary)
+				.onChange(async (value) => {
+					this.plugin.settings.syncNoticeSettings.showAutoSyncSummary = value;
+					await this.plugin.saveData(this.plugin.settings);
+				}));
+		// エラー通知表示
+		new Setting(containerEl)
+			.setName('エラー通知を表示')
+			.setDesc('同期エラー発生時の通知を表示するかどうか')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.syncNoticeSettings.showErrors)
+				.onChange(async (value) => {
+					this.plugin.settings.syncNoticeSettings.showErrors = value;
+					await this.plugin.saveData(this.plugin.settings);
+				}));
+
+		// 通知表示最小時間
+		new Setting(containerEl)
+			.setName('通知表示最小時間 (秒)')
+			.setDesc('同期時間がこの値以上の場合のみ通知を表示')
+			.addText(text => {
+				text.inputEl.type = 'number';
+				text.inputEl.min = '0';
+				text.setValue(this.plugin.settings.syncNoticeSettings.minSyncDurationForNotice.toString())
+					.onChange(async (value) => {
+						const num = parseInt(value, 10);
+            if (!isNaN(num)) {
+                this.plugin.settings.syncNoticeSettings.minSyncDurationForNotice = num;
+                await this.plugin.saveData(this.plugin.settings);
+            }
+					});
+			});
 
 		// --- 手動アクション & デバッグセクション ---
 		containerEl.createEl('h3', { text: '手動アクション & デバッグ' });
