@@ -67,3 +67,23 @@ export interface BatchResponseItem {
 	headers?: { [key: string]: string }; // 個別リクエストのレスポンスヘッダー (オプション)
 	body?: any; // 個別リクエストのレスポンスボディ (通常はJSONオブジェクト or エラーメッセージ)
 }
+
+// バッチ処理全体の結果
+export interface BatchResult {
+    results: BatchResponseItem[];
+    created: number;
+    updated: number;
+    deleted: number;
+    errors: number;
+    skipped: number;
+}
+
+// エラーログ用インターフェース
+export interface ErrorLog {
+    errorType: 'permanent'|'transient';
+    operation: 'delete'|'update'|'create';
+    taskId: string;
+    gcalId?: string;
+    retryCount: number;
+    errorDetails: any;
+}

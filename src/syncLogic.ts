@@ -2,7 +2,7 @@ import { Notice } from 'obsidian';
 import { ErrorHandler, DateUtils } from './commonUtils';
 import { calendar_v3 } from 'googleapis';
 import GoogleCalendarTasksSyncPlugin from './main';
-import { ObsidianTask, GoogleCalendarEventInput, BatchRequestItem, BatchResponseItem } from './types';
+import { ObsidianTask, GoogleCalendarEventInput, BatchRequestItem, BatchResponseItem, BatchResult, ErrorLog } from './types';
 import { BatchProcessor } from './batchProcessor';
 
 export class SyncLogic {
@@ -12,11 +12,17 @@ export class SyncLogic {
     constructor(plugin: GoogleCalendarTasksSyncPlugin) {
         this.plugin = plugin;
         this.batchProcessor = new BatchProcessor(plugin.settings.calendarId, plugin.settings);
+        this.errorLogs = [];
     }
 
     /**
      * Obsidian タスクと Google Calendar イベント間の同期を実行します。
      */
+    private errorLogs: ErrorLog[];
+    private retryCount = 0;
+    private readonly MAX_RETRIES = 3;
+    private readonly RETRY_DELAY_MS = 1000;
+
     async runSync(): Promise<void> {
         if (this.plugin.isCurrentlySyncing()) {
             console.warn("同期はスキップされました: 既に進行中です。");
@@ -24,6 +30,8 @@ export class SyncLogic {
             return;
         }
         this.plugin.setSyncing(true);
+        this.errorLogs = [];
+        this.retryCount = 0;
         const syncStartTime = DateUtils.parseDate(new Date().toISOString());
 
         // 設定と認証の確認
@@ -95,10 +103,7 @@ export class SyncLogic {
             // 5. バッチ実行
             if (batchRequests.length > 0) {
                 const { results, created, updated, deleted, errors, skipped } = 
-                    await this.batchProcessor.executeBatches(
-                        batchRequests,
-                        (batch) => this.plugin.gcalApi.executeBatchRequest(batch)
-                    );
+                    await this.executeBatchesWithRetry(batchRequests);
                 
                 createdCount += created;
                 updatedCount += updated;
@@ -107,7 +112,7 @@ export class SyncLogic {
                 skippedCount += skipped;
 
                 // バッチ結果を処理してtaskMapを更新
-                results.forEach((res, i) => {
+                results.forEach((res: BatchResponseItem, i: number) => {
                     const req = batchRequests[i];
                     if (res.status >= 200 && res.status < 300) {
                         const id = res.body?.id || req.originalGcalId;
@@ -118,8 +123,11 @@ export class SyncLogic {
                         } else if (req.operationType === 'delete' && req.obsidianTaskId) {
                             delete taskMap[req.obsidianTaskId];
                         }
-                    } else if (req.operationType === 'delete' && req.obsidianTaskId) {
-                        delete taskMap[req.obsidianTaskId];
+                    } else if (req.operationType === 'delete') {
+                        this.handleDeleteError(req, res.status);
+                        if (res.status === 404 && req.obsidianTaskId) {
+                            delete taskMap[req.obsidianTaskId];
+                        }
                     }
                 });
             } else if (isManualSync && this.plugin.settings.syncNoticeSettings.showManualSyncProgress) {
@@ -274,6 +282,55 @@ export class SyncLogic {
     /**
      * イベントの更新要否を判定
      */
+    private async executeBatchesWithRetry(batchRequests: BatchRequestItem[]): Promise<BatchResult> {
+        while (this.retryCount <= this.MAX_RETRIES) {
+            try {
+                const result = await this.batchProcessor.executeBatches(
+                    batchRequests,
+                    (batch) => this.plugin.gcalApi.executeBatchRequest(batch)
+                );
+
+                if (result.errors > 0) {
+                    const shouldRetry = result.results.some(res => 
+                        [403, 429, 500, 502, 503, 504].includes(res.status));
+                    if (shouldRetry && this.retryCount < this.MAX_RETRIES) {
+                        this.retryCount++;
+                        const delay = this.RETRY_DELAY_MS * Math.pow(2, this.retryCount);
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        continue;
+                    }
+                }
+                return result;
+            } catch (error) {
+                if (this.retryCount >= this.MAX_RETRIES) throw error;
+                this.retryCount++;
+                const delay = this.RETRY_DELAY_MS * Math.pow(2, this.retryCount);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+        throw new Error(`Max retries (${this.MAX_RETRIES}) exceeded`);
+    }
+
+    private handleDeleteError(request: BatchRequestItem, status: number): void {
+        const errorType = status === 404 ? 'permanent' : 'transient';
+        this.errorLogs.push({
+            errorType,
+            operation: 'delete',
+            taskId: request.obsidianTaskId || 'unknown',
+            gcalId: request.originalGcalId,
+            retryCount: this.retryCount,
+            errorDetails: { status }
+        });
+
+        if (status === 404) {
+            console.warn(`404エラー: イベントが見つかりません (TaskID: ${request.obsidianTaskId}, GCalID: ${request.originalGcalId})`);
+        } else if (status === 403) {
+            console.error(`403エラー: 権限不足 (TaskID: ${request.obsidianTaskId})`);
+        } else if (status === 429) {
+            console.warn(`429エラー: レート制限超過。リトライ待機中...`);
+        }
+    }
+
     private needsUpdate(
         existingEvent: calendar_v3.Schema$Event,
         newPayload: GoogleCalendarEventInput
