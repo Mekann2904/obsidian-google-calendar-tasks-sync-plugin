@@ -404,6 +404,23 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 						this.display(); // UI を再描画
 					}
 				}));
+
+		// 強制リセットボタン
+		new Setting(containerEl)
+			.setName('Obsidianの状態を強制的にリモートへ反映')
+			.setDesc('🚨【危険】リモートの全イベントを削除し、Obsidianのタスクを再登録します。リモートでの変更は全て失われます。')
+			.addButton(button => button
+				.setButtonText('強制的にリモートをリセット')
+				.setIcon('alert-triangle')
+				.setWarning()
+				.onClick(async () => {
+					if (confirm('本当にリモートをリセットしますか？\nGoogleカレンダー上のこのプラグインが管理する全てのイベントが削除され、現在のObsidianのタスクが再登録されます。この操作は元に戻せません。')) {
+						new Notice('強制リセットを開始します...', 3000);
+						await this.plugin.forceSync();
+						this.display();
+					}
+				}));
+
 		// 現在のマップキャッシュのエントリ数を表示
 		const taskCount = Object.keys(this.plugin.settings.taskMap).length;
 		containerEl.createEl('p', {

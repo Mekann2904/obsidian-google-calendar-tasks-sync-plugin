@@ -111,7 +111,7 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 			console.warn(`無効な同期間隔 "${this.settings.syncIntervalMinutes}"。デフォルト ${DEFAULT_SETTINGS.syncIntervalMinutes} にリセット。`);
 			this.settings.syncIntervalMinutes = DEFAULT_SETTINGS.syncIntervalMinutes;
 		}
-		if (this.settings.lastSyncTime && !validateMoment(this.settings.lastSyncTime, "YYYY-MM-DDTHH:mm:ssZ", "lastSyncTime")) {
+		if (this.settings.lastSyncTime && !validateMoment(this.settings.lastSyncTime, [moment.ISO_8601 as any, "YYYY-MM-DDTHH:mm:ssZ"], "lastSyncTime")) {
             console.warn(`無効な lastSyncTime "${this.settings.lastSyncTime}"。クリアします。`);
 			this.settings.lastSyncTime = undefined;
         }
@@ -183,7 +183,7 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 
     /** 手動同期をトリガー */
     async triggerSync(): Promise<void> {
-        if (!this.settings.tokens || !this.isTokenValid(false) && !this.isTokenValid(true)) {
+        if (!this.settings.tokens || (!this.isTokenValid(false) && !this.isTokenValid(true))) {
             new Notice("認証されていないか、トークンが期限切れ/無効です。設定から認証/再認証してください。");
             return;
         }
@@ -193,6 +193,20 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
         }
         new Notice('手動同期を開始しました...');
         await this.syncLogic.runSync();
+    }
+
+    /** 強制同期 (リセット) をトリガー */
+    async forceSync(): Promise<void> {
+        if (!this.settings.tokens || (!this.isTokenValid(false) && !this.isTokenValid(true))) {
+            new Notice("認証されていないか、トークンが期限切れ/無効です。設定から認証/再認証してください。");
+            return;
+        }
+        if (this.isSyncing) {
+            new Notice("同期は既に進行中です。");
+            return;
+        }
+        new Notice('強制リセット同期を開始しました...');
+        await this.syncLogic.runSync({ force: true });
     }
 
 	/** 自動同期を設定 */

@@ -21,7 +21,12 @@ export interface ObsidianTask {
 }
 
 // Google Calendar API のイベント入力型
-export type GoogleCalendarEventInput = calendar_v3.Schema$Event;
+export type GoogleCalendarEventInput = calendar_v3.Schema$Event & {
+    reminders?: {
+        useDefault: boolean;
+        overrides?: Array<{ method: 'popup' | 'email'; minutes: number }>;
+    };
+};
 
 export interface GoogleCalendarTasksSyncSettings {
 	clientId: string; // Google Cloud Console で取得したクライアントID

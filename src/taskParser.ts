@@ -65,6 +65,7 @@ export class TaskParser {
         let taskContent = match[2].trim();
         const isCompleted = checkbox !== ' ' && checkbox !== '';
 
+        // FIX: ISO拡張の余計な空白を除去し、秒・小数秒・タイムゾーンを正しくオプショナルに
         const isoOrSimpleDateRegex = `\\d{4}-\\d{2}-\\d{2}(?:T\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?(?:Z|[+-]\\d{2}:\\d{2})?)?`;
         const simpleDateRegexOnly = `\\d{4}-\\d{2}-\\d{2}`;
 
@@ -111,7 +112,7 @@ export class TaskParser {
         }
 
         // 繰り返しルールを抽出
-        ({ value: recurrenceRuleText, remainingContent } = extractMetadata(remainingContent, /(?:🔁|repeat:|recur:)\s*([^📅🛫⏳➕✅🔺⏫🔼🔽⏬#^]+)/));
+        ({ value: recurrenceRuleText, remainingContent } = extractMetadata(remainingContent, /(?:🔁|repeat:|recur:)\s*([^📅🛫⏳➕✅🔺⏫🔼🔽⏬⏰#^]+)/u));
 
         // ブロックリンクを抽出 (行末)
         const blockLinkMatch = remainingContent.match(/\s+(\^[a-zA-Z0-9-]+)$/);
@@ -131,6 +132,12 @@ export class TaskParser {
 
         // サマリー: 残った内容を整理
         const summary = remainingContent.replace(/\s{2,}/g, ' ').trim();
+
+        // 追加仕様: dueDate があり startDate がない場合、startDate を dueDate と同じにする
+        if (dueDate && !startDate) {
+            startDate = dueDate;
+            console.log(`タスク "${summary.substring(0, 20)}..." の startDate が dueDate から補完されました: ${startDate}`);
+        }
 
         // 繰り返しルールを解析
         const recurrenceRefDate = startDate || dueDate || scheduledDate;
@@ -167,33 +174,56 @@ export class TaskParser {
 
     /**
      * 繰り返しルールのテキストを解析し、iCalendar RRULE 文字列に変換。
+     * - 既存の RRULE 形式（"RRULE:..." または "FREQ=..."）を優先してパース
+     * - それが失敗した場合は簡易的な自然言語（every day/week/month/year 等）でパース
      */
-     parseRecurrenceRule(ruleText: string, dtstartHint: string | null): string | null {
-        ruleText = ruleText.trim(); // 元のケースを保持してパースを試みる
+    parseRecurrenceRule(ruleText: string, dtstartHint: string | null): string | null {
+        ruleText = ruleText.trim(); // 元のケースを保持
         let finalRruleString: string | null = null;
 
         // 既存の RRULE 文字列を優先的にパース
         if (ruleText.toUpperCase().startsWith('RRULE:') || ruleText.toUpperCase().startsWith('FREQ=')) {
             try {
                 const ruleInput = ruleText.toUpperCase().startsWith('RRULE:') ? ruleText : `RRULE:${ruleText}`;
-                const rule = rrulestr(ruleInput, { forceset: true });
+                // forceset: true だと RRuleSet が返ることがあるため両方に対応
+                const parsed = rrulestr(ruleInput, { forceset: true });
 
-                // DTSTART の処理
-                if (!rule.options.dtstart && dtstartHint) {
-                    const pDate = moment(dtstartHint, [moment.ISO_8601, 'YYYY-MM-DD'], true).utc();
-                    if(pDate.isValid()) {
-                        rule.options.dtstart = pDate.toDate();
-                    } else {
-                         // ヒントが無効な場合は今日の日付を使用
-                        console.warn(`RRULE 解析のための無効な dtstartHint "${dtstartHint}"。今日を使用します。`);
-                        rule.options.dtstart = moment().startOf('day').toDate(); // ローカルタイムの今日
+                // RRule インスタンスを取り出す
+                let baseRule: RRule | null = null;
+                if (parsed instanceof RRule) {
+                    baseRule = parsed;
+                } else if (parsed && typeof parsed === 'object' && 'rrules' in parsed) {
+                    const rules = (parsed as RRuleSet).rrules();
+                    if (rules.length > 0) {
+                        baseRule = rules[0];
                     }
-                } else if (!rule.options.dtstart) {
-                    rule.options.dtstart = moment().startOf('day').toDate(); // ローカルタイムの今日
-                    console.warn(`RRULE "${ruleText}" に DTSTART がありません。今日を使用します。`);
                 }
-                finalRruleString = rule.toString(); // DTSTART が追加された可能性のある RRULE 文字列
-                return finalRruleString; // パース成功したら返す
+
+                // 見つからなければ失敗扱い（自然言語パースへ）
+                if (!baseRule) {
+                    throw new Error('No RRule found in parsed value');
+                }
+
+                // DTSTART の処理（既存に無ければ補完）
+                let dtstart: Date | undefined = baseRule.options.dtstart;
+                if (!dtstart && dtstartHint) {
+                    const pDate = moment(dtstartHint, [moment.ISO_8601, 'YYYY-MM-DD'], true).utc();
+                    if (pDate.isValid()) {
+                        dtstart = pDate.toDate();
+                    } else {
+                        console.warn(`RRULE 解析のための無効な dtstartHint "${dtstartHint}"。今日を使用します。`);
+                        dtstart = moment().startOf('day').toDate(); // ローカルタイムの今日
+                    }
+                } else if (!dtstart) {
+                    console.warn(`RRULE "${ruleText}" に DTSTART がありません。今日を使用します。`);
+                    dtstart = moment().startOf('day').toDate();
+                }
+
+                // 既存オプションを再構成して新しい RRule を生成（副作用を避ける）
+                const opts = { ...baseRule.options, dtstart } as RRuleOptions;
+                const normalized = new RRule(opts);
+                finalRruleString = normalized.toString(); // RRULE:... を返す
+                return finalRruleString;
             } catch (e) {
                 console.warn(`直接的な RRULE パースに失敗: "${ruleText}"`, e);
                 // 失敗したら自然言語パースへフォールバック
@@ -201,7 +231,7 @@ export class TaskParser {
         }
 
         // --- 自然言語パース (フォールバック) ---
-         ruleText = ruleText.toLowerCase(); // 自然言語は小文字で処理
+        ruleText = ruleText.toLowerCase();
         let dtstartDate: Date;
         if (dtstartHint) {
             const pDate = moment.utc(dtstartHint, [moment.ISO_8601, 'YYYY-MM-DD'], true);
@@ -274,28 +304,28 @@ export class TaskParser {
             options.freq = freq;
             options.interval = interval > 0 ? interval : 1;
             try {
-                // RRuleOptions にキャストする際に不足している必須プロパティがないか確認
+                // RRuleOptions を安全に構成（null を入れない）
                 const finalOptions: RRuleOptions = {
-                    freq: options.freq,
-                    dtstart: options.dtstart || new Date(), // dtstart は必須
-                    interval: options.interval,
-                    wkst: options.wkst ?? null,
-                    count: options.count ?? null,
-                    until: options.until ?? null,
-                    tzid: options.tzid ?? null,
-                    bysetpos: options.bysetpos ?? null,
-                    bymonth: options.bymonth ?? null,
-                    bymonthday: options.bymonthday ?? null,
-                    byyearday: options.byyearday ?? null,
-                    byweekno: options.byweekno ?? null,
-                    byweekday: options.byweekday ?? null,
-                    byhour: options.byhour ?? null,
-                    byminute: options.byminute ?? null,
-                    bysecond: options.bysecond ?? null,
-                    byeaster: options.byeaster ?? null,
-                    bynmonthday: null,
-                    bynweekday: null,
-                };
+                    freq: options.freq!,
+                    dtstart: options.dtstart || new Date(),
+                    interval: options.interval!,
+                } as RRuleOptions;
+
+                if (options.wkst !== undefined) (finalOptions as any).wkst = options.wkst;
+                if (options.count !== undefined) finalOptions.count = options.count;
+                if (options.until !== undefined) finalOptions.until = options.until;
+                if ((options as any).tzid !== undefined) (finalOptions as any).tzid = (options as any).tzid;
+                if (options.bysetpos !== undefined) finalOptions.bysetpos = options.bysetpos;
+                if (options.bymonth !== undefined) finalOptions.bymonth = options.bymonth;
+                if (options.bymonthday !== undefined) finalOptions.bymonthday = options.bymonthday;
+                if (options.byyearday !== undefined) finalOptions.byyearday = options.byyearday;
+                if (options.byweekno !== undefined) finalOptions.byweekno = options.byweekno;
+                if (options.byweekday !== undefined) finalOptions.byweekday = options.byweekday as any;
+                if (options.byhour !== undefined) finalOptions.byhour = options.byhour;
+                if (options.byminute !== undefined) finalOptions.byminute = options.byminute;
+                if (options.bysecond !== undefined) finalOptions.bysecond = options.bysecond;
+                if ((options as any).byeaster !== undefined) (finalOptions as any).byeaster = (options as any).byeaster;
+
                 const rule = new RRule(finalOptions);
                 finalRruleString = rule.toString();
             } catch (e) {

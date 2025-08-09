@@ -4,6 +4,7 @@ import { calendar_v3 } from 'googleapis';
 import GoogleCalendarTasksSyncPlugin from './main';
 import { ObsidianTask, GoogleCalendarEventInput, BatchRequestItem, BatchResponseItem, BatchResult, ErrorLog } from './types';
 import { BatchProcessor } from './batchProcessor';
+import moment from 'moment';
 
 export class SyncLogic {
     private plugin: GoogleCalendarTasksSyncPlugin;
@@ -17,13 +18,16 @@ export class SyncLogic {
 
     /**
      * Obsidian タスクと Google Calendar イベント間の同期を実行します。
+     * @param {object} [options] - 同期オプション
+     * @param {boolean} [options.force=false] - true の場合、リモートをローカルの状態で上書きする強制同期を実行します。
      */
     private errorLogs: ErrorLog[];
     private retryCount = 0;
     private readonly MAX_RETRIES = 3;
     private readonly RETRY_DELAY_MS = 1000;
 
-    async runSync(): Promise<void> {
+    async runSync(options: { force?: boolean } = {}): Promise<void> {
+        const { force = false } = options;
         if (this.plugin.isCurrentlySyncing()) {
             console.warn("同期はスキップされました: 既に進行中です。");
             new Notice("同期は既に進行中です。");
@@ -32,7 +36,7 @@ export class SyncLogic {
         this.plugin.setSyncing(true);
         this.errorLogs = [];
         this.retryCount = 0;
-        const syncStartTime = DateUtils.parseDate(new Date().toISOString());
+        const syncStartTime = moment();
 
         // 設定と認証の確認
         if (!this.plugin.settings.tokens || !this.plugin.settings.calendarId) {
@@ -54,15 +58,15 @@ export class SyncLogic {
             return;
         }
 
-        console.log(`カレンダー ID: ${this.plugin.settings.calendarId} と同期を開始`);
-        const isManualSync = !this.plugin.settings.autoSync;
+        console.log(`カレンダー ID: ${this.plugin.settings.calendarId} と同期を開始 (強制: ${force})`);
+        const isManualSync = !this.plugin.settings.autoSync || force;
         if (isManualSync && this.plugin.settings.syncNoticeSettings.showManualSyncProgress) {
-            new Notice('同期を開始しました...', 3000);
+            new Notice(force ? '強制同期を開始しました...' : '同期を開始しました...', 3000);
         }
 
         let createdCount = 0, updatedCount = 0, deletedCount = 0, skippedCount = 0, errorCount = 0;
         const batchRequests: BatchRequestItem[] = [];
-        const taskMap = { ...this.plugin.settings.taskMap };
+        const taskMap = force ? {} : { ...this.plugin.settings.taskMap };
         let existingEvents: calendar_v3.Schema$Event[] = [];
         let googleEventMap = new Map<string, calendar_v3.Schema$Event>();
 
@@ -81,8 +85,15 @@ export class SyncLogic {
             }
             console.time("Sync: Fetch GCal Events");
             existingEvents = await this.plugin.gcalApi.fetchGoogleCalendarEvents();
-            googleEventMap = this.mapGoogleEvents(existingEvents, taskMap);
+            if (!force) {
+                googleEventMap = this.mapGoogleEvents(existingEvents, taskMap);
+            }
             console.timeEnd("Sync: Fetch GCal Events");
+
+            // FIX: 既存イベントIDのセット（DELETE前検証で使用）
+            const existingGIdSet = new Set<string>(
+                existingEvents.map(e => e.id).filter((v): v is string => !!v)
+            );
 
             // 3. 作成/更新/キャンセル準備
             if (isManualSync && this.plugin.settings.syncNoticeSettings.showManualSyncProgress) {
@@ -90,14 +101,14 @@ export class SyncLogic {
             }
             console.time("Sync: Prepare Batch Requests");
             const { currentObsidianTaskIds, skipped } = this.prepareBatchRequests(
-                obsidianTasks, googleEventMap, taskMap, batchRequests
+                obsidianTasks, googleEventMap, taskMap, batchRequests, force
             );
             skippedCount += skipped;
             console.timeEnd("Sync: Prepare Batch Requests");
 
-            // 4. 削除準備
+            // 4. 削除準備（FIX: 古い taskMap を検証し、存在しないIDは送らずに taskMap から除去）
             console.time("Sync: Prepare Deletions");
-            this.prepareDeletionRequests(taskMap, currentObsidianTaskIds, existingEvents, batchRequests);
+            this.prepareDeletionRequests(taskMap, currentObsidianTaskIds, existingEvents, existingGIdSet, batchRequests, force);
             console.timeEnd("Sync: Prepare Deletions");
 
             // 5. バッチ実行
@@ -111,44 +122,115 @@ export class SyncLogic {
                 errorCount += errors;
                 skippedCount += skipped;
 
-                // バッチ結果を処理してtaskMapを更新
+                // バッチ結果を処理してtaskMapを更新 + フォールバック生成
+                const calendarPath = `/calendar/v3/calendars/${encodeURIComponent(this.plugin.settings.calendarId)}/events`;
+                const fallbackInserts: BatchRequestItem[] = []; // FIX: UPDATE/PATCH 404/410 → POSTにフォールバック
+
                 results.forEach((res: BatchResponseItem, i: number) => {
                     const req = batchRequests[i];
                     if (res.status >= 200 && res.status < 300) {
-                        const id = res.body?.id || req.originalGcalId;
-                        if (req.operationType === 'insert' && id && req.obsidianTaskId) {
-                            taskMap[req.obsidianTaskId] = id;
-                        } else if ((req.operationType === 'update' || req.operationType === 'patch') && id && req.obsidianTaskId) {
-                            taskMap[req.obsidianTaskId] = id;
+                        const newGcalId = res.body?.id;
+                        if (req.operationType === 'insert' && newGcalId && req.obsidianTaskId) {
+                            const oldGcalId = taskMap[req.obsidianTaskId];
+                            if (oldGcalId && oldGcalId !== newGcalId) {
+                                console.log(`タスクマップ更新 (再作成): ${req.obsidianTaskId} -> ${newGcalId} (旧: ${oldGcalId})`);
+                            }
+                            taskMap[req.obsidianTaskId] = newGcalId;
+                        } else if ((req.operationType === 'update' || req.operationType === 'patch') && newGcalId && req.obsidianTaskId) {
+                            taskMap[req.obsidianTaskId] = newGcalId;
                         } else if (req.operationType === 'delete' && req.obsidianTaskId) {
                             delete taskMap[req.obsidianTaskId];
                         }
-                    } else if (req.operationType === 'delete') {
-                        this.handleDeleteError(req, res.status);
-                        if (res.status === 404 && req.obsidianTaskId) {
-                            delete taskMap[req.obsidianTaskId];
+                    } else {
+                        // 2xx 以外の処理（FIX: 網羅）
+                        const status = res.status;
+                        // DELETE エラー処理（既存の動作）
+                        if (req.operationType === 'delete') {
+                            this.handleDeleteError(req, status);
+                            if (status === 410 || status === 404) {
+                                if (req.obsidianTaskId) {
+                                    console.log(`マップから削除 (存在しないため): ${req.obsidianTaskId}`);
+                                    delete taskMap[req.obsidianTaskId];
+                                }
+                            }
+                            return;
                         }
+
+                        // FIX: UPDATE/PATCH が 404/410 → POST にフォールバック
+                        if ((req.operationType === 'update' || req.operationType === 'patch') && (status === 404 || status === 410)) {
+                            if (req.obsidianTaskId) {
+                                // 古いマッピングは破棄
+                                if (taskMap[req.obsidianTaskId]) {
+                                    console.warn(`更新対象が消失（${status}）: 再作成へ切替 TaskID=${req.obsidianTaskId}, GCalID=${req.originalGcalId}`);
+                                    delete taskMap[req.obsidianTaskId];
+                                }
+                                // 再作成の投入
+                                fallbackInserts.push({
+                                    method: 'POST',
+                                    path: calendarPath,
+                                    body: req.body,                 // 元のペイロードをそのまま再利用
+                                    obsidianTaskId: req.obsidianTaskId,
+                                    operationType: 'insert'
+                                });
+                            }
+                            return;
+                        }
+
+                        // FIX: INSERT エラーやそれ以外の 4xx/5xx もログ化
+                        const operation = req.operationType === 'insert' ? 'create' : 
+                                         req.operationType === 'patch' ? 'update' : 
+                                         req.operationType || 'update';
+                        this.errorLogs.push({
+                            errorType: (status >= 500 || status === 429) ? 'transient' : 'permanent',
+                            operation: operation as 'delete'|'update'|'create',
+                            taskId: req.obsidianTaskId || 'unknown',
+                            gcalId: req.originalGcalId,
+                            retryCount: this.retryCount,
+                            errorDetails: { status }
+                        });
                     }
                 });
+
+                // FIX: フォールバックの POST をまとめて実行
+                if (fallbackInserts.length > 0) {
+                    console.log(`再作成フォールバック: ${fallbackInserts.length} 件をPOST`);
+                    const fb = await this.executeBatchesWithRetry(fallbackInserts);
+                    createdCount += fb.created;
+                    updatedCount += fb.updated;
+                    deletedCount += fb.deleted;
+                    errorCount += fb.errors;
+                    skippedCount += fb.skipped;
+
+                    // マップ更新（成功分）
+                    fb.results.forEach((res, idx) => {
+                        const req = fallbackInserts[idx];
+                        if (res.status >= 200 && res.status < 300) {
+                            const newId = res.body?.id;
+                            if (newId && req.obsidianTaskId) {
+                                taskMap[req.obsidianTaskId] = newId;
+                            }
+                        }
+                    });
+                }
             } else if (isManualSync && this.plugin.settings.syncNoticeSettings.showManualSyncProgress) {
                 new Notice('変更なし。', 2000);
             }
 
             // 7. 設定保存・サマリー
-            const syncEndTime = DateUtils.parseDate(new Date().toISOString());
+            const syncEndTime = new Date();
             this.plugin.settings.taskMap = taskMap;
-            this.plugin.settings.lastSyncTime = syncEndTime.toISOString();
+            this.plugin.settings.lastSyncTime = moment(syncEndTime).format('YYYY-MM-DDTHH:mm:ssZ'); // ミリ秒なしのISO形式
             await this.plugin.saveData(this.plugin.settings);
 
-            const durationSeconds = DateUtils.formatDuration(syncStartTime, syncEndTime);
+            const durationSeconds = moment(syncEndTime).diff(syncStartTime, 'seconds');
             const shouldShowSummary = 
                 (isManualSync && this.plugin.settings.syncNoticeSettings.showManualSyncProgress) ||
                 (!isManualSync && this.plugin.settings.syncNoticeSettings.showAutoSyncSummary && 
                  durationSeconds >= this.plugin.settings.syncNoticeSettings.minSyncDurationForNotice);
             
-			if (shouldShowSummary || (errorCount > 0 && this.plugin.settings.syncNoticeSettings.showErrors)) {
-				new Notice(`同期完了 (${durationSeconds.toFixed(1)}秒): ${createdCount}追加, ${updatedCount}更新, ${deletedCount}削除, ${skippedCount}スキップ, ${errorCount}エラー`,
-					errorCount ? 15000 : 7000);
+            if (shouldShowSummary || (errorCount > 0 && this.plugin.settings.syncNoticeSettings.showErrors)) {
+                new Notice(`同期完了 (${durationSeconds.toFixed(1)}秒): ${createdCount}追加, ${updatedCount}更新, ${deletedCount}削除, ${skippedCount}スキップ, ${errorCount}エラー`,
+                    errorCount ? 15000 : 7000);
             }
         } catch (fatal) {
             console.error('致命的エラー:', fatal);
@@ -170,6 +252,10 @@ export class SyncLogic {
         existingEvents.forEach(event => {
             const obsId = event.extendedProperties?.private?.['obsidianTaskId'];
             const gcalId = event.id;
+
+            // FIX: cancelled はマッピング対象から除外（更新対象にしない）
+            if (event.status === 'cancelled') return;
+
             if (obsId && gcalId) {
                 const existingMapping = googleEventMap.get(obsId);
                 if (!existingMapping || (event.updated && existingMapping.updated && DateUtils.parseDate(event.updated).isAfter(DateUtils.parseDate(existingMapping.updated)))) {
@@ -194,7 +280,8 @@ export class SyncLogic {
         obsidianTasks: ObsidianTask[],
         googleEventMap: Map<string, calendar_v3.Schema$Event>,
         taskMap: { [obsidianTaskId: string]: string },
-        batchRequests: BatchRequestItem[]
+        batchRequests: BatchRequestItem[],
+        force: boolean = false
     ): { currentObsidianTaskIds: Set<string>, skipped: number } {
         const currentObsidianTaskIds = new Set<string>();
         let skippedCount = 0;
@@ -203,42 +290,55 @@ export class SyncLogic {
         for (const task of obsidianTasks) {
             currentObsidianTaskIds.add(task.id);
             const obsId = task.id;
-            const existingEvent = googleEventMap.get(obsId);
-            const googleEventId = existingEvent?.id || taskMap[obsId];
 
-            // 完了済みタスク → cancel
-            if (task.isCompleted) {
-                if (googleEventId && existingEvent && existingEvent.status !== 'cancelled') {
-                    batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(googleEventId)}`, body: { status: 'cancelled' }, obsidianTaskId: obsId, operationType: 'patch', originalGcalId: googleEventId });
-                    console.log(`キャンセル準備: "${task.summary || obsId}" (GCal ID: ${googleEventId})`);
-                } else {
-                    skippedCount++;
-                }
-                continue;
-            }
-
-            // 日付不足 → skip
+            // 日付不足は常にスキップ
             if (!task.startDate || !task.dueDate) {
+                console.log(`タスクスキップ (日付不足): "${task.summary}"`);
                 skippedCount++;
                 continue;
             }
 
-            const eventPayload = this.plugin.gcalMapper.mapObsidianTaskToGoogleEvent(task);
+            // 完了済みタスクの処理
+            if (task.isCompleted) {
+                if (!force) {
+                    const existingEvent = googleEventMap.get(obsId);
+                    if (existingEvent && existingEvent.status !== 'cancelled') {
+                        const gcalId = existingEvent.id!;
+                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, body: { status: 'cancelled' }, obsidianTaskId: obsId, operationType: 'patch', originalGcalId: gcalId });
+                        console.log(`キャンセル準備: "${task.summary}" (GCal ID: ${gcalId})`);
+                    } else {
+                        skippedCount++;
+                    }
+                } else {
+                    skippedCount++; // 強制同期では完了タスクは無視
+                }
+                continue;
+            }
 
-            if (googleEventId && existingEvent) {
+            const eventPayload = this.plugin.gcalMapper.mapObsidianTaskToGoogleEvent(task);
+            const existingEvent = googleEventMap.get(obsId);
+
+            if (force) {
+                // 強制モード: 未完了のタスクは全て新規作成
+                batchRequests.push({ method: 'POST', path: calendarPath, body: eventPayload, obsidianTaskId: obsId, operationType: 'insert' });
+                console.log(`強制挿入準備: "${task.summary}"`);
+                continue;
+            }
+
+            // --- 通常同期モード ---
+            if (existingEvent) {
+                // GCal上にイベントが存在する場合 → 更新チェック
                 if (this.needsUpdate(existingEvent, eventPayload)) {
-                    batchRequests.push({ method: 'PUT', path: `${calendarPath}/${encodeURIComponent(googleEventId)}`, body: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: googleEventId });
-                    console.log(`更新準備: "${task.summary || obsId}" (GCal ID: ${googleEventId})`);
+                    const gcalId = existingEvent.id!;
+                    batchRequests.push({ method: 'PUT', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, body: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: gcalId });
+                    console.log(`更新準備: "${task.summary}" (GCal ID: ${gcalId})`);
                 } else {
                     skippedCount++;
                 }
             } else {
-                if (googleEventId && !existingEvent) {
-                    console.warn(`古いマップエントリ発見: ${googleEventId} → 再作成`);
-                    delete taskMap[obsId];
-                }
+                // GCal上にイベントが存在しない場合 → 新規作成
+                console.log(`挿入準備 (GCalに存在せず): "${task.summary}"`);
                 batchRequests.push({ method: 'POST', path: calendarPath, body: eventPayload, obsidianTaskId: obsId, operationType: 'insert' });
-                console.log(`挿入準備: "${task.summary || obsId}"`);
             }
         }
         console.log(`バッチリクエスト準備完了: ${batchRequests.length} 件の操作, ${skippedCount} 件スキップ。`);
@@ -252,21 +352,43 @@ export class SyncLogic {
         taskMap: { [obsidianTaskId: string]: string },
         currentObsidianTaskIds: Set<string>,
         existingGCalEvents: calendar_v3.Schema$Event[],
-        batchRequests: BatchRequestItem[]
+        existingGIdSet: Set<string>, // FIX: 追加
+        batchRequests: BatchRequestItem[],
+        force: boolean = false
     ): void {
         const calendarPath = `/calendar/v3/calendars/${encodeURIComponent(this.plugin.settings.calendarId)}/events`;
         const processed = new Set<string>();
 
-        // Obsidian で削除されたタスクに対応 → delete
+        if (force) {
+            // 強制モード: 全ての既存イベントを削除
+            existingGCalEvents.forEach(event => {
+                if (event.id) {
+                    batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(event.id)}`, obsidianTaskId: 'force-delete', operationType: 'delete', originalGcalId: event.id });
+                    processed.add(event.id);
+                }
+            });
+            console.log(`強制削除準備完了: ${processed.size} 件`);
+            return;
+        }
+
+        // 通常モード: Obsidianで削除されたタスクと孤児イベントを削除
         Object.entries(taskMap).forEach(([obsId, gId]) => {
-            if (gId && !currentObsidianTaskIds.has(obsId) && !processed.has(gId)) {
-                batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(gId)}`, obsidianTaskId: obsId, operationType: 'delete', originalGcalId: gId });
-                processed.add(gId);
-                console.log(`削除準備 (Obs削除): GCal ID: ${gId}`);
+            if (!gId) return;
+            if (!currentObsidianTaskIds.has(obsId)) {
+                // FIX: 既にサーバーに存在しないIDなら、DELETE を送らずにマッピングだけ除去
+                if (!existingGIdSet.has(gId)) {
+                    console.warn(`削除スキップ（既に消失）: obsId=${obsId}, gId=${gId} → マップから除去`);
+                    delete taskMap[obsId];
+                    return;
+                }
+                if (!processed.has(gId)) {
+                    batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(gId)}`, obsidianTaskId: obsId, operationType: 'delete', originalGcalId: gId });
+                    processed.add(gId);
+                    console.log(`削除準備 (Obs削除): GCal ID: ${gId}`);
+                }
             }
         });
 
-        // 孤児イベント → delete
         existingGCalEvents.forEach(event => {
             const id = event.id;
             const obsId = event.extendedProperties?.private?.['obsidianTaskId'];
@@ -280,7 +402,7 @@ export class SyncLogic {
     }
 
     /**
-     * イベントの更新要否を判定
+     * バッチの実行（指数バックオフ付き）
      */
     private async executeBatchesWithRetry(batchRequests: BatchRequestItem[]): Promise<BatchResult> {
         while (this.retryCount <= this.MAX_RETRIES) {
@@ -328,6 +450,8 @@ export class SyncLogic {
             console.error(`403エラー: 権限不足 (TaskID: ${request.obsidianTaskId})`);
         } else if (status === 429) {
             console.warn(`429エラー: レート制限超過。リトライ待機中...`);
+        } else if (status === 410) {
+            console.warn(`410エラー: 既に削除済み (TaskID: ${request.obsidianTaskId}, GCalID: ${request.originalGcalId})`);
         }
     }
 
@@ -335,27 +459,62 @@ export class SyncLogic {
         existingEvent: calendar_v3.Schema$Event,
         newPayload: GoogleCalendarEventInput
     ): boolean {
-        if ((existingEvent.summary||'') !== (newPayload.summary||'')) return true;
-        if ((existingEvent.description||'') !== (newPayload.description||'')) return true;
-        const oldStat = existingEvent.status==='cancelled'?'cancelled':'confirmed';
-        const newStat = newPayload.status==='cancelled'?'cancelled':'confirmed';
-        if (oldStat !== newStat) return true;
-        const cmpTime = (t1: calendar_v3.Schema$EventDateTime | undefined, t2: calendar_v3.Schema$EventDateTime | undefined) => {
-            if (!t1&&!t2) return false;
-            if (!t1||!t2) return true;
-            if (t1.date&&t2.date) return t1.date!==t2.date;
-            if (t1.dateTime&&t2.dateTime) return !DateUtils.isSameDateTime(t1.dateTime, t2.dateTime);
+        // Summary
+        if ((existingEvent.summary || '') !== (newPayload.summary || '')) {
             return true;
+        }
+
+        // Description
+        if ((existingEvent.description || '') !== (newPayload.description || '')) {
+            return true;
+        }
+
+        // Status
+        const oldStat = existingEvent.status === 'cancelled' ? 'cancelled' : 'confirmed';
+        const newStat = newPayload.status === 'cancelled' ? 'cancelled' : 'confirmed';
+        if (oldStat !== newStat) {
+            return true;
+        }
+
+        // Time comparison
+        const cmpTime = (t1: calendar_v3.Schema$EventDateTime | undefined, t2: calendar_v3.Schema$EventDateTime | undefined): boolean => {
+            if (!t1 && !t2) return false;
+            if (!t1 || !t2) return true;
+            if (t1.date && t2.date) return t1.date !== t2.date;
+            if (t1.dateTime && t2.dateTime) return !DateUtils.isSameDateTime(t1.dateTime, t2.dateTime);
+            return true; // 形式が違う場合
         };
+
         if (cmpTime(existingEvent.start, newPayload.start)) return true;
         if (cmpTime(existingEvent.end, newPayload.end)) return true;
+
+        // Reminders
+        const oldUseDefault = existingEvent.reminders?.useDefault ?? true;
+        const newUseDefault = newPayload.reminders?.useDefault ?? true;
+        if (oldUseDefault !== newUseDefault) return true;
+
+        if (!newUseDefault) {
+            const oldOverrides = existingEvent.reminders?.overrides || [];
+            const newOverrides = newPayload.reminders?.overrides || [];
+            if (oldOverrides.length !== newOverrides.length) return true;
+            const overridesChanged = oldOverrides.some((or, i) => 
+                (or.minutes !== newOverrides[i].minutes) || (or.method !== newOverrides[i].method)
+            );
+            if (overridesChanged) return true;
+        }
+
+        // Recurrence
         const norm = (r: string | undefined) => r ? (r.toUpperCase().startsWith('RRULE:') ? r.substring(6).trim() : r.trim()) : '';
-        const oldRec = (existingEvent.recurrence||[]).map(norm).sort();
-        const newRec = (newPayload.recurrence||[]).map(norm).sort();
-        if (oldRec.length!==newRec.length||oldRec.some((v,i)=>v!==newRec[i])) return true;
+        const oldRec = (existingEvent.recurrence || []).map(norm).sort();
+        const newRec = (newPayload.recurrence || []).map(norm).sort();
+        if (oldRec.length !== newRec.length || oldRec.some((v, i) => v !== newRec[i])) return true;
+
+        // Extended Properties (obsidianTaskId)
         const oldId = existingEvent.extendedProperties?.private?.['obsidianTaskId'];
         const newId = newPayload.extendedProperties?.private?.['obsidianTaskId'];
-        if ((oldId||'') !== (newId||'')) { console.warn(`ID mismatch: ${oldId} vs ${newId}`);return true; }
+        if ((oldId || '') !== (newId || '')) return true;
+
         return false;
     }
 }
+

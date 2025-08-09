@@ -57,6 +57,42 @@ export class GCalMapper {
             delete event.recurrence; // 完了済み、ルールなし、または開始時間がない場合は削除
         }
 
+        // リマインダーを scheduledDate から設定、またはデフォルトを設定
+        if (event.start) {
+            const eventStartMoment = event.start.dateTime
+                ? moment.utc(event.start.dateTime)
+                : moment.utc(event.start.date).startOf('day');
+
+            let reminderMoment: moment.Moment | null = null;
+
+            if (task.scheduledDate) {
+                // ⏳ が指定されている場合、その日時を使用
+                reminderMoment = moment.utc(task.scheduledDate, [moment.ISO_8601, 'YYYY-MM-DD'], true);
+                if (!reminderMoment.isValid()) {
+                    console.warn(`タスク "${task.summary}" のリマインダー日時 (scheduledDate) のパースに失敗しました。`);
+                    reminderMoment = null;
+                }
+            } else {
+                // ⏳ がない場合、デフォルトでイベント開始の前日に設定
+                reminderMoment = eventStartMoment.clone().subtract(1, 'day');
+                console.log(`タスク "${task.summary}" にデフォルトリマインダー（1日前）を設定します。`);
+            }
+
+            if (reminderMoment && eventStartMoment.isValid()) {
+                const diffMinutes = eventStartMoment.diff(reminderMoment, 'minutes');
+
+                if (diffMinutes > 0) {
+                    event.reminders = {
+                        useDefault: false,
+                        overrides: [{ method: 'popup', minutes: diffMinutes }],
+                    };
+                    console.log(`タスク "${task.summary}" に ${diffMinutes} 分前のリマインダーを設定しました。`);
+                } else {
+                    console.warn(`タスク "${task.summary}" のリマインダー時刻 (${reminderMoment.toISOString()}) がイベント開始時刻 (${eventStartMoment.toISOString()}) 以降のため、リマインダーは設定されません。`);
+                }
+            }
+        }
+
         return event;
     }
 

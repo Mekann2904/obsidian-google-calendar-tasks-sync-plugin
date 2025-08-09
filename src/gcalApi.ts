@@ -1,19 +1,11 @@
 import { Notice, request, RequestUrlParam } from 'obsidian';
 import { calendar_v3 } from 'googleapis';
 import { randomBytes } from 'crypto';
-import GoogleCalendarTasksSyncPlugin from './main'; // main.ts からインポート
+import GoogleCalendarTasksSyncPlugin from './main';
 import { GoogleCalendarTasksSyncSettings, BatchRequestItem, BatchResponseItem } from './types';
 import { isGaxiosError } from './utils';
 import { GaxiosResponse } from 'gaxios';
 
-/**
- * Google Calendar との低レベル通信を担うサービスクラス。
- * - **fetchGoogleCalendarEvents** … 拡張プロパティ `isGcalSync=true` が付いたイベントを全て取得
- * - **executeBatchRequest** … Batch API(v3) を使った一括 CRUD 実行
- *   * 409 Conflict を item‑level エラーとして握りつぶし、致命的停止を回避
- *   * 認証エラー時にはアクセストークン再取得を試行
- * - **parseBatchResponse / parseSingleBatchPart** … multipart/mixed をパースして高レベル構造体に変換
- */
 export class GCalApiService {
     private plugin: GoogleCalendarTasksSyncPlugin;
 
@@ -40,6 +32,7 @@ export class GCalApiService {
             showDeleted: false,
             maxResults: 250,
             singleEvents: false,
+            timeMin: new Date().toISOString(), // 以後のみ（既存ID検証には十分）
         };
 
         console.log("このプラグインによってマークされた全ての GCal イベントを取得中...");
@@ -76,9 +69,7 @@ export class GCalApiService {
 
     /**
      * 準備されたバッチリクエストを実行します。
-     *
-     * 仕様上、バッチ全体が 409 Conflict で返るケース（削除対象が既に無い等）がある。
-     * 409 は致命的ではないため、結果を解析して上位へ返却する。
+     * 404/409/410 は item-level の警告として扱い、致命停止しません。
      */
     async executeBatchRequest(batchRequests: BatchRequestItem[]): Promise<BatchResponseItem[]> {
         // 1) 認証チェックとトークンリフレッシュ
@@ -98,20 +89,28 @@ export class GCalApiService {
             body += `--${boundary}\r\n`;
             body += `Content-Type: application/http\r\n`;
             body += `Content-ID: <item-${idx + 1}>\r\n\r\n`;
-            body += `${req.method} ${req.path}\r\n`;
+            // FIX: HTTP/1.1 を明示し、必ずヘッダ終端の空行を入れる
+            body += `${req.method} ${req.path} HTTP/1.1\r\n`;
 
-            // ユーザー定義ヘッダー
+            // ユーザー定義ヘッダー + 必要に応じて Content-Type
+            const headerLines: string[] = [];
             if (req.headers) {
-                Object.entries(req.headers).forEach(([k, v]) => {
-                    body += `${k}: ${v}\r\n`;
-                });
+                for (const [k, v] of Object.entries(req.headers)) headerLines.push(`${k}: ${v}`);
             }
-            // BODY
             if (req.body) {
-                body += "Content-Type: application/json; charset=UTF-8\r\n\r\n";
-                body += JSON.stringify(req.body);
+                // JSON ボディを送る場合のみ付与
+                headerLines.push(`Content-Type: application/json; charset=UTF-8`);
             }
-            body += "\r\n"; // Part 終端
+            if (headerLines.length > 0) {
+                body += headerLines.join("\r\n") + "\r\n";
+            }
+            body += `\r\n`; // ヘッダ終端
+
+            // ボディ
+            if (req.body) {
+                body += JSON.stringify(req.body) + `\r\n`;
+            }
+            body += `\r\n`; // Part 終端の空行
         });
         body += `--${boundary}--\r\n`;
 
@@ -131,43 +130,36 @@ export class GCalApiService {
             console.log(`${batchRequests.length} 件の操作を含むバッチリクエストを送信中...`);
             const responseText = await request(requestParams);
 
-            // --- ステータス推定 ---
-            let responseStatus = 200;
-            try {
-                const maybeJson = JSON.parse(responseText);
-                if (maybeJson?.error?.code) responseStatus = maybeJson.error.code as number;
-            } catch {
-                const statusMatch = responseText.match(/^HTTP\/\d\.\d\s+(\d+)/m);
-                if (statusMatch) {
-                    responseStatus = parseInt(statusMatch[1], 10);
-                } else if (!responseText.includes(`--${boundary}`)) {
-                    responseStatus = 500; // 不明なエラー
+            // 4) multipart の boundary はレスポンス独自なので本文から検出してパース
+            const results = this.parseBatchResponse(responseText); // FIX: boundary 引数を廃止し自動検出
+
+            // 404/409/410 は item-level の警告として集計
+            const ignorable = new Set([404, 409, 410]);
+            const ignorableCount = results.filter(r => ignorable.has(r.status)).length;
+            if (ignorableCount > 0) {
+                const counts = results.reduce((acc, r) => {
+                    if (ignorable.has(r.status)) acc[r.status] = (acc[r.status] || 0) + 1;
+                    return acc;
+                }, {} as Record<number, number>);
+                const summary = Object.entries(counts).map(([s, c]) => `${c}件の ${s}`).join(", ");
+                console.warn(`バッチ応答に無視可能なエラーが含まれています: ${summary}。`);
+            }
+
+            // レスポンスが空 or パース不能だった場合は致命エラーとして扱う
+            if (results.length === 0) {
+                // 可能ならトップレベル JSON を読み取って詳細表示
+                try {
+                    const err = JSON.parse(responseText);
+                    const code = err?.error?.code;
+                    const msg  = err?.error?.message || "Unknown error";
+                    throw new Error(`Batch response parse failed: ${code ?? "N/A"} ${msg}`);
+                } catch {
+                    throw new Error("Batch response parse failed: No parts found.");
                 }
             }
-            console.log(`バッチ応答ステータス (推定): ${responseStatus}`);
 
-            // 4) 致命的エラー判定
-            if (responseStatus >= 400 && responseStatus !== 409) {
-                // 409 は item‑level エラーとして処理するため throw しない
-                console.error("バッチリクエスト全体が失敗しました:", responseStatus, responseText.slice(0, 1000));
-                let details = responseText.slice(0, 500);
-                try {
-                    const errJson = JSON.parse(responseText);
-                    details = errJson?.error?.message || details;
-                } catch {/* ignore */}
-                throw new Error(`バッチリクエストがステータス ${responseStatus} で失敗しました: ${details}`);
-            }
-
-            // 5) レスポンスを解析
-            const results = this.parseBatchResponse(responseText, boundary);
-            // Conflict (409) を警告ログにとどめて続行
-            const conflictCount = results.filter(r => r.status === 409).length;
-            if (conflictCount) {
-                console.warn(`バッチ応答に 409 Conflict が ${conflictCount} 件含まれています。対象リソースが既に無い可能性があります。`);
-            }
             return results;
         } catch (error) {
-            // 認証・権限系などの例外処理
             console.error("バッチリクエストの実行または処理中にエラー:", error);
             if (error instanceof Error) {
                 const msg = error.toString();
@@ -190,12 +182,28 @@ export class GCalApiService {
     // ---------------------------------------------------------------------
 
     /**
-     * Google Batch API からの multipart/mixed レスポンスをパースします。
+     * レスポンス本文から boundary を自動検出し、multipart をパースします。
+     * 返り値は part ごとの HTTP ステータスと JSON ボディ（可能な範囲で）です。
      */
-    private parseBatchResponse(responseText: string, boundary: string): BatchResponseItem[] {
+    private parseBatchResponse(responseText: string): BatchResponseItem[] {
         const results: BatchResponseItem[] = [];
+
+        // FIX: レスポンス側 boundary を自動抽出
+        const boundary = this.detectResponseBoundary(responseText);
+        if (!boundary) {
+            console.warn("レスポンスの boundary を検出できませんでした。");
+            return results;
+        }
+
         const delimiter = `--${boundary}`;
-        const parts = responseText.split(delimiter).filter(p => p.trim() && p.trim() !== "--");
+        const endDelimiter = `--${boundary}--`;
+        let raw = responseText;
+
+        // 前後のプリンブル/エピローグを考慮し、delimiter で分解
+        const parts = raw
+            .split(delimiter)
+            .map(p => p.trim())
+            .filter(p => p && p !== '--' && p !== endDelimiter);
 
         for (const rawPart of parts) {
             const cleaned = rawPart.replace(/^\r?\n|\r?\n$/g, "");
@@ -203,42 +211,67 @@ export class GCalApiService {
             if (parsed) {
                 results.push(parsed);
             } else {
-                // パース失敗でも結果を返す（エラー扱い）
                 results.push({ status: 500, body: { error: { message: "Failed to parse batch response part." } } });
             }
         }
+
         console.log(`${results.length} 件のバッチ応答アイテムを抽出しました。`);
         return results;
+    }
+
+    // FIX: レスポンス本文から最初の boundary トークンを推定
+    private detectResponseBoundary(text: string): string | null {
+        // 典型例: `--batch_ABCDEF123\r\n` で開始（RFC2046 準拠のトークン）
+        // CRLF あり／なし双方に耐性を持たせる
+        const token = "[A-Za-z0-9'()+_,.\-]+";
+        const m = text.match(new RegExp(`(?:^|\\r?\\n)--(${token})\\r?\\n`));
+        if (m && m[1]) return m[1];
+
+        // 念のため閉じ区切りのパターンも試す
+        const m2 = text.match(new RegExp(`--(${token})--\\r?\\n`));
+        if (m2 && m2[1]) return m2[1];
+
+        return null;
     }
 
     /**
      * 個別のバッチ応答パートをパースします。
      */
     private parseSingleBatchPart(partText: string): BatchResponseItem | null {
+        // 各 part は自前ヘッダの後に `HTTP/1.1 xxx` から始まる HTTP メッセージが続く
         const lines = partText.split(/\r?\n/);
-        const statusLineIdx = lines.findIndex(l => l.startsWith("HTTP/"));
-        const headerEndIdx = lines.findIndex((l, idx) => idx > statusLineIdx && l.trim() === "");
 
-        if (statusLineIdx === -1 || headerEndIdx === -1) {
-            console.warn("バッチパート内で HTTP ステータス行/ヘッダー終端が見つかりません:", lines.slice(0, 5).join("\n"));
+        // `HTTP/` 行を探す
+        const statusLineIdx = lines.findIndex(l => /^HTTP\/\d\.\d\s+\d+/.test(l));
+        if (statusLineIdx === -1) {
+            console.warn("バッチパート内で HTTP ステータス行が見つかりません:", lines.slice(0, 6).join("\n"));
             return null;
         }
 
-        // ステータス行
+        // HTTP ヘッダ終端（空行）を探す（statusLine 以降）
+        const headerEndIdx = lines.findIndex((l, idx) => idx > statusLineIdx && l.trim() === "");
+        if (headerEndIdx === -1) {
+            console.warn("バッチパート内で HTTP ヘッダ終端が見つかりません:", lines.slice(statusLineIdx, statusLineIdx + 10).join("\n"));
+            return null;
+        }
+
+        // ステータス
         const statusLine = lines[statusLineIdx];
         const statusMatch = statusLine.match(/^HTTP\/\d\.\d\s+(\d+)/);
         const status = statusMatch ? parseInt(statusMatch[1], 10) : 500;
 
-        // ボディ
+        // ボディ（空のこともある）
         const bodyRaw = lines.slice(headerEndIdx + 1).join("\n").trim();
-        let bodyJson: any = null;
+        let bodyJson: any = undefined;
         if (bodyRaw) {
             try {
                 bodyJson = JSON.parse(bodyRaw);
             } catch {
-                bodyJson = { message: bodyRaw.slice(0, 200) + (bodyRaw.length > 200 ? "…" : "") };
+                // JSON でなければ切り詰めて保持
+                bodyJson = { message: bodyRaw.slice(0, 500) + (bodyRaw.length > 500 ? "…" : "") };
             }
         }
+
         return { status, body: bodyJson };
     }
 }
