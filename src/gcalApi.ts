@@ -16,7 +16,7 @@ export class GCalApiService {
     /**
      * このプラグインによって作成された Google Calendar イベントを取得します。
      */
-    async fetchGoogleCalendarEvents(): Promise<calendar_v3.Schema$Event[]> {
+    async fetchGoogleCalendarEvents(settings: GoogleCalendarTasksSyncSettings): Promise<calendar_v3.Schema$Event[]> {
         if (!this.plugin.calendar) {
             this.plugin.authService.initializeCalendarApi();
             if (!this.plugin.calendar) {
@@ -27,7 +27,7 @@ export class GCalApiService {
         const existingEvents: calendar_v3.Schema$Event[] = [];
         let nextPageToken: string | undefined;
         const requestParams: calendar_v3.Params$Resource$Events$List = {
-            calendarId: this.plugin.settings.calendarId,
+            calendarId: settings.calendarId,
             privateExtendedProperty: ["isGcalSync=true"],
             showDeleted: false,
             maxResults: 250,
