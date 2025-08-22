@@ -3,7 +3,9 @@ import { calendar_v3 } from 'googleapis';
 import { BatchRequestItem, BatchResponseItem, GoogleCalendarTasksSyncSettings } from './types';
 
 export class BatchProcessor {
-    private readonly BATCH_SIZE = 100;
+    // Google Calendar API のバッチリクエストは、公式ドキュメント上、最大50リクエストまで。
+    // See: https://developers.google.com/calendar/api/guides/batch
+    private readonly BATCH_SIZE = 50;
 
     constructor(private calendarId: string, private settings: GoogleCalendarTasksSyncSettings) {}
 
