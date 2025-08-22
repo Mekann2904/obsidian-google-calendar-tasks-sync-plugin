@@ -234,8 +234,11 @@ export class TaskParser {
         ruleText = ruleText.toLowerCase();
         let dtstartDate: Date;
         if (dtstartHint) {
-            const pDate = moment.utc(dtstartHint, [moment.ISO_8601, 'YYYY-MM-DD'], true);
-            dtstartDate = pDate.isValid() ? pDate.toDate() : moment().startOf('day').toDate(); // UTC or Local Today
+            // FIX: moment.utc() を moment() に変更。
+            // 日付のみのヒント("2023-12-25"など)をUTC0時ではなく、ローカルタイムゾーンの0時として解釈させる。
+            // これにより、タイムゾーンがUTCより西にあるユーザーで日付が1日ずれる問題を修正。
+            const pDate = moment(dtstartHint, [moment.ISO_8601, 'YYYY-MM-DD'], true);
+            dtstartDate = pDate.isValid() ? pDate.toDate() : moment().startOf('day').toDate(); // Local Time
         } else {
             dtstartDate = moment().startOf('day').toDate(); // Local Today
         }
