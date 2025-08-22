@@ -136,6 +136,13 @@ export class SyncLogic {
 
                 results.forEach((res: BatchResponseItem, i: number) => {
                     const req = batchRequests[i];
+                    // FIX: クラッシュ回避のため、応答に対応するリクエストが存在することを確認
+                    if (!req) {
+                        console.warn(`応答に対応するリクエストが見つかりません (index: ${i})。リトライ処理中の不整合の可能性があります。`, res);
+                        errorCount++;
+                        return;
+                    }
+
                     if (res.status >= 200 && res.status < 300) {
                         const newGcalId = res.body?.id;
                         if (req.operationType === 'insert' && newGcalId && req.obsidianTaskId) {

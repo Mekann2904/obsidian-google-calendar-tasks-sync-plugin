@@ -26,6 +26,7 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 		showErrors: true, // エラー通知を表示するか
 		minSyncDurationForNotice: 10, // 通知を表示する最小同期時間（秒）
 	},
+	interBatchDelay: 500, // バッチリクエスト間のデフォルト遅延（ミリ秒）
 };
 
 
@@ -101,6 +102,36 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 						} else if (value !== currentPortSetting.toString()) {
 							new Notice('無効なポート番号です (1024-65535)。', 5000);
 							text.setValue(currentPortSetting.toString()); // 無効な値は元に戻す
+						}
+					});
+			});
+		// バッチ間遅延
+		new Setting(containerEl)
+			.setName('バッチ間遅延 (ミリ秒)')
+			.setDesc('レート制限を回避するため、各バッチリクエスト間に設ける遅延時間 (0-5000ms)。')
+			.addText((text: TextComponent) => {
+				text.inputEl.type = 'number';
+				text.inputEl.min = '0';
+				text.inputEl.max = '5000';
+				const current = this.plugin.settings.interBatchDelay;
+				text.setValue(current.toString())
+					.setPlaceholder(DEFAULT_SETTINGS.interBatchDelay.toString())
+					.onChange(async (value) => {
+						const delay = parseInt(value, 10);
+						let newDelay = current;
+						if (isNaN(delay) || delay < 0) {
+							newDelay = 0;
+						} else if (delay > 5000) {
+							newDelay = 5000;
+						} else {
+							newDelay = delay;
+						}
+						if (current !== newDelay) {
+							this.plugin.settings.interBatchDelay = newDelay;
+							await this.plugin.saveData(this.plugin.settings);
+							text.setValue(newDelay.toString());
+						} else if (value !== newDelay.toString()){
+							text.setValue(newDelay.toString());
 						}
 					});
 			});

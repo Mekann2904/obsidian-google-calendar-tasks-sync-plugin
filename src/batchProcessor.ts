@@ -57,6 +57,11 @@ export class BatchProcessor {
             } catch (e: any) {
                 errors += this.handleBatchError(e, batchChunk, allResults);
             }
+
+            // FIX: 次のバッチがある場合、レート制限回避のために遅延を設ける
+            if (i + this.BATCH_SIZE < batchRequests.length && this.settings.interBatchDelay > 0) {
+                await new Promise(resolve => setTimeout(resolve, this.settings.interBatchDelay));
+            }
         }
 
         console.timeEnd("BatchProcessor: Execute All Batches");
