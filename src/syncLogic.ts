@@ -41,6 +41,11 @@ export class SyncLogic {
         const gcalMapper = new GCalMapper(this.plugin.app, settings);
         const batchProcessor = new BatchProcessor(settings.calendarId, settings);
 
+        // FIX: 強制同期の場合は lastSyncTime をクリアしてフル同期を実行
+        if (force) {
+            settings.lastSyncTime = undefined;
+        }
+
         // 設定と認証の確認
         if (!settings.tokens || !settings.calendarId) {
             ErrorHandler.showError('同期失敗: 認証またはカレンダー ID が設定されていません。');

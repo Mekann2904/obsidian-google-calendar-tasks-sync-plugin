@@ -32,10 +32,16 @@ export class GCalApiService {
             showDeleted: false,
             maxResults: 250,
             singleEvents: false,
-            timeMin: new Date().toISOString(), // 以後のみ（既存ID検証には十分）
         };
 
-        console.log("このプラグインによってマークされた全ての GCal イベントを取得中...");
+        // FIX: API効率化のため、差分同期では updatedMin を使用する
+        if (settings.lastSyncTime) {
+            requestParams.updatedMin = settings.lastSyncTime;
+            console.log(`差分同期をトリガー: ${settings.lastSyncTime} 以降に更新されたイベントのみを取得します。`);
+        } else {
+            // timeMin は updatedMin と併用不可。フル同期時はどちらも不要。
+            console.log(`フル同期をトリガー: すべての管理イベントを取得します。`);
+        }
 
         try {
             let page = 1;
