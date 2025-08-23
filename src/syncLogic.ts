@@ -5,6 +5,7 @@ import GoogleCalendarTasksSyncPlugin from './main';
 import { ObsidianTask, GoogleCalendarEventInput, BatchRequestItem, BatchResponseItem, BatchResult, ErrorLog } from './types';
 import { BatchProcessor } from './batchProcessor';
 import moment from 'moment';
+import { GCalMapper } from './gcalMapper';
 
 export class SyncLogic {
     private plugin: GoogleCalendarTasksSyncPlugin;
