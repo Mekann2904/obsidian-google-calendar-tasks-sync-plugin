@@ -66,7 +66,7 @@ export class TaskParser {
         const isCompleted = checkbox !== ' ' && checkbox !== '';
 
         // FIX: ISO拡張の余計な空白を除去し、秒・小数秒・タイムゾーンを正しくオプショナルに
-        const isoOrSimpleDateRegex = `\\d{4}-\\d{2}-\\d{2}(?:T\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?(?:Z|[+-]\\d{2}:\\d{2})?)?`;
+        const isoOrSimpleDateRegex = `\\d{4}-\\d{2}-\\d{2}(?:[T ]\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?)?(?:Z|[+-]\\d{2}:\\d{2})?`;
         const simpleDateRegexOnly = `\\d{4}-\\d{2}-\\d{2}`;
 
         // メタデータの抽出関数
@@ -74,7 +74,13 @@ export class TaskParser {
             const m = content.match(pattern);
             if (m && m[1]) {
                 const fullMatch = m[0]; // マッチした全体 (e.g., "📅 2023-12-25")
-                const value = m[1]; // キャプチャグループの値 (e.g., "2023-12-25")
+                let value = m[1]; // キャプチャグループの値 (e.g., "2023-12-25")
+
+                // 日付と時刻の区切り文字としてスペースが使われている場合、'T'に正規化する
+                if (value.length > 10 && value[10] === ' ') {
+                    value = value.slice(0, 10) + 'T' + value.slice(11);
+                }
+
                 return { value, remainingContent: content.replace(fullMatch, '').trim() };
             }
             return { value: null, remainingContent: content };
