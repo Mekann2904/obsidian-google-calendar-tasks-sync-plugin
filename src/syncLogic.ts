@@ -232,7 +232,10 @@ export class SyncLogic {
                             return;
                         }
                         if (status === 400) {
-                            try { console.error('400 body:', JSON.stringify(res.body).slice(0, 500)); } catch {}
+                            try {
+                                console.error('400 body:', JSON.stringify(res.body).slice(0, 500));
+                                console.error('400 req:', JSON.stringify(req.body || req.fullBody).slice(0, 500));
+                            } catch {}
                         }
                         // 診断用に recentErrors を更新（上限 50 件）
                         const maxSamples = 50;
@@ -497,6 +500,13 @@ export class SyncLogic {
                             out.push({ ...clone(eventPayload), start: { date: m.format('YYYY-MM-DD') }, end: { date: m.clone().add(1,'day').format('YYYY-MM-DD') }, recurrence: undefined });
                             return;
                         }
+                        // ガード: 不正や逆転を修正
+                        if (!s.isValid()) { console.warn('skip invalid start', m.toString()); return; }
+                        if (!e.isValid() || !e.isAfter(s)) {
+                            // 最低でも設定のデフォルト分だけ確保（存在しない時間帯は次の00:00）
+                            const minEnd = s.clone().add(this.plugin.settings.defaultEventDurationMinutes, 'minute');
+                            e = e.isValid() ? (e.isAfter(s) ? e : minEnd) : minEnd;
+                        }
                         const ev = clone(eventPayload);
                         ev.start = { dateTime: s.toISOString(true) };
                         ev.end = { dateTime: e.toISOString(true) };
@@ -543,6 +553,10 @@ export class SyncLogic {
                     } else {
                         e = sDay.clone().hour(eh!).minute(em!).second(0).millisecond(0);
                     }
+                    if (!s.isValid()) { console.warn('skip invalid start (daily expand):', sDay.toString()); continue; }
+                    if (!e.isValid() || !e.isAfter(s)) {
+                        e = s.clone().add(this.plugin.settings.defaultEventDurationMinutes, 'minute');
+                    }
                     const ev = clone(eventPayload);
                     ev.start = { dateTime: s.toISOString(true) };
                     ev.end = { dateTime: e.toISOString(true) };
@@ -571,7 +585,10 @@ export class SyncLogic {
                 cursor = next;
             }
             // 最終スライス: 00:00〜元の終了時刻
-            out.push({ ...clone(eventPayload), start: { dateTime: cursor.startOf('day').toISOString(true) }, end: { dateTime: edt.toISOString(true) }, recurrence: undefined });
+            const finalStart = cursor.startOf('day');
+            if (finalStart.isBefore(edt)) {
+                out.push({ ...clone(eventPayload), start: { dateTime: finalStart.toISOString(true) }, end: { dateTime: edt.toISOString(true) }, recurrence: undefined });
+            }
             // 正規化: date を排除
             out.forEach(ev => { if ((ev.start as any).date) delete (ev.start as any).date; if ((ev.end as any).date) delete (ev.end as any).date; });
             return out;
