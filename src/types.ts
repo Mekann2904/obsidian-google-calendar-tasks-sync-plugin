@@ -83,6 +83,7 @@ export interface BatchResult {
     deleted: number;
     errors: number;
     skipped: number;
+    metrics?: SyncMetrics;
 }
 
 // エラーログ用インターフェース
@@ -93,4 +94,13 @@ export interface ErrorLog {
     gcalId?: string;
     retryCount: number;
     errorDetails: any;
+}
+
+// 同期メトリクス
+export interface SyncMetrics {
+    sentSubBatches: number;      // 送信したサブバッチ数（最大50件単位）
+    attempts: number;            // 再送を含む試行回数
+    totalWaitMs: number;         // バックオフ + インターバッチ待機の合計
+    batchLatenciesMs: number[];  // 各サブバッチの往復レイテンシ
+    statusCounts: { [status: number]: number }; // ステータスコード分布
 }

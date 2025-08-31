@@ -2,7 +2,7 @@ import { Notice } from 'obsidian';
 import { ErrorHandler, DateUtils } from './commonUtils';
 import { calendar_v3 } from 'googleapis';
 import GoogleCalendarTasksSyncPlugin from './main';
-import { ObsidianTask, GoogleCalendarEventInput, BatchRequestItem, BatchResponseItem, BatchResult, ErrorLog, GoogleCalendarTasksSyncSettings } from './types';
+import { ObsidianTask, GoogleCalendarEventInput, BatchRequestItem, BatchResponseItem, BatchResult, ErrorLog, GoogleCalendarTasksSyncSettings, SyncMetrics } from './types';
 import { createHash } from 'crypto';
 import { BatchProcessor } from './batchProcessor';
 import moment from 'moment';
@@ -128,7 +128,7 @@ export class SyncLogic {
 
             // 5. バッチ実行
             if (batchRequests.length > 0) {
-                const { results, created, updated, deleted, errors, skipped: batchSkipped } =
+                const { results, created, updated, deleted, errors, skipped: batchSkipped, metrics } =
                     await this.executeBatchesWithRetry(batchRequests, batchProcessor);
                 
                 createdCount += created;
@@ -136,6 +136,9 @@ export class SyncLogic {
                 deletedCount += deleted;
                 errorCount += errors;
                 skippedCount += batchSkipped;
+
+                // メトリクスの要約を出力
+                if (metrics) this.logMetricsSummary('Main Batch', metrics);
 
                 const calendarPath = `/calendar/v3/calendars/${encodeURIComponent(settings.calendarId)}/events`;
                 const fallbackInserts: BatchRequestItem[] = [];
@@ -211,6 +214,7 @@ export class SyncLogic {
                     deletedCount += fb.deleted;
                     errorCount += fb.errors;
                     skippedCount += fb.skipped;
+                    if (fb.metrics) this.logMetricsSummary('Fallback Inserts', fb.metrics);
                     fb.results.forEach((res, idx) => {
                         const req = fallbackInserts[idx];
                         if (res.status >= 200 && res.status < 300 && res.body?.id && req.obsidianTaskId) {
@@ -395,6 +399,13 @@ export class SyncLogic {
         // 選択的リトライ: 成功/恒久失敗は確定し、403/429/5xx のみ再送
         const finalResults: BatchResponseItem[] = new Array(batchRequests.length);
         let created = 0, updated = 0, deleted = 0, errors = 0, skipped = 0;
+        const metrics: SyncMetrics = {
+            sentSubBatches: 0,
+            attempts: 0,
+            totalWaitMs: 0,
+            batchLatenciesMs: [],
+            statusCounts: {},
+        };
 
         const isTransient = (status: number) => [403, 429, 500, 502, 503, 504].includes(status);
         const treatAsSkipped = (req: BatchRequestItem, status: number) => {
@@ -410,16 +421,22 @@ export class SyncLogic {
         while (pending.length > 0) {
             attempt++;
             this.retryCount = attempt - 1;
+            metrics.attempts = attempt; // 最終回数で更新
 
             for (let i = 0; i < pending.length; i += 50) {
                 const windowIdx = pending.slice(i, i + 50);
                 const subReq = windowIdx.map(idx => batchRequests[idx]);
+                const start = performance.now();
                 const subRes = await this.plugin.gcalApi.executeBatchRequest(subReq);
+                const end = performance.now();
+                metrics.sentSubBatches++;
+                metrics.batchLatenciesMs.push(end - start);
 
                 subRes.forEach((res, k) => {
                     const origIdx = windowIdx[k];
                     const req = batchRequests[origIdx];
 
+                    metrics.statusCounts[res.status] = (metrics.statusCounts[res.status] || 0) + 1;
                     if (res.status >= 200 && res.status < 300) {
                         finalResults[origIdx] = res;
                         switch (req.operationType) {
@@ -449,6 +466,7 @@ export class SyncLogic {
 
                 // レート制限回避のためのインターバッチ遅延
                 if (i + 50 < pending.length && this.plugin.settings.interBatchDelay > 0) {
+                    metrics.totalWaitMs += this.plugin.settings.interBatchDelay;
                     await new Promise(resolve => setTimeout(resolve, this.plugin.settings.interBatchDelay));
                 }
             }
@@ -470,11 +488,12 @@ export class SyncLogic {
             }
 
             const delay = this.RETRY_DELAY_MS * Math.pow(2, attempt) + Math.floor(Math.random() * 250);
+            metrics.totalWaitMs += delay;
             await new Promise(resolve => setTimeout(resolve, delay));
             pending = nextPending;
         }
 
-        return { results: finalResults, created, updated, deleted, errors, skipped };
+        return { results: finalResults, created, updated, deleted, errors, skipped, metrics };
     }
 
     // 安定イベントIDを生成（Googleの制約: 英小文字/数字/ハイフン/アンダースコア, 5-1024文字）
@@ -588,5 +607,23 @@ export class SyncLogic {
 
         // 何も差分がない場合は summary を noop として入れない（空オブジェクトのまま返す）
         return patch;
+    }
+
+    // メトリクスのp50/p95/p99を計算して要約ログを出力
+    private logMetricsSummary(title: string, metrics: SyncMetrics): void {
+        const lat = metrics.batchLatenciesMs.slice().sort((a,b)=>a-b);
+        const pct = (p: number) => {
+            if (lat.length === 0) return 0;
+            const idx = Math.min(lat.length - 1, Math.ceil((p/100)*lat.length)-1);
+            return lat[idx];
+        };
+        const p50 = pct(50);
+        const p95 = pct(95);
+        const p99 = pct(99);
+        const sum = lat.reduce((s,v)=>s+v,0);
+        const avg = lat.length ? sum/lat.length : 0;
+        const sc = metrics.statusCounts;
+        const scStr = Object.keys(sc).sort().map(k=>`${k}:${sc[+k]}`).join(', ');
+        console.log(`[Metrics] ${title}: batches=${metrics.sentSubBatches}, attempts=${metrics.attempts}, waitMs=${metrics.totalWaitMs}, avg=${avg.toFixed(1)}ms, p50=${p50.toFixed(1)}ms, p95=${p95.toFixed(1)}ms, p99=${p99.toFixed(1)}ms, statuses={ ${scStr} }`);
     }
 }
