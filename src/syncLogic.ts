@@ -414,7 +414,18 @@ export class SyncLogic {
         const rr = (eventPayload.recurrence || [])[0] || '';
         const mDaily = rr.match(/FREQ=DAILY(?:;COUNT=(\d+))?/);
         if (mDaily) {
-            const count = Number(mDaily[1] || '1');
+            let count = Number(mDaily[1] || '');
+            if (!count || isNaN(count)) {
+                // COUNT が無い場合は🛫〜📅の日数で補完
+                if (task.startDate && task.dueDate) {
+                    const s = moment(task.startDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
+                    const e = moment(task.dueDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
+                    const days = e.diff(s, 'days') + 1;
+                    count = days > 0 ? days : 1;
+                } else {
+                    count = 1;
+                }
+            }
             const base = eventPayload.start?.dateTime ? moment.parseZone(eventPayload.start.dateTime) : null;
             if (base && count > 0) {
                 // 時間帯はタスクの timeWindow または payload の時刻から推定
