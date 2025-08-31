@@ -15,6 +15,8 @@ import { GCalMapper } from './gcalMapper';
 import { GCalApiService } from './gcalApi';
 import { SyncLogic } from './syncLogic';
 import { validateMoment } from './utils'; // ユーティリティ関数をインポート
+import { GoogleTasksService } from './tasksApi';
+import { TasksSync } from './tasksSync';
 
 export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 	settings: GoogleCalendarTasksSyncSettings;
@@ -27,6 +29,8 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 	gcalMapper: GCalMapper;
 	gcalApi: GCalApiService;
 	syncLogic: SyncLogic;
+	tasksService?: GoogleTasksService;
+	tasksSync?: TasksSync;
 	private isSyncing: boolean = false;
 
 	constructor(app: App, manifest: any) {
@@ -75,6 +79,16 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 			callback: async () => this.triggerSync(),
 		});
 
+		this.addCommand({
+			id: 'sync-nested-to-google-tasks',
+			name: 'ネストタスクを Google Tasks に同期する',
+			callback: async () => {
+				if (!this.settings.enableGoogleTasksSync) { new Notice('設定で Google Tasks 同期を有効にしてください。'); return; }
+				if (!this.tasksService || !this.tasksSync) { this.tasksService = new GoogleTasksService(this); this.tasksSync = new TasksSync(this.app, this, this.tasksService); }
+				await this.syncNestedToGoogleTasks();
+			}
+		});
+
 		// 重複整理（ドライラン）
 		this.addCommand({
 			id: 'dedupe-cleanup-dry-run',
@@ -102,6 +116,12 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 
 		// 自動同期のセットアップ
 		this.setupAutoSync();
+
+		// Google Tasks 連携の初期化
+		if (this.settings.enableGoogleTasksSync) {
+			this.tasksService = new GoogleTasksService(this);
+			this.tasksSync = new TasksSync(this.app, this, this.tasksService);
+		}
 
 		console.log('Google Calendar Sync プラグインがロードされました。');
 	}
@@ -269,6 +289,20 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 			window.clearInterval(this.syncIntervalId);
 			this.syncIntervalId = null;
 			console.log("自動同期タイマーが停止されました。");
+		}
+	}
+
+	// Google Tasks 連携（設定タブからも呼び出される）
+	async syncNestedToGoogleTasks(): Promise<void> {
+		if (!this.settings.enableGoogleTasksSync) { new Notice('Google Tasks 同期は無効です。'); return; }
+		if (!this.oauth2Client) { new Notice('未認証です。設定から認証してください。'); return; }
+		if (!this.tasksService || !this.tasksSync) { this.tasksService = new GoogleTasksService(this); this.tasksSync = new TasksSync(this.app, this, this.tasksService); }
+		try {
+			await this.tasksSync!.syncNestedToGoogleTasks();
+			new Notice('ネストタスクを Google Tasks に同期しました。');
+		} catch (e: any) {
+			console.error('Google Tasks 同期でエラー:', e);
+			new Notice('Google Tasks 同期でエラーが発生しました。コンソールを確認してください。');
 		}
 	}
 }

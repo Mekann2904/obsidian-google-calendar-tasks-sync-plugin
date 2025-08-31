@@ -62,6 +62,7 @@ export interface GoogleCalendarTasksSyncSettings {
 	interBatchDelay: number; // バッチリクエスト間の遅延（ミリ秒）
 	recentErrors?: ErrorLog[]; // 最近のエラーサンプル（診断用）
 	useSyncToken?: boolean; // 可能な場合、syncToken による増分取得を使用
+	enableGoogleTasksSync?: boolean; // ネストタスクをGoogle Tasksへ同期
 }
 
 // バッチリクエスト用のインターフェース

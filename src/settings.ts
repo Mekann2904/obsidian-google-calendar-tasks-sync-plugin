@@ -17,6 +17,7 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 	includeDescriptionInIdentity: false,
 	includeReminderInIdentity: false,
 	useSyncToken: false,
+	enableGoogleTasksSync: false,
 	syncPriorityToDescription: true,
 	syncTagsToDescription: true,
 	syncBlockLinkToDescription: false, // デフォルトではオフ (Obsidian URI に統合されるため)
@@ -455,6 +456,29 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 
 		// --- 手動アクション & デバッグセクション ---
 		containerEl.createEl('h3', { text: '手動アクション & デバッグ' });
+
+		// Google Tasks 連携
+		new Setting(containerEl)
+			.setName('Google Tasks 同期を有効化')
+			.setDesc('親タスク配下のネストされたチェックボックスを Google Tasks に同期（テスト機能）')
+			.addToggle(toggle => toggle
+				.setValue(!!this.plugin.settings.enableGoogleTasksSync)
+				.onChange(async (value) => {
+					this.plugin.settings.enableGoogleTasksSync = value;
+					await this.plugin.saveData(this.plugin.settings);
+					new Notice('設定を保存しました。必要に応じて再認証してください。');
+				}));
+
+		new Setting(containerEl)
+			.setName('ネストタスクを Google Tasks へ同期')
+			.setDesc('親タスク名でタスクリストを作成し、子タスクを項目として追加（テスト機能）。')
+			.addButton(btn => btn
+				.setButtonText('同期する')
+				.onClick(async () => {
+					// @ts-ignore
+					await this.plugin.syncNestedToGoogleTasks();
+					new Notice('Google Tasks への同期が完了しました。');
+				}));
 		// 強制同期ボタン
 		new Setting(containerEl)
 			.setName('今すぐ強制同期')

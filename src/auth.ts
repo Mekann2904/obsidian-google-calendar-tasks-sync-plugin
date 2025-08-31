@@ -15,6 +15,14 @@ export class AuthService {
         this.plugin = plugin;
     }
 
+    private buildScopes(): string[] {
+        const scopes = ['https://www.googleapis.com/auth/calendar.events'];
+        try {
+            if ((this.plugin.settings as any).enableGoogleTasksSync) scopes.push('https://www.googleapis.com/auth/tasks');
+        } catch {}
+        return scopes;
+    }
+
     /**
      * Google OAuth 認証フローでリダイレクト先として使用される URI を取得します。
      * 設定されたポート番号を使用します。
@@ -165,7 +173,7 @@ export class AuthService {
             // 認証URLを生成
             const authUrl = this.plugin.oauth2Client.generateAuthUrl({
                 access_type: 'offline', // リフレッシュトークンを取得するため
-                scope: ['https://www.googleapis.com/auth/calendar.events'], // カレンダーイベントへのアクセス権限
+                scope: this.buildScopes(), // 必要スコープ
                 prompt: 'consent', // 常に同意画面を表示 (リフレッシュトークン再取得のため)
                 state: this.activeOAuthState, // CSRF対策
                 redirect_uri: currentRedirectUri // コールバックを受け取るURI
