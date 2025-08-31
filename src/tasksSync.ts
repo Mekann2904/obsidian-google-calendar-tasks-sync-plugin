@@ -1,4 +1,5 @@
 import { App } from 'obsidian';
+import { tasks_v1 } from 'googleapis';
 import GoogleCalendarTasksSyncPlugin from './main';
 import { GoogleTasksService } from './tasksApi';
 
