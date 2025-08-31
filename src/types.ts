@@ -37,6 +37,8 @@ export interface GoogleCalendarTasksSyncSettings {
 	autoSync: boolean; // 自動同期を有効にするか
 	taskMap: { [obsidianTaskId: string]: string }; // ObsidianタスクIDとGoogle CalendarイベントIDのマッピング
 	lastSyncTime?: string; // 最後に同期が成功した時刻 (ISO 8601 形式)
+	fetchWindowPastDays?: number; // フル同期時の取得窓: 過去日数
+	fetchWindowFutureDays?: number; // フル同期時の取得窓: 未来日数
 	// Google Calendar イベントの説明欄にどの情報を含めるかの設定
 	syncPriorityToDescription: boolean; // 優先度を説明に追加するか
 	syncTagsToDescription: boolean; // タグを説明に追加するか

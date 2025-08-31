@@ -12,6 +12,8 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 	autoSync: true,
 	taskMap: {},
 	lastSyncTime: undefined,
+	fetchWindowPastDays: 90,
+	fetchWindowFutureDays: 180,
 	syncPriorityToDescription: true,
 	syncTagsToDescription: true,
 	syncBlockLinkToDescription: false, // デフォルトではオフ (Obsidian URI に統合されるため)
@@ -293,6 +295,41 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 						} else if(value !== newDur.toString()){
 							text.setValue(newDur.toString()); // 表示を正規化
 						}
+					});
+			});
+
+		// 取得窓（フル同期時）
+		new Setting(containerEl)
+			.setName('フル同期の取得窓（過去日数）')
+			.setDesc('lastSyncTime が未設定のフル同期時に、過去N日分に取得を制限する (0 で無制限)。')
+			.addText(text => {
+				text.inputEl.type = 'number';
+				text.inputEl.min = '0';
+				const current = this.plugin.settings.fetchWindowPastDays ?? DEFAULT_SETTINGS.fetchWindowPastDays!;
+				text.setValue(String(current))
+					.onChange(async (value) => {
+						let n = parseInt(value, 10);
+						if (isNaN(n) || n < 0) n = 0;
+						this.plugin.settings.fetchWindowPastDays = n;
+						await this.plugin.saveData(this.plugin.settings);
+						text.setValue(String(n));
+					});
+			});
+
+		new Setting(containerEl)
+			.setName('フル同期の取得窓（未来日数）')
+			.setDesc('lastSyncTime が未設定のフル同期時に、未来M日分に取得を制限する (0 で無制限)。')
+			.addText(text => {
+				text.inputEl.type = 'number';
+				text.inputEl.min = '0';
+				const current = this.plugin.settings.fetchWindowFutureDays ?? DEFAULT_SETTINGS.fetchWindowFutureDays!;
+				text.setValue(String(current))
+					.onChange(async (value) => {
+						let n = parseInt(value, 10);
+						if (isNaN(n) || n < 0) n = 0;
+						this.plugin.settings.fetchWindowFutureDays = n;
+						await this.plugin.saveData(this.plugin.settings);
+						text.setValue(String(n));
 					});
 			});
 		// --- Google イベント説明欄の内容 ---
