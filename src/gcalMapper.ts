@@ -45,16 +45,21 @@ export class GCalMapper {
 
         // 繰り返しルール
         if (!task.isCompleted && task.recurrenceRule && event.start) { // 未完了でルールと開始時間がある場合のみ
-            let rruleString = task.recurrenceRule.toUpperCase();
-            if (!rruleString.startsWith('RRULE:')) {
-                rruleString = `RRULE:${rruleString}`;
-            }
+            // RRULE 正規化: 複数行や先頭に DTSTART が付く表現を許容し、RRULE 行のみ抽出
+            const raw = String(task.recurrenceRule).trim();
+            const upper = raw.replace(/\r/g, '\n').toUpperCase();
+            const rruleLineMatch = upper.match(/RRULE:[^\n]+/);
+            let normalized = '';
+            if (rruleLineMatch) normalized = rruleLineMatch[0];
+            else if (/^FREQ=/.test(upper)) normalized = `RRULE:${upper}`;
+            else normalized = upper.replace(/DTSTART:[^\n]+\n?/g, '').trim();
+            if (normalized && !normalized.startsWith('RRULE:')) normalized = `RRULE:${normalized}`;
             try {
-                rrulestr(rruleString); // パース可能かチェック
-                event.recurrence = [rruleString];
+                rrulestr(normalized); // パース可能かチェック
+                event.recurrence = [normalized];
             } catch (e) {
-                 console.warn(`タスク "${task.summary || task.id}" の無効な RRULE 文字列: ${task.recurrenceRule}。繰り返しをスキップします。`, e);
-                 delete event.recurrence;
+                console.warn(`タスク "${task.summary || task.id}" の無効な RRULE 文字列(正規化後): ${normalized}。繰り返しをスキップします。`, e);
+                delete event.recurrence;
             }
         } else {
             delete event.recurrence; // 完了済み、ルールなし、または開始時間がない場合は削除
