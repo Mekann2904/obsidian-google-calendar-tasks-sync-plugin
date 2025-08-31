@@ -63,6 +63,7 @@ export class TasksSync {
 
       // ローカル子の集合
       const localChildIds = new Set<string>(tree.children.map(c => c.id));
+      const reservedRemoteIds = new Set<string>();
 
       // 再帰的に（親→子→孫）を処理。due は親から継承
       const processNode = async (node: NestedTaskNode, parentTaskId: string | undefined, inheritedDue: string | undefined) => {
@@ -77,17 +78,19 @@ export class TasksSync {
         let gid = settings.tasksItemMap![node.id];
         if (gid && remoteById.has(gid)) {
           await this.gtasks.upsertTasks(listId!, [{ id: gid, title: node.title, notes: this.buildManagedNotes(node.notes, node.id), due: dueIso, parentId: parentTaskId }]);
+          reservedRemoteIds.add(gid);
         } else {
           const dup = remoteByTitle.get(node.title);
           if (dup?.id) {
             settings.tasksItemMap![node.id] = dup.id;
             await this.gtasks.upsertTasks(listId!, [{ id: dup.id, title: node.title, notes: this.buildManagedNotes(node.notes, node.id), due: dueIso, parentId: parentTaskId }]);
             gid = dup.id;
+            reservedRemoteIds.add(dup.id);
           } else {
             await this.gtasks.upsertTasks(listId!, [{ title: node.title, notes: this.buildManagedNotes(node.notes, node.id), due: dueIso, parentId: parentTaskId }]);
             const refreshed = await this.gtasks.listTasks(listId!);
             const found = refreshed.find(t => t.title === node.title && (t.notes || '').includes(`obsidianTaskId=${node.id}`));
-            if (found?.id) gid = settings.tasksItemMap![node.id] = found.id;
+            if (found?.id) { gid = settings.tasksItemMap![node.id] = found.id; reservedRemoteIds.add(found.id); }
           }
         }
         for (const childNode of node.children) {
@@ -99,15 +102,11 @@ export class TasksSync {
         await processNode(child, undefined, tree.dueDate || startMatch[1]);
       }
 
-      // 不要なリモート（管理対象でローカルに存在しない）を削除
-      const localIdsRecursive = new Set<string>();
-      const collectIds = (n: NestedTaskNode) => { localIdsRecursive.add(n.id); n.children.forEach(collectIds); };
-      tree.children.forEach(collectIds);
+      // 不要なリモート（今回の同期で予約されなかった管理タスク）だけ削除
       for (const t of remote) {
-        if (!this.isManagedTask(t) || !t.notes) continue;
-        const m = t.notes.match(/obsidianTaskId=([^\s]+)/);
-        const cid = m ? m[1] : undefined;
-        if (cid && !localIdsRecursive.has(cid) && t.id) {
+        if (!this.isManagedTask(t) || !t.id) continue;
+        if (t.title === '[ogcts:list-marker]') continue;
+        if (!reservedRemoteIds.has(t.id)) {
           try { await this.gtasks.deleteTask(listId!, t.id); } catch {}
         }
       }
