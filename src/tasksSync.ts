@@ -59,12 +59,12 @@ export class TasksSync {
 
         let gid = settings.tasksItemMap![node.id];
         if (gid && remoteById.has(gid)) {
-          await this.gtasks.upsertTasks(listId!, [{ id: gid, title: node.title, notes: this.buildManagedNotes(node.notes, node.id), due: dueIso }]);
+          await this.gtasks.upsertTasks(listId!, [{ id: gid, title: node.title, notes: this.buildManagedNotes(node.notes, node.id), due: dueIso, parentId: parentTaskId }]);
         } else {
           const dup = remoteByTitle.get(node.title);
           if (dup?.id) {
             settings.tasksItemMap![node.id] = dup.id;
-            await this.gtasks.upsertTasks(listId!, [{ id: dup.id, title: node.title, notes: this.buildManagedNotes(node.notes, node.id), due: dueIso }]);
+            await this.gtasks.upsertTasks(listId!, [{ id: dup.id, title: node.title, notes: this.buildManagedNotes(node.notes, node.id), due: dueIso, parentId: parentTaskId }]);
             gid = dup.id;
           } else {
             await this.gtasks.upsertTasks(listId!, [{ title: node.title, notes: this.buildManagedNotes(node.notes, node.id), due: dueIso, parentId: parentTaskId }]);

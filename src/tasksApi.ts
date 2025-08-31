@@ -46,8 +46,12 @@ export class GoogleTasksService {
         for (const t of tasks) {
             if (t.id) {
                 await this.tasks.tasks.patch({ tasklist: listId, task: t.id, requestBody: { title: t.title, notes: t.notes, due: t.due } });
+                if (t.parentId) {
+                    // 親の変更は move API を使用
+                    await this.tasks.tasks.move({ tasklist: listId, task: t.id, parent: t.parentId });
+                }
             } else {
-                await this.tasks.tasks.insert({ tasklist: listId, requestBody: { title: t.title, notes: t.notes, due: t.due, parent: t.parentId } });
+                await this.tasks.tasks.insert({ tasklist: listId, parent: t.parentId, requestBody: { title: t.title, notes: t.notes, due: t.due } });
             }
         }
     }
