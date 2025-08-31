@@ -11,6 +11,8 @@ interface NestedTaskNode {
   id: string;
   path: string;
   done: boolean;
+  startDate?: string | null;
+  dueDate?: string | null;
 }
 
 export class TasksSync {
@@ -46,34 +48,43 @@ export class TasksSync {
       // ローカル子の集合
       const localChildIds = new Set<string>(tree.children.map(c => c.id));
 
-      // アップサート（ローカル優先）: 未完了のみ、完了は削除
-      for (const child of tree.children) {
-        if (child.done) {
-          const gidDel = settings.tasksItemMap![child.id];
-          if (gidDel) { try { await this.gtasks.deleteTask(listId!, gidDel); } catch {} delete settings.tasksItemMap![child.id]; }
-          continue;
+      // 再帰的に（親→子→孫）を処理。due は親から継承
+      const processNode = async (node: NestedTaskNode, parentTaskId: string | undefined, inheritedDue: string | undefined) => {
+        if (node.done) {
+          const gidDel = settings.tasksItemMap![node.id];
+          if (gidDel) { try { await this.gtasks.deleteTask(listId!, gidDel); } catch {} delete settings.tasksItemMap![node.id]; }
+          return;
         }
-        let gid = settings.tasksItemMap![child.id];
+        const effectiveDue = node.dueDate || inheritedDue;
+        const dueIso = effectiveDue ? new Date(`${effectiveDue}T23:59:00`).toISOString() : undefined;
+
+        let gid = settings.tasksItemMap![node.id];
         if (gid && remoteById.has(gid)) {
-          await this.gtasks.upsertTasks(listId!, [{ id: gid, title: child.title, notes: this.buildManagedNotes(child.notes, child.id) }]);
+          await this.gtasks.upsertTasks(listId!, [{ id: gid, title: node.title, notes: this.buildManagedNotes(node.notes, node.id), due: dueIso }]);
         } else {
-          // タイトル一致の既存があれば再利用
-          const dup = remoteByTitle.get(child.title);
+          const dup = remoteByTitle.get(node.title);
           if (dup?.id) {
-            settings.tasksItemMap![child.id] = dup.id;
-            await this.gtasks.upsertTasks(listId!, [{ id: dup.id, title: child.title, notes: this.buildManagedNotes(child.notes, child.id) }]);
+            settings.tasksItemMap![node.id] = dup.id;
+            await this.gtasks.upsertTasks(listId!, [{ id: dup.id, title: node.title, notes: this.buildManagedNotes(node.notes, node.id), due: dueIso }]);
+            gid = dup.id;
           } else {
-            await this.gtasks.upsertTasks(listId!, [{ title: child.title, notes: this.buildManagedNotes(child.notes, child.id) }]);
-            // 新規挿入のID取得は batch では困難なため、簡易に再取得してマッピング（少数前提）
+            await this.gtasks.upsertTasks(listId!, [{ title: node.title, notes: this.buildManagedNotes(node.notes, node.id), due: dueIso, parentId: parentTaskId }]);
             const refreshed = await this.gtasks.listTasks(listId!);
-            const found = refreshed.find(t => t.title === child.title && (t.notes || '').includes(`obsidianTaskId=${child.id}`));
-            if (found?.id) settings.tasksItemMap![child.id] = found.id;
+            const found = refreshed.find(t => t.title === node.title && (t.notes || '').includes(`obsidianTaskId=${node.id}`));
+            if (found?.id) gid = settings.tasksItemMap![node.id] = found.id;
           }
         }
+        for (const childNode of node.children) {
+          await processNode(childNode, gid, effectiveDue);
+        }
+      };
+
+      for (const child of tree.children) {
+        await processNode(child, undefined, tree.dueDate || startMatch[1]);
       }
 
       // 子が全て完了ならリストを削除
-      const anyActive = tree.children.some(c => !c.done);
+      const anyActive = tree.children.some(c => !this.isAllDoneRecursive(c));
       if (!anyActive) {
         try { await this.gtasks.deleteList(listId!); } catch {}
         delete settings.tasksListMap![tree.id];
@@ -107,6 +118,10 @@ export class TasksSync {
           const done = /x|X|✓|✔/.test(mark);
           const id = this.makeId(file.path, i, line);
           const node: NestedTaskNode = { title, notes: undefined, children: [], indent, id, path: file.path, done };
+          const sm = title.match(/🛫\s*(\d{4}-\d{2}-\d{2})/);
+          const dm = title.match(/📅\s*(\d{4}-\d{2}-\d{2})/);
+          node.startDate = sm ? sm[1] : null;
+          node.dueDate = dm ? dm[1] : null;
 
           while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop();
           if (stack.length === 0) {
@@ -138,6 +153,12 @@ export class TasksSync {
       hash = ((hash << 5) - hash) + ch; hash |= 0;
     }
     return `obsidian-${path}-${index}-${hash}`;
+  }
+
+  private isAllDoneRecursive(n: NestedTaskNode): boolean {
+    if (!n) return true;
+    if (!n.done) return false;
+    return n.children.every(c => this.isAllDoneRecursive(c));
   }
 
   private buildManagedNotes(userNotes: string | undefined, obsidianTaskId: string): string {

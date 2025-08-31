@@ -39,15 +39,15 @@ export class GoogleTasksService {
         return res.data.items || [];
     }
 
-    async upsertTasks(listId: string, tasks: Array<{ id?: string; title: string; notes?: string }>): Promise<void> {
+    async upsertTasks(listId: string, tasks: Array<{ id?: string; title: string; notes?: string; due?: string; parentId?: string }>): Promise<void> {
         this.ensureClient();
         if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');
 
         for (const t of tasks) {
             if (t.id) {
-                await this.tasks.tasks.patch({ tasklist: listId, task: t.id, requestBody: { title: t.title, notes: t.notes } });
+                await this.tasks.tasks.patch({ tasklist: listId, task: t.id, requestBody: { title: t.title, notes: t.notes, due: t.due } });
             } else {
-                await this.tasks.tasks.insert({ tasklist: listId, requestBody: { title: t.title, notes: t.notes } });
+                await this.tasks.tasks.insert({ tasklist: listId, requestBody: { title: t.title, notes: t.notes, due: t.due, parent: t.parentId } });
             }
         }
     }
