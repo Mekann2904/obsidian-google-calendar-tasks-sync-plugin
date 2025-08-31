@@ -1,5 +1,6 @@
 import { Notice } from 'obsidian';
 import { ErrorHandler, DateUtils, FingerprintUtils } from './commonUtils';
+import { rrulestr } from 'rrule';
 import { calendar_v3 } from 'googleapis';
 import GoogleCalendarTasksSyncPlugin from './main';
 import { ObsidianTask, GoogleCalendarEventInput, BatchRequestItem, BatchResponseItem, BatchResult, ErrorLog, GoogleCalendarTasksSyncSettings, SyncMetrics } from './types';
@@ -410,9 +411,62 @@ export class SyncLogic {
         const out: GoogleCalendarEventInput[] = [];
         const clone = (e: GoogleCalendarEventInput): GoogleCalendarEventInput => JSON.parse(JSON.stringify(e));
 
+        const ruleStr = (eventPayload.recurrence || [])[0] || '';
+        const hasRecurrence = !!ruleStr;
+
+        // 0) 汎用: RRULE があり、🛫/📅 がある場合は rrule で期間内の実発生日を列挙して個別イベント化
+        if (hasRecurrence && task.startDate && task.dueDate) {
+            try {
+                const dtstart = eventPayload.start?.dateTime ? new Date(eventPayload.start.dateTime) : new Date(task.startDate);
+                const set = rrulestr(ruleStr, { forceset: true, dtstart });
+                const startBound = moment(task.startDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day').toDate();
+                // inclusive のため終端は日末まで
+                const endBound = moment(task.dueDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).endOf('day').toDate();
+                const dates: Date[] = (set as any).between(startBound, endBound, true) as Date[];
+                if (dates && dates.length > 0) {
+                    const baseStart = eventPayload.start?.dateTime ? moment.parseZone(eventPayload.start.dateTime) : null;
+                    const baseEnd = eventPayload.end?.dateTime ? moment.parseZone(eventPayload.end.dateTime) : null;
+                    const durationMs = baseStart && baseEnd ? baseEnd.diff(baseStart) : 0;
+                    const twStart = task.timeWindowStart || (baseStart ? baseStart.format('HH:mm') : undefined);
+                    const twEnd = task.timeWindowEnd || (baseEnd ? baseEnd.format('HH:mm') : undefined);
+
+                    dates.forEach(d => {
+                        const m = moment(d);
+                        let s: moment.Moment;
+                        let e: moment.Moment;
+                        if (twStart && twEnd) {
+                            const [sh, sm] = twStart.split(':').map(Number);
+                            s = m.clone().hour(sh).minute(sm).second(0).millisecond(0);
+                            if (twEnd === '24:00') e = m.clone().add(1,'day').startOf('day');
+                            else {
+                                const [eh, em] = twEnd.split(':').map(Number);
+                                e = m.clone().hour(eh).minute(em).second(0).millisecond(0);
+                            }
+                        } else if (baseStart && durationMs > 0) {
+                            s = m.clone().hour(baseStart.hour()).minute(baseStart.minute()).second(0).millisecond(0);
+                            e = s.clone().add(durationMs, 'ms');
+                        } else {
+                            // 時刻情報がない場合は終日1日（フォールバック）
+                            out.push({ ...clone(eventPayload), start: { date: m.format('YYYY-MM-DD') }, end: { date: m.clone().add(1,'day').format('YYYY-MM-DD') }, recurrence: undefined });
+                            return;
+                        }
+                        const ev = clone(eventPayload);
+                        ev.start = { dateTime: s.toISOString(true) };
+                        ev.end = { dateTime: e.toISOString(true) };
+                        ev.recurrence = undefined;
+                        if ((ev.start as any).date) delete (ev.start as any).date;
+                        if ((ev.end as any).date) delete (ev.end as any).date;
+                        out.push(ev);
+                    });
+                    if (out.length > 0) return out;
+                }
+            } catch (e) {
+                console.warn('RRULE 展開に失敗したため、フォールバック経路を使用します。', e);
+            }
+        }
+
         // 1) daily + COUNT の場合は個別イベントに展開
-        const rr = (eventPayload.recurrence || [])[0] || '';
-        const mDaily = rr.match(/FREQ=DAILY(?:;COUNT=(\d+))?/);
+        const mDaily = ruleStr.match(/FREQ=DAILY(?:;COUNT=(\d+))?/);
         if (mDaily) {
             let count = Number(mDaily[1] || '');
             if (!count || isNaN(count)) {
