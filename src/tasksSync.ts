@@ -37,6 +37,13 @@ export class TasksSync {
         try { await this.gtasks.deleteList(lid); } catch {}
         delete settings.tasksListMap![pid];
       }
+      // 設定マップに残っているが marker 走査に出なかった古いリストIDも削除対象
+      for (const [pid, lid] of Object.entries(settings.tasksListMap || {})) {
+        if (!(pid in remoteIndex.parentToList)) {
+          try { await this.gtasks.deleteList(lid); } catch {}
+          delete settings.tasksListMap![pid];
+        }
+      }
       await this.plugin.saveData(settings);
       return; // すべて削除したので今回の同期は終了
     }
@@ -44,6 +51,13 @@ export class TasksSync {
     // ローカルに存在しない親のリストは削除（部分的な全削除）
     for (const [pid, lid] of Object.entries(remoteIndex.parentToList)) {
       if (!localParentIds.has(pid)) {
+        try { await this.gtasks.deleteList(lid); } catch {}
+        delete settings.tasksListMap![pid];
+      }
+    }
+    // 設定マップに残っているが、ローカルに存在しない親に紐づく古いリストIDも削除
+    for (const [pid, lid] of Object.entries(settings.tasksListMap || {})) {
+      if (!localParentIds.has(pid) && !(pid in remoteIndex.parentToList)) {
         try { await this.gtasks.deleteList(lid); } catch {}
         delete settings.tasksListMap![pid];
       }
