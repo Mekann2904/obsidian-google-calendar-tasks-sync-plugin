@@ -181,7 +181,7 @@ export class SyncLogic {
                                 fallbackInserts.push({
                                     method: 'POST',
                                     path: calendarPath,
-                                    body: { ...(req.fullBody || req.body || {}), id: this.generateStableEventId(req.obsidianTaskId) },
+                                    body: { ...(req.fullBody || req.body || {}) },
                                     obsidianTaskId: req.obsidianTaskId,
                                     operationType: 'insert'
                                 });
@@ -330,8 +330,8 @@ export class SyncLogic {
             const existingEvent = googleEventMap.get(obsId);
 
             if (force) {
-                // 挿入を冪等化するため、安定イベントIDを付与
-                const insertBody = { ...eventPayload, id: this.generateStableEventId(obsId) } as GoogleCalendarEventInput;
+                // Google Calendar の events.insert は body.id を受け付けないため付与しない
+                const insertBody = { ...eventPayload } as GoogleCalendarEventInput;
                 batchRequests.push({ method: 'POST', path: calendarPath, body: insertBody, obsidianTaskId: obsId, operationType: 'insert' });
                 continue;
             }
@@ -362,7 +362,7 @@ export class SyncLogic {
                         skippedCount++;
                     }
                 } else {
-                    const insertBody = { ...eventPayload, id: this.generateStableEventId(obsId) } as GoogleCalendarEventInput;
+                    const insertBody = { ...eventPayload } as GoogleCalendarEventInput;
                     batchRequests.push({ method: 'POST', path: calendarPath, body: insertBody, obsidianTaskId: obsId, operationType: 'insert' });
                 }
             }
