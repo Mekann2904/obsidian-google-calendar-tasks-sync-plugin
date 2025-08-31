@@ -66,7 +66,8 @@ export class TaskParser {
         const isCompleted = checkbox !== ' ' && checkbox !== '';
 
         // FIX: ISO拡張の余計な空白を除去し、秒・小数秒・タイムゾーンを正しくオプショナルに
-        const isoOrSimpleDateRegex = `\\d{4}-\\d{2}-\\d{2}(?:T\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?(?:Z|[+-]\\d{2}:\\d{2})?)?`;
+        // 拡張: 'YYYY-MM-DD HH:mm' 形式も許容（T または空白区切り）
+        const isoOrSimpleDateRegex = `\\d{4}-\\d{2}-\\d{2}(?:[T\\s]\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?(?:Z|[+-]\\d{2}:\\d{2})?)?`;
         const simpleDateRegexOnly = `\\d{4}-\\d{2}-\\d{2}`;
 
         // メタデータの抽出関数
