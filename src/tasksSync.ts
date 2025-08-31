@@ -58,8 +58,23 @@ export class TasksSync {
     // 設定マップに残っているが、ローカルに存在しない親に紐づく古いリストIDも削除
     for (const [pid, lid] of Object.entries(settings.tasksListMap || {})) {
       if (!localParentIds.has(pid) && !(pid in remoteIndex.parentToList)) {
-        try { await this.gtasks.deleteList(lid); } catch {}
-        delete settings.tasksListMap![pid];
+        try {
+          // リストが存在しない場合はマッピングだけ掃除
+          const ok = await this.gtasks.getList(lid);
+          if (!ok) { delete settings.tasksListMap![pid]; continue; }
+
+          // 管理対象か（親ID一致のマーカーが存在するか）を確認
+          const items = await this.gtasks.listTasks(lid);
+          const hasMarker = (items || []).some(t => t.title === '[ogcts:list-marker]' && (t.notes || '').includes(`parentObsidianTaskId=${pid}`));
+          if (hasMarker) {
+            await this.gtasks.deleteList(lid);
+          }
+          // いずれにせよ、この親IDのマッピングは掃除（管理外なら操作はせずマップのみ削除）
+          delete settings.tasksListMap![pid];
+        } catch {
+          // 失敗してもマップは掃除して次へ（次回同期で自然修復）
+          delete settings.tasksListMap![pid];
+        }
       }
     }
 
