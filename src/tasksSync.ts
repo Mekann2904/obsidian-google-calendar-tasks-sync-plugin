@@ -82,6 +82,19 @@ export class TasksSync {
         await processNode(child, undefined, tree.dueDate || startMatch[1]);
       }
 
+      // 不要なリモート（管理対象でローカルに存在しない）を削除
+      const localIdsRecursive = new Set<string>();
+      const collectIds = (n: NestedTaskNode) => { localIdsRecursive.add(n.id); n.children.forEach(collectIds); };
+      tree.children.forEach(collectIds);
+      for (const t of remote) {
+        if (!this.isManagedTask(t) || !t.notes) continue;
+        const m = t.notes.match(/obsidianTaskId=([^\s]+)/);
+        const cid = m ? m[1] : undefined;
+        if (cid && !localIdsRecursive.has(cid) && t.id) {
+          try { await this.gtasks.deleteTask(listId!, t.id); } catch {}
+        }
+      }
+
       // 子が全て完了ならリストを削除
       const anyActive = tree.children.some(c => !this.isAllDoneRecursive(c));
       if (!anyActive) {

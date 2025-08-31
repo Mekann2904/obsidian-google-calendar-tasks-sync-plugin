@@ -645,13 +645,17 @@ export class SyncLogic {
                     delete taskMap[obsId]; // 古い片方のマップは掃除
                     return;
                 }
-                if (!processed.has(gId)) {
-                    const ev = existingGCalEvents.find(e => e.id === gId);
+                // 対象obsIdに紐づく全ての管理イベントを削除（拡張展開された分も含む）
+                const related = existingGCalEvents.filter(e => e.extendedProperties?.private?.['isGcalSync'] === 'true' && e.extendedProperties?.private?.['obsidianTaskId'] === obsId && e.id);
+                related.forEach(ev => {
+                    const rid = ev.id!;
+                    if (processed.has(rid)) return;
                     const headers: Record<string, string> = {};
-                    if (ev?.etag) headers['If-Match'] = ev.etag;
-                    batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(gId)}`, headers, obsidianTaskId: obsId, operationType: 'delete', originalGcalId: gId });
-                    processed.add(gId);
-                }
+                    if (ev.etag) headers['If-Match'] = ev.etag;
+                    batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(rid)}`, headers, obsidianTaskId: obsId, operationType: 'delete', originalGcalId: rid });
+                    processed.add(rid);
+                });
+                delete taskMap[obsId];
             }
         });
 
