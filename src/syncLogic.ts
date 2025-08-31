@@ -508,8 +508,8 @@ export class SyncLogic {
                             e = e.isValid() ? (e.isAfter(s) ? e : minEnd) : minEnd;
                         }
                         const ev = clone(eventPayload);
-                        ev.start = { dateTime: s.toISOString(true) };
-                        ev.end = { dateTime: e.toISOString(true) };
+                        ev.start = { dateTime: s.format('YYYY-MM-DDTHH:mm:ssZ'), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone } as any;
+                        ev.end = { dateTime: e.format('YYYY-MM-DDTHH:mm:ssZ'), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone } as any;
                         ev.recurrence = undefined;
                         if ((ev.start as any).date) delete (ev.start as any).date;
                         if ((ev.end as any).date) delete (ev.end as any).date;
@@ -558,8 +558,8 @@ export class SyncLogic {
                         e = s.clone().add(this.plugin.settings.defaultEventDurationMinutes, 'minute');
                     }
                     const ev = clone(eventPayload);
-                    ev.start = { dateTime: s.toISOString(true) };
-                    ev.end = { dateTime: e.toISOString(true) };
+                    ev.start = { dateTime: s.format('YYYY-MM-DDTHH:mm:ssZ'), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone } as any;
+                    ev.end = { dateTime: e.format('YYYY-MM-DDTHH:mm:ssZ'), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone } as any;
                     ev.recurrence = undefined;
                     if ((ev.start as any).date) delete (ev.start as any).date;
                     if ((ev.end as any).date) delete (ev.end as any).date;
@@ -576,7 +576,7 @@ export class SyncLogic {
             let cursor = sdt.clone();
             // 先頭スライス: 開始〜24:00
             let endOfDay = cursor.clone().add(1,'day').startOf('day');
-            out.push({ ...clone(eventPayload), start: { dateTime: cursor.toISOString(true) }, end: { dateTime: endOfDay.toISOString(true) }, recurrence: undefined });
+            out.push({ ...clone(eventPayload), start: { dateTime: cursor.format('YYYY-MM-DDTHH:mm:ssZ'), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone } as any, end: { dateTime: endOfDay.format('YYYY-MM-DDTHH:mm:ssZ'), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone } as any, recurrence: undefined });
             // 中間スライス: 00:00〜24:00
             cursor = endOfDay.clone();
             while (cursor.isBefore(edt, 'day')) {
@@ -587,7 +587,7 @@ export class SyncLogic {
             // 最終スライス: 00:00〜元の終了時刻
             const finalStart = cursor.startOf('day');
             if (finalStart.isBefore(edt)) {
-                out.push({ ...clone(eventPayload), start: { dateTime: finalStart.toISOString(true) }, end: { dateTime: edt.toISOString(true) }, recurrence: undefined });
+                out.push({ ...clone(eventPayload), start: { dateTime: finalStart.format('YYYY-MM-DDTHH:mm:ssZ'), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone } as any, end: { dateTime: edt.format('YYYY-MM-DDTHH:mm:ssZ'), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone } as any, recurrence: undefined });
             }
             // 正規化: date を排除
             out.forEach(ev => { if ((ev.start as any).date) delete (ev.start as any).date; if ((ev.end as any).date) delete (ev.end as any).date; });

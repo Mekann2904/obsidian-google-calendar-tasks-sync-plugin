@@ -202,21 +202,21 @@ export class GCalMapper {
             if (hasWindow) {
                 // 時間ウィンドウがある場合は必ず時間指定イベントにする
                 const isDaily = (task.recurrenceRule || '').toUpperCase().includes('FREQ=DAILY');
-                event.start = { dateTime: toIso(startMoment, winStart) };
+                event.start = this.toEventDateTime(moment(toIso(startMoment, winStart)));
                 if (winEnd === '24:00') {
                     // 24:00 は翌日 00:00
                     const baseEndDay = isDaily ? startMoment.clone().add(1,'day')
                                                : (dueMoment.isSame(startMoment,'day') ? startMoment.clone().add(1,'day')
                                                                                       : dueMoment.clone().add(1,'day'));
-                    event.end = { dateTime: toIso(baseEndDay, '00:00') };
+                    event.end = this.toEventDateTime(moment(toIso(baseEndDay, '00:00')));
                 } else {
                     const baseEndDay = isDaily ? startMoment : dueMoment;
-                    event.end = { dateTime: toIso(baseEndDay, winEnd) };
+                    event.end = this.toEventDateTime(moment(toIso(baseEndDay, winEnd)));
                 }
             } else if (startIsDateTime && !dueIsDateTime && startMoment.isSame(dueMoment, 'day')) {
                 // 仕様: 開始に時刻・終了が日付のみ（同日）の場合は 24:00 まで
-                event.start = { dateTime: startMoment.toISOString(true) };
-                event.end = { dateTime: startMoment.clone().add(1,'day').startOf('day').toISOString(true) };
+                event.start = this.toEventDateTime(startMoment);
+                event.end = this.toEventDateTime(startMoment.clone().add(1,'day').startOf('day'));
             } else {
                 // 終日イベント
                 event.start = { date: startMoment.format('YYYY-MM-DD') };
@@ -231,8 +231,8 @@ export class GCalMapper {
             }
         } else {
             // 時間指定イベント
-            event.start = { dateTime: startMoment.toISOString(true) }; // keepOffset=true
-            event.end = { dateTime: dueMoment.toISOString(true) };   // keepOffset=true
+            event.start = this.toEventDateTime(startMoment);
+            event.end = this.toEventDateTime(dueMoment);
 
             if (dueMoment.isSameOrBefore(startMoment)) {
                 console.warn(`タスク "${task.summary || task.id}": 終了時刻 (${dueMoment.toISOString()}) が開始時刻 (${startMoment.toISOString()}) 以前。デフォルト期間 (${this.settings.defaultEventDurationMinutes}分) を使用して調整します。`);
@@ -265,6 +265,13 @@ export class GCalMapper {
              this.setDefaultEventTime(event);
              event.description = (event.description || '') + `\n\n(注意: イベント時間はデフォルト設定 - 日付処理エラー)`;
         }
+    }
+
+    private toEventDateTime(m: moment.Moment): { dateTime: string; timeZone?: string } {
+        const dateTime = m.format('YYYY-MM-DDTHH:mm:ssZ');
+        let timeZone: string | undefined = undefined;
+        try { timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch {}
+        return timeZone ? { dateTime, timeZone } : { dateTime };
     }
 
     /**
