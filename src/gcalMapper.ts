@@ -268,7 +268,9 @@ export class GCalMapper {
     }
 
     private toEventDateTime(m: moment.Moment): { dateTime: string; timeZone?: string } {
-        const dateTime = m.format('YYYY-MM-DDTHH:mm:ssZ');
+        // Google Calendar API は dateTime と timeZone の組合せを許容。
+        // 互換性のため、offset なしのローカル表記 + IANA timeZone を送る。
+        const dateTime = m.format('YYYY-MM-DDTHH:mm:ss');
         let timeZone: string | undefined = undefined;
         try { timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch {}
         return timeZone ? { dateTime, timeZone } : { dateTime };
