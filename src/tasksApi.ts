@@ -23,6 +23,18 @@ export class GoogleTasksService {
         return res.data.items || [];
     }
 
+    async getList(listId: string): Promise<tasks_v1.Schema$TaskList | null> {
+        this.ensureClient();
+        if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');
+        try {
+            const res = await this.tasks.tasklists.get({ tasklist: listId });
+            return res.data || null;
+        } catch (e: any) {
+            // 404などは null 扱い
+            return null;
+        }
+    }
+
     async getOrCreateList(title: string): Promise<string> {
         this.ensureClient();
         if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');

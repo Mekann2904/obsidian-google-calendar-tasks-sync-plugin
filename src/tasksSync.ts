@@ -37,26 +37,17 @@ export class TasksSync {
       const dueMatch = tree.title.match(/📅\s*(\d{4}-\d{2}-\d{2})/);
       if (!startMatch || !dueMatch) continue;
 
-      // 親→リストIDの確定（マップ → マーカー検索 → タイトル作成の順でロバストに探索）
-      let listId = settings.tasksListMap![tree.id];
-      if (!listId) {
-        listId = await this.gtasks.findListByMarker(tree.id) || await this.gtasks.getOrCreateList(tree.title);
-        settings.tasksListMap![tree.id] = listId;
-      }
-      settings.tasksListMap![tree.id] = listId;
+      // 親→リストIDの確定（マップIDの有効性検証→マーカー検索→作成）
+      let listId = await this.ensureListForParent(tree.id, tree.title);
 
       // リモートの既存タスク一覧（重複抑止・再利用）
       let remote: tasks_v1.Schema$Task[] = [];
       try {
         remote = await this.gtasks.listTasks(listId);
-        // リストが有効で取得できたら、このタイミングでマーカーを確保
-        try { await this.gtasks.ensureMarkerTask(listId, tree.id); } catch { /* ignore */ }
       } catch (e: any) {
         // ステールな listId の可能性（404）。マーカー検出→作成へフォールバック
         try {
-          listId = await this.gtasks.findListByMarker(tree.id) || await this.gtasks.getOrCreateList(tree.title);
-          this.plugin.settings.tasksListMap![tree.id] = listId;
-          await this.gtasks.ensureMarkerTask(listId, tree.id);
+          listId = await this.ensureListForParent(tree.id, tree.title);
           remote = await this.gtasks.listTasks(listId);
         } catch {
           // フォールバック失敗時はこの親をスキップ
@@ -222,6 +213,23 @@ export class TasksSync {
     if (!n) return true;
     if (!n.done) return false;
     return n.children.every(c => this.isAllDoneRecursive(c));
+  }
+
+  private async ensureListForParent(parentId: string, title: string): Promise<string> {
+    const settings = this.plugin.settings;
+    let listId = settings.tasksListMap?.[parentId];
+    if (listId) {
+      const ok = await this.gtasks.getList(listId);
+      if (!ok) listId = undefined as any;
+    }
+    if (!listId) {
+      listId = await this.gtasks.findListByMarker(parentId) || await this.gtasks.getOrCreateList(title);
+      settings.tasksListMap![parentId] = listId;
+      await this.plugin.saveData(settings);
+    }
+    // マーカーを確保
+    try { await this.gtasks.ensureMarkerTask(listId, parentId); } catch {}
+    return listId;
   }
 
   private buildManagedNotes(userNotes: string | undefined, obsidianTaskId: string): string {
