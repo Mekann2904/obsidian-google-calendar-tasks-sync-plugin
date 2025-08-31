@@ -339,10 +339,26 @@ export class SyncLogic {
             if (existingEvent) {
                 if (this.needsUpdate(existingEvent, eventPayload)) {
                     const gcalId = existingEvent.id!;
-                    const headers: Record<string, string> = {};
-                    if (existingEvent.etag) headers['If-Match'] = existingEvent.etag;
-                    const patchBody = this.buildPatchBody(existingEvent, eventPayload);
-                    batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, headers, body: patchBody, fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: gcalId });
+                    // 展開条件: 日次時間帯 or 日付跨ぎの時間指定
+                    const rr = (eventPayload.recurrence || [])[0] || '';
+                    const isDaily = /FREQ=DAILY/.test(rr);
+                    const sdt = eventPayload.start?.dateTime ? moment.parseZone(eventPayload.start.dateTime) : null;
+                    const edt = eventPayload.end?.dateTime ? moment.parseZone(eventPayload.end.dateTime) : null;
+                    const crossDay = !!(sdt && edt && !sdt.isSame(edt, 'day'));
+
+                    if (isDaily || crossDay) {
+                        // 既存を削除し、必要数のPOSTへ置換
+                        const delHeaders: Record<string, string> = {};
+                        if (existingEvent.etag) delHeaders['If-Match'] = existingEvent.etag;
+                        batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, headers: delHeaders, obsidianTaskId: obsId, operationType: 'delete', originalGcalId: gcalId });
+                        const bodies = this.expandEventForInsertion(eventPayload, task);
+                        bodies.forEach(body => batchRequests.push({ method: 'POST', path: calendarPath, body, obsidianTaskId: obsId, operationType: 'insert' }));
+                    } else {
+                        const headers: Record<string, string> = {};
+                        if (existingEvent.etag) headers['If-Match'] = existingEvent.etag;
+                        const patchBody = this.buildPatchBody(existingEvent, eventPayload);
+                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, headers, body: patchBody, fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: gcalId });
+                    }
                 } else {
                     skippedCount++;
                 }
@@ -350,9 +366,20 @@ export class SyncLogic {
                 // まず taskMap を優先（updatedMin/窓の都合でリストに出てこないケースの重複作成を防ぐ）
                 const mappedId = taskMap[obsId];
                 if (mappedId) {
-                    const headers: Record<string, string> = {};
-                    // ETag 不明のため If-Match は付けない（404時は後段フォールバックがinsert）
-                    batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(mappedId)}`, headers, body: eventPayload, fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: mappedId });
+                    // ID 指定更新でも展開条件なら置換
+                    const rr = (eventPayload.recurrence || [])[0] || '';
+                    const isDaily = /FREQ=DAILY/.test(rr);
+                    const sdt = eventPayload.start?.dateTime ? moment.parseZone(eventPayload.start.dateTime) : null;
+                    const edt = eventPayload.end?.dateTime ? moment.parseZone(eventPayload.end.dateTime) : null;
+                    const crossDay = !!(sdt && edt && !sdt.isSame(edt, 'day'));
+                    if (isDaily || crossDay) {
+                        batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(mappedId)}`, obsidianTaskId: obsId, operationType: 'delete', originalGcalId: mappedId });
+                        const bodies = this.expandEventForInsertion(eventPayload, task);
+                        bodies.forEach(body => batchRequests.push({ method: 'POST', path: calendarPath, body, obsidianTaskId: obsId, operationType: 'insert' }));
+                    } else {
+                        const headers: Record<string, string> = {};
+                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(mappedId)}`, headers, body: eventPayload, fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: mappedId });
+                    }
                 } else {
                     // 重複防止: 同一性キーで既存イベントを検索
                     const identity = this.buildIdentityKeyFromPayload(eventPayload);
