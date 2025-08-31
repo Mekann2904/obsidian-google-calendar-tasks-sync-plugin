@@ -145,6 +145,8 @@ export class SyncLogic {
 
                 const calendarPath = `/calendar/v3/calendars/${encodeURIComponent(settings.calendarId)}/events`;
                 const fallbackInserts: BatchRequestItem[] = [];
+                const fallbackNoIfMatch: BatchRequestItem[] = [];
+                const fallbackDeleteNoIfMatch: BatchRequestItem[] = [];
 
                 results.forEach((res: BatchResponseItem, i: number) => {
                     const req = batchRequests[i];
@@ -170,6 +172,15 @@ export class SyncLogic {
                             this.handleDeleteError(req, status);
                             if (status === 410 || status === 404) {
                                 if (req.obsidianTaskId) delete taskMap[req.obsidianTaskId];
+                            } else if (status === 412) {
+                                const retryDel: BatchRequestItem = {
+                                    method: 'DELETE',
+                                    path: req.path,
+                                    obsidianTaskId: req.obsidianTaskId,
+                                    operationType: 'delete',
+                                    originalGcalId: req.originalGcalId
+                                };
+                                fallbackDeleteNoIfMatch.push(retryDel);
                             }
                             return;
                         }
@@ -207,6 +218,22 @@ export class SyncLogic {
                             errorDetails: { status }
                         };
                         this.errorLogs.push(entry);
+                        // 412 (If-Match 不一致) はローカル優先で上書き再送
+                        if ((req.operationType === 'update' || req.operationType === 'patch') && status === 412) {
+                            const retry: BatchRequestItem = {
+                                method: req.method,
+                                path: req.path,
+                                body: req.body || req.fullBody,
+                                obsidianTaskId: req.obsidianTaskId,
+                                operationType: req.operationType,
+                                originalGcalId: req.originalGcalId
+                            };
+                            fallbackNoIfMatch.push(retry);
+                            return;
+                        }
+                        if (status === 400) {
+                            try { console.error('400 body:', JSON.stringify(res.body).slice(0, 500)); } catch {}
+                        }
                         // 診断用に recentErrors を更新（上限 50 件）
                         const maxSamples = 50;
                         const arr = this.plugin.settings.recentErrors ?? [];
@@ -231,6 +258,26 @@ export class SyncLogic {
                             taskMap[req.obsidianTaskId] = res.body.id;
                         }
                     });
+                }
+
+                if (fallbackNoIfMatch.length > 0) {
+                    console.log(`412再試行(If-Match無): ${fallbackNoIfMatch.length} 件を再送`);
+                    const fb2 = await this.executeBatchesWithRetry(fallbackNoIfMatch, batchProcessor);
+                    createdCount += fb2.created;
+                    updatedCount += fb2.updated;
+                    deletedCount += fb2.deleted;
+                    errorCount += fb2.errors;
+                    skippedCount += fb2.skipped;
+                }
+
+                if (fallbackDeleteNoIfMatch.length > 0) {
+                    console.log(`412削除再試行(If-Match無): ${fallbackDeleteNoIfMatch.length} 件を再送`);
+                    const fb3 = await this.executeBatchesWithRetry(fallbackDeleteNoIfMatch, batchProcessor);
+                    createdCount += fb3.created;
+                    updatedCount += fb3.updated;
+                    deletedCount += fb3.deleted;
+                    errorCount += fb3.errors;
+                    skippedCount += fb3.skipped;
                 }
             } else if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
                 new Notice('変更なし。', 2000);

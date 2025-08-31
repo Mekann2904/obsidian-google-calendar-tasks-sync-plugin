@@ -286,10 +286,11 @@ export class GCalApiService {
         }
 
         // HTTP ヘッダ終端（空行）を探す（statusLine 以降）
-        const headerEndIdx = lines.findIndex((l, idx) => idx > statusLineIdx && l.trim() === "");
+        let headerEndIdx = lines.findIndex((l, idx) => idx > statusLineIdx && l.trim() === "");
         if (headerEndIdx === -1) {
-            console.warn("バッチパート内で HTTP ヘッダ終端が見つかりません:", lines.slice(statusLineIdx, statusLineIdx + 10).join("\n"));
-            return null;
+            // 204 No Content 等でボディが無い場合、空行が省略されることがある。
+            // その場合はパート末尾をヘッダ終端と見なし、ボディ無しで成功として扱う。
+            headerEndIdx = lines.length - 1;
         }
 
         // ステータス
@@ -298,7 +299,7 @@ export class GCalApiService {
         const status = statusMatch ? parseInt(statusMatch[1], 10) : 500;
 
         // ボディ（空のこともある）
-        const bodyRaw = lines.slice(headerEndIdx + 1).join("\n").trim();
+        const bodyRaw = headerEndIdx + 1 < lines.length ? lines.slice(headerEndIdx + 1).join("\n").trim() : "";
         let bodyJson: any = undefined;
         if (bodyRaw) {
             try {
