@@ -58,23 +58,8 @@ export class TasksSync {
     // 設定マップに残っているが、ローカルに存在しない親に紐づく古いリストIDも削除
     for (const [pid, lid] of Object.entries(settings.tasksListMap || {})) {
       if (!localParentIds.has(pid) && !(pid in remoteIndex.parentToList)) {
-        try {
-          // リストが存在しない場合はマッピングだけ掃除
-          const ok = await this.gtasks.getList(lid);
-          if (!ok) { delete settings.tasksListMap![pid]; continue; }
-
-          // 管理対象か（親ID一致のマーカーが存在するか）を確認
-          const items = await this.gtasks.listTasks(lid);
-          const hasMarker = (items || []).some(t => t.title === '[ogcts:list-marker]' && (t.notes || '').includes(`parentObsidianTaskId=${pid}`));
-          if (hasMarker) {
-            await this.gtasks.deleteList(lid);
-          }
-          // いずれにせよ、この親IDのマッピングは掃除（管理外なら操作はせずマップのみ削除）
-          delete settings.tasksListMap![pid];
-        } catch {
-          // 失敗してもマップは掃除して次へ（次回同期で自然修復）
-          delete settings.tasksListMap![pid];
-        }
+        // リモートに検出されない＝管理対象ではない／既に削除済みと解釈し、API呼び出しは行わずマップだけ掃除
+        delete settings.tasksListMap![pid];
       }
     }
 
@@ -264,18 +249,15 @@ export class TasksSync {
 
   private async ensureListForParent(parentId: string, title: string): Promise<string> {
     const settings = this.plugin.settings;
-    let listId = settings.tasksListMap?.[parentId];
-    if (listId) {
-      const ok = await this.gtasks.getList(listId);
-      if (!ok) listId = undefined as any;
-    }
+    // まずマーカーで検出（タイトルや古いIDに依存しない）
+    let listId = await this.gtasks.findListByMarker(parentId);
     if (!listId) {
-      listId = await this.gtasks.findListByMarker(parentId) || await this.gtasks.getOrCreateList(title);
-      settings.tasksListMap![parentId] = listId;
-      await this.plugin.saveData(settings);
+      // 見つからなければ作成
+      listId = await this.gtasks.getOrCreateList(title);
+      try { await this.gtasks.ensureMarkerTask(listId, parentId); } catch {}
     }
-    // マーカーを確保
-    try { await this.gtasks.ensureMarkerTask(listId, parentId); } catch {}
+    settings.tasksListMap![parentId] = listId;
+    await this.plugin.saveData(settings);
     return listId;
   }
 
