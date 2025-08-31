@@ -16,6 +16,13 @@ export class GoogleTasksService {
         }
     }
 
+    async listLists(maxResults: number = 100): Promise<tasks_v1.Schema$TaskList[]> {
+        this.ensureClient();
+        if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');
+        const res = await this.tasks.tasklists.list({ maxResults });
+        return res.data.items || [];
+    }
+
     async getOrCreateList(title: string): Promise<string> {
         this.ensureClient();
         if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');

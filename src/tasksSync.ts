@@ -24,6 +24,12 @@ export class TasksSync {
     settings.tasksListMap = settings.tasksListMap || {};
     settings.tasksItemMap = settings.tasksItemMap || {};
 
+    // リモートインデックスを構築（管理マーカーに基づく全件スキャン）
+    const remoteIndex = await this.buildRemoteIndex();
+    // 設定マップを最新の検出結果で更新（壊れているIDを自然修復）
+    for (const [pid, lid] of Object.entries(remoteIndex.parentToList)) settings.tasksListMap[pid] = lid;
+    for (const [cid, tid] of Object.entries(remoteIndex.childToTask)) settings.tasksItemMap[cid] = tid;
+
     for (const tree of trees) {
       if (tree.children.length === 0) continue;
       // 親タスクの条件: 🛫 と 📅 がある（同一日である必要はない）
@@ -126,6 +132,31 @@ export class TasksSync {
     }
 
     await this.plugin.saveData(settings);
+  }
+
+  private async buildRemoteIndex(): Promise<{ parentToList: Record<string, string>; childToTask: Record<string, string> }> {
+    const parentToList: Record<string, string> = {};
+    const childToTask: Record<string, string> = {};
+    try {
+      const lists = await this.gtasks.listLists(100);
+      for (const l of lists) {
+        if (!l.id) continue;
+        let items: tasks_v1.Schema$Task[] = [];
+        try { items = await this.gtasks.listTasks(l.id); } catch { continue; }
+        const hasMarker = items.some(t => t.title === '[ogcts:list-marker]' && (t.notes || '').includes('[ogcts]'));
+        if (!hasMarker) continue;
+        const marker = items.find(t => t.title === '[ogcts:list-marker]' && (t.notes || '').includes('parentObsidianTaskId='));
+        const pMatch = marker?.notes?.match(/parentObsidianTaskId=([^\s]+)/);
+        const parentId = pMatch ? pMatch[1] : undefined;
+        if (parentId) parentToList[parentId] = l.id;
+        for (const t of items) {
+          if (!this.isManagedTask(t) || !t.id || !t.notes) continue;
+          const m = t.notes.match(/obsidianTaskId=([^\s]+)/);
+          if (m) childToTask[m[1]] = t.id;
+        }
+      }
+    } catch {}
+    return { parentToList, childToTask };
   }
 
   private async collectNestedTasks(): Promise<NestedTaskNode[]> {
