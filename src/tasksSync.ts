@@ -7,6 +7,8 @@ interface NestedTaskNode {
   notes?: string;
   children: NestedTaskNode[];
   indent: number;
+  id: string;
+  path: string;
 }
 
 export class TasksSync {
@@ -14,12 +16,75 @@ export class TasksSync {
 
   async syncNestedToGoogleTasks(): Promise<void> {
     const trees = await this.collectNestedTasks();
+    const settings = this.plugin.settings;
+    settings.tasksListMap = settings.tasksListMap || {};
+    settings.tasksItemMap = settings.tasksItemMap || {};
+
     for (const tree of trees) {
       if (tree.children.length === 0) continue;
-      const listId = await this.gtasks.getOrCreateList(tree.title);
-      const items = tree.children.map(c => ({ title: c.title, notes: c.notes }));
-      await this.gtasks.upsertTasks(listId, items);
+
+      // 親→リストIDの確定（ローカル優先：タイトルが変わっていたらリネーム）
+      let listId = settings.tasksListMap![tree.id];
+      if (listId) {
+        try {
+          // 既存リストのタイトルをローカルに合わせる
+          await this.gtasks.renameList(listId, tree.title);
+        } catch {
+          // 404 等は作り直し
+          listId = await this.gtasks.getOrCreateList(tree.title);
+          settings.tasksListMap![tree.id] = listId;
+        }
+      } else {
+        listId = await this.gtasks.getOrCreateList(tree.title);
+        settings.tasksListMap![tree.id] = listId;
+      }
+
+      // リモートの既存タスク一覧（重複抑止・再利用）
+      const remote = await this.gtasks.listTasks(listId);
+      const remoteById = new Map<string, tasks_v1.Schema$Task>();
+      const remoteByTitle = new Map<string, tasks_v1.Schema$Task>();
+      for (const t of remote) { if (t.id) remoteById.set(t.id, t); if (t.title) remoteByTitle.set(t.title, t); }
+
+      // ローカル子の集合
+      const localChildIds = new Set<string>(tree.children.map(c => c.id));
+
+      // アップサート（ローカル優先）
+      for (const child of tree.children) {
+        let gid = settings.tasksItemMap![child.id];
+        if (gid && remoteById.has(gid)) {
+          await this.gtasks.upsertTasks(listId!, [{ id: gid, title: child.title, notes: child.notes }]);
+        } else {
+          // タイトル一致の既存があれば再利用
+          const dup = remoteByTitle.get(child.title);
+          if (dup?.id) {
+            settings.tasksItemMap![child.id] = dup.id;
+            await this.gtasks.upsertTasks(listId!, [{ id: dup.id, title: child.title, notes: child.notes }]);
+          } else {
+            await this.gtasks.upsertTasks(listId!, [{ title: child.title, notes: child.notes }]);
+            // 新規挿入のID取得は batch では困難なため、簡易に再取得してマッピング（少数前提）
+            const refreshed = await this.gtasks.listTasks(listId!);
+            const found = refreshed.find(t => t.title === child.title && (t.notes || '') === (child.notes || ''));
+            if (found?.id) settings.tasksItemMap![child.id] = found.id;
+          }
+        }
+      }
+
+      // リモート削除（ローカルに無い子で、当方マップ管理対象のみ）
+      for (const [obsChildId, googleTaskId] of Object.entries(settings.tasksItemMap!)) {
+        if (!localChildIds.has(obsChildId)) continue; // 別の親のもの
+      }
+      // 上のループは親区別が無いので、親の子だけのサブマップを作る
+      const childMapEntries = Object.entries(settings.tasksItemMap!).filter(([cid]) => localChildIds.has(cid));
+      for (const [cid, googleTaskId] of childMapEntries) {
+        const stillExists = tree.children.some(c => c.id === cid);
+        if (!stillExists && googleTaskId) {
+          try { await this.gtasks.deleteTask(listId!, googleTaskId); } catch {}
+          delete settings.tasksItemMap![cid];
+        }
+      }
     }
+
+    await this.plugin.saveData(settings);
   }
 
   private async collectNestedTasks(): Promise<NestedTaskNode[]> {
@@ -42,7 +107,8 @@ export class TasksSync {
         if (m) {
           const indent = m[1].length;
           const title = (m[3] || '').trim();
-          const node: NestedTaskNode = { title, notes: undefined, children: [], indent };
+          const id = this.makeId(file.path, i, line);
+          const node: NestedTaskNode = { title, notes: undefined, children: [], indent, id, path: file.path };
 
           while (stack.length && stack[stack.length - 1].indent >= indent) stack.pop();
           if (stack.length === 0) {
@@ -65,5 +131,14 @@ export class TasksSync {
     // 親となりうるノードのみ返す（直下に子があるもの）
     return out.filter(n => n.children.length > 0);
   }
-}
 
+  private makeId(path: string, index: number, line: string): string {
+    let hash = 0;
+    const raw = line.trim();
+    for (let i = 0; i < raw.length; i++) {
+      const ch = raw.charCodeAt(i);
+      hash = ((hash << 5) - hash) + ch; hash |= 0;
+    }
+    return `obsidian-${path}-${index}-${hash}`;
+  }
+}

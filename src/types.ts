@@ -63,6 +63,9 @@ export interface GoogleCalendarTasksSyncSettings {
 	recentErrors?: ErrorLog[]; // 最近のエラーサンプル（診断用）
 	useSyncToken?: boolean; // 可能な場合、syncToken による増分取得を使用
 	enableGoogleTasksSync?: boolean; // ネストタスクをGoogle Tasksへ同期
+	// Google Tasks 連携用のマップ
+	tasksListMap?: { [parentObsidianTaskId: string]: string }; // 親タスクID -> Google Tasklist ID
+	tasksItemMap?: { [childObsidianTaskId: string]: string };  // 子タスクID   -> Google Task ID
 }
 
 // バッチリクエスト用のインターフェース

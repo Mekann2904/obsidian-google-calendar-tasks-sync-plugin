@@ -32,13 +32,35 @@ export class GoogleTasksService {
         return created.data.id;
     }
 
-    async upsertTasks(listId: string, tasks: Array<{ title: string; notes?: string }>): Promise<void> {
+    async listTasks(listId: string): Promise<tasks_v1.Schema$Task[]> {
+        this.ensureClient();
+        if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');
+        const res = await this.tasks.tasks.list({ tasklist: listId, maxResults: 200 });
+        return res.data.items || [];
+    }
+
+    async upsertTasks(listId: string, tasks: Array<{ id?: string; title: string; notes?: string }>): Promise<void> {
         this.ensureClient();
         if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');
 
         for (const t of tasks) {
-            await this.tasks.tasks.insert({ tasklist: listId, requestBody: { title: t.title, notes: t.notes } });
+            if (t.id) {
+                await this.tasks.tasks.patch({ tasklist: listId, task: t.id, requestBody: { title: t.title, notes: t.notes } });
+            } else {
+                await this.tasks.tasks.insert({ tasklist: listId, requestBody: { title: t.title, notes: t.notes } });
+            }
         }
     }
-}
 
+    async deleteTask(listId: string, taskId: string): Promise<void> {
+        this.ensureClient();
+        if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');
+        await this.tasks.tasks.delete({ tasklist: listId, task: taskId });
+    }
+
+    async renameList(listId: string, newTitle: string): Promise<void> {
+        this.ensureClient();
+        if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');
+        await this.tasks.tasklists.patch({ tasklist: listId, requestBody: { title: newTitle } });
+    }
+}

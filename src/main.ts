@@ -230,6 +230,10 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
         new Notice('手動同期を開始しました...');
         // FIX: 設定のスナップショットを渡して競合状態を防止
         await this.syncLogic.runSync(JSON.parse(JSON.stringify(this.settings)));
+        // Google Tasks 同期（同時実行の代わりに直列で安全に）
+        if (this.settings.enableGoogleTasksSync) {
+            await this.syncNestedToGoogleTasks();
+        }
     }
 
     /** 強制同期 (リセット) をトリガー */

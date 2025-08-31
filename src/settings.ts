@@ -18,6 +18,8 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 	includeReminderInIdentity: false,
 	useSyncToken: false,
 	enableGoogleTasksSync: false,
+	tasksListMap: {},
+	tasksItemMap: {},
 	syncPriorityToDescription: true,
 	syncTagsToDescription: true,
 	syncBlockLinkToDescription: false, // デフォルトではオフ (Obsidian URI に統合されるため)
