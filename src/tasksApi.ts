@@ -63,4 +63,10 @@ export class GoogleTasksService {
         if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');
         await this.tasks.tasklists.patch({ tasklist: listId, requestBody: { title: newTitle } });
     }
+
+    async deleteList(listId: string): Promise<void> {
+        this.ensureClient();
+        if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');
+        await this.tasks.tasklists.delete({ tasklist: listId });
+    }
 }
