@@ -31,8 +31,16 @@ export class TasksSync {
       const dueMatch = tree.title.match(/📅\s*(\d{4}-\d{2}-\d{2})/);
       if (!startMatch || !dueMatch) continue;
 
-      // 親→リストIDの確定（タイトルで取得/作成し、マップ更新）
-      let listId = await this.gtasks.getOrCreateList(tree.title);
+      // 親→リストIDの確定（マップ → マーカー検索 → タイトル作成の順でロバストに探索）
+      let listId = settings.tasksListMap![tree.id];
+      if (listId) {
+        // マーカーが無ければ付与
+        try { await this.gtasks.ensureMarkerTask(listId, tree.id); } catch { /* ignore */ }
+      } else {
+        listId = await this.gtasks.findListByMarker(tree.id) || await this.gtasks.getOrCreateList(tree.title);
+        settings.tasksListMap![tree.id] = listId;
+        try { await this.gtasks.ensureMarkerTask(listId, tree.id); } catch { /* ignore */ }
+      }
       settings.tasksListMap![tree.id] = listId;
 
       // リモートの既存タスク一覧（重複抑止・再利用）

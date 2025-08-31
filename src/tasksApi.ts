@@ -73,4 +73,31 @@ export class GoogleTasksService {
         if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');
         await this.tasks.tasklists.delete({ tasklist: listId });
     }
+
+    async ensureMarkerTask(listId: string, parentObsidianId: string): Promise<string> {
+        this.ensureClient();
+        if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');
+        const markerTitle = '[ogcts:list-marker]';
+        const markerNotes = `[ogcts] appId=obsidian-gcal-tasks isGtasksSync=true parentObsidianTaskId=${parentObsidianId} version=1`;
+        const items = await this.listTasks(listId);
+        const found = items.find(t => t.title === markerTitle && (t.notes || '').includes(`parentObsidianTaskId=${parentObsidianId}`));
+        if (found?.id) return found.id;
+        const created = await this.tasks.tasks.insert({ tasklist: listId, requestBody: { title: markerTitle, notes: markerNotes } });
+        return created.data.id!;
+    }
+
+    async findListByMarker(parentObsidianId: string): Promise<string | undefined> {
+        this.ensureClient();
+        if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');
+        const lists = await this.tasks.tasklists.list({ maxResults: 100 });
+        for (const l of lists.data.items || []) {
+            if (!l.id) continue;
+            try {
+                const items = await this.tasks.tasks.list({ tasklist: l.id, maxResults: 50 });
+                const found = (items.data.items || []).some(t => (t.title === '[ogcts:list-marker]') && (t.notes || '').includes(`parentObsidianTaskId=${parentObsidianId}`));
+                if (found) return l.id;
+            } catch { /* ignore */ }
+        }
+        return undefined;
+    }
 }
