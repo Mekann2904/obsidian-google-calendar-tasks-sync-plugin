@@ -61,6 +61,7 @@ export interface BatchRequestItem {
 	path: string; // APIのパス (例: /calendar/v3/calendars/{calendarId}/events/{eventId})
 	headers?: { [key: string]: string }; // リクエストヘッダー (オプション)
 	body?: any; // リクエストボディ (JSONなど)
+	fullBody?: any; // PATCHのフォールバック用に保持する完全ボディ (オプション)
 	obsidianTaskId?: string; // どのObsidianタスクに関連するか (結果処理で使用)
 	operationType?: 'insert' | 'update' | 'patch' | 'delete'; // 実行した操作の種類 (結果処理で使用)
 	originalGcalId?: string; // delete/update/patch 操作の対象となる元のGoogle CalendarイベントID

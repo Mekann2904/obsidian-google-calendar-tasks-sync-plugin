@@ -2,7 +2,7 @@ import { Notice } from 'obsidian';
 import { ErrorHandler, DateUtils } from './commonUtils';
 import { calendar_v3 } from 'googleapis';
 import GoogleCalendarTasksSyncPlugin from './main';
-import { ObsidianTask, GoogleCalendarEventInput, BatchRequestItem, BatchResponseItem, BatchResult, ErrorLog } from './types';
+import { ObsidianTask, GoogleCalendarEventInput, BatchRequestItem, BatchResponseItem, BatchResult, ErrorLog, GoogleCalendarTasksSyncSettings } from './types';
 import { createHash } from 'crypto';
 import { BatchProcessor } from './batchProcessor';
 import moment from 'moment';
@@ -176,7 +176,7 @@ export class SyncLogic {
                                 fallbackInserts.push({
                                     method: 'POST',
                                     path: calendarPath,
-                                    body: { ...(req.body || {}), id: this.generateStableEventId(req.obsidianTaskId) },
+                                    body: { ...(req.fullBody || req.body || {}), id: this.generateStableEventId(req.obsidianTaskId) },
                                     obsidianTaskId: req.obsidianTaskId,
                                     operationType: 'insert'
                                 });
@@ -325,7 +325,8 @@ export class SyncLogic {
                     const gcalId = existingEvent.id!;
                     const headers: Record<string, string> = {};
                     if (existingEvent.etag) headers['If-Match'] = existingEvent.etag;
-                    batchRequests.push({ method: 'PUT', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, headers, body: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: gcalId });
+                    const patchBody = this.buildPatchBody(existingEvent, eventPayload);
+                    batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, headers, body: patchBody, fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: gcalId });
                 } else {
                     skippedCount++;
                 }
@@ -535,5 +536,57 @@ export class SyncLogic {
         if ((oldId || '') !== (newId || '')) return true;
 
         return false;
+    }
+
+    // 差分PATCHボディを生成
+    private buildPatchBody(
+        existingEvent: calendar_v3.Schema$Event,
+        newPayload: GoogleCalendarEventInput
+    ): Partial<calendar_v3.Schema$Event> {
+        const patch: Partial<calendar_v3.Schema$Event> = {};
+
+        if ((existingEvent.summary || '') !== (newPayload.summary || '')) patch.summary = newPayload.summary;
+        if ((existingEvent.description || '') !== (newPayload.description || '')) patch.description = newPayload.description;
+
+        const oldStat = existingEvent.status === 'cancelled' ? 'cancelled' : 'confirmed';
+        const newStat = newPayload.status === 'cancelled' ? 'cancelled' : 'confirmed';
+        if (oldStat !== newStat) patch.status = newPayload.status;
+
+        const cmpTime = (t1?: calendar_v3.Schema$EventDateTime, t2?: calendar_v3.Schema$EventDateTime) => {
+            if (!t1 && !t2) return false;
+            if (!t1 || !t2) return true;
+            if (t1.date && t2.date) return t1.date !== t2.date;
+            if (t1.dateTime && t2.dateTime) return !DateUtils.isSameDateTime(t1.dateTime, t2.dateTime);
+            return true;
+        };
+        if (cmpTime(existingEvent.start, newPayload.start)) patch.start = newPayload.start;
+        if (cmpTime(existingEvent.end, newPayload.end)) patch.end = newPayload.end;
+
+        const oldUseDefault = existingEvent.reminders?.useDefault ?? true;
+        const newUseDefault = newPayload.reminders?.useDefault ?? true;
+        if (oldUseDefault !== newUseDefault) patch.reminders = newPayload.reminders;
+        else if (!newUseDefault) {
+            const oldOverrides = existingEvent.reminders?.overrides || [];
+            const newOverrides = newPayload.reminders?.overrides || [];
+            if (oldOverrides.length !== newOverrides.length || oldOverrides.some((o, i) => o.minutes !== newOverrides[i].minutes || o.method !== newOverrides[i].method)) {
+                patch.reminders = newPayload.reminders;
+            }
+        }
+
+        const norm = (r?: string) => r ? r.toUpperCase().replace('RRULE:', '').trim() : '';
+        const oldRec = (existingEvent.recurrence || []).map(norm).sort().join(',');
+        const newRec = (newPayload.recurrence || []).map(norm).sort().join(',');
+        if (oldRec !== newRec) patch.recurrence = newPayload.recurrence;
+
+        const oldId = existingEvent.extendedProperties?.private?.['obsidianTaskId'];
+        const newId = newPayload.extendedProperties?.private?.['obsidianTaskId'];
+        const oldSync = existingEvent.extendedProperties?.private?.['isGcalSync'];
+        const newSync = newPayload.extendedProperties?.private?.['isGcalSync'];
+        if ((oldId || '') !== (newId || '') || (oldSync || '') !== (newSync || '')) {
+            patch.extendedProperties = newPayload.extendedProperties;
+        }
+
+        // 何も差分がない場合は summary を noop として入れない（空オブジェクトのまま返す）
+        return patch;
     }
 }
