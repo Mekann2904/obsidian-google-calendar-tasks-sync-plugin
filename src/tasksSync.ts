@@ -39,13 +39,9 @@ export class TasksSync {
 
       // 親→リストIDの確定（マップ → マーカー検索 → タイトル作成の順でロバストに探索）
       let listId = settings.tasksListMap![tree.id];
-      if (listId) {
-        // マーカーが無ければ付与
-        try { await this.gtasks.ensureMarkerTask(listId, tree.id); } catch { /* ignore */ }
-      } else {
+      if (!listId) {
         listId = await this.gtasks.findListByMarker(tree.id) || await this.gtasks.getOrCreateList(tree.title);
         settings.tasksListMap![tree.id] = listId;
-        try { await this.gtasks.ensureMarkerTask(listId, tree.id); } catch { /* ignore */ }
       }
       settings.tasksListMap![tree.id] = listId;
 
@@ -53,6 +49,8 @@ export class TasksSync {
       let remote: tasks_v1.Schema$Task[] = [];
       try {
         remote = await this.gtasks.listTasks(listId);
+        // リストが有効で取得できたら、このタイミングでマーカーを確保
+        try { await this.gtasks.ensureMarkerTask(listId, tree.id); } catch { /* ignore */ }
       } catch (e: any) {
         // ステールな listId の可能性（404）。マーカー検出→作成へフォールバック
         try {
