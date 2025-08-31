@@ -166,12 +166,14 @@ export class GCalMapper {
         const startStr = task.startDate!; // null でないことは呼び出し元で保証される想定
         const dueStr = task.dueDate!;   // null でないことは呼び出し元で保証される想定
 
-        const startIsDateTime = startStr.includes('T');
-        const dueIsDateTime = dueStr.includes('T');
+        // 'YYYY-MM-DD HH:mm' も時刻付きとして認識する
+        const hasTime = (s: string) => /(T|\s)\d{1,2}:\d{2}/.test(s);
+        const startIsDateTime = hasTime(startStr);
+        const dueIsDateTime = hasTime(dueStr);
 
         // moment.utc を使用し、厳密なパースを行う
-        const startMoment = moment.utc(startStr, [moment.ISO_8601, 'YYYY-MM-DD'], true);
-        const dueMoment = moment.utc(dueStr, [moment.ISO_8601, 'YYYY-MM-DD'], true);
+        const startMoment = moment.utc(startStr, [moment.ISO_8601, 'YYYY-MM-DD HH:mm', 'YYYY-MM-DD'], true);
+        const dueMoment = moment.utc(dueStr, [moment.ISO_8601, 'YYYY-MM-DD HH:mm', 'YYYY-MM-DD'], true);
 
         if (!startMoment.isValid() || !dueMoment.isValid()) {
             console.error(`タスク "${task.summary || task.id}" の日付パース失敗 (setEventTimeUsingStartDue)。Start: ${startStr}, Due: ${dueStr}。時間をデフォルト設定します。`);
