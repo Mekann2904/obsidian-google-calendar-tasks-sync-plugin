@@ -105,6 +105,10 @@ export class SyncLogic {
             const existingGIdSet = new Set<string>(
                 existingEvents.map(e => e.id).filter((v): v is string => !!v)
             );
+            
+            // ID → Event の逆引きマップ（ETag 参照用）
+            const eventById = new Map<string, calendar_v3.Schema$Event>();
+            existingEvents.forEach(ev => { if (ev.id) eventById.set(ev.id, ev); });
 
             // 3. 作成/更新/キャンセル準備
             if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
@@ -294,7 +298,9 @@ export class SyncLogic {
                     const existingEvent = googleEventMap.get(obsId);
                     if (existingEvent && existingEvent.status !== 'cancelled') {
                         const gcalId = existingEvent.id!;
-                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, body: { status: 'cancelled' }, obsidianTaskId: obsId, operationType: 'patch', originalGcalId: gcalId });
+                        const headers: Record<string, string> = {};
+                        if (existingEvent.etag) headers['If-Match'] = existingEvent.etag;
+                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, headers, body: { status: 'cancelled' }, obsidianTaskId: obsId, operationType: 'patch', originalGcalId: gcalId });
                     } else {
                         skippedCount++;
                     }
@@ -317,7 +323,9 @@ export class SyncLogic {
             if (existingEvent) {
                 if (this.needsUpdate(existingEvent, eventPayload)) {
                     const gcalId = existingEvent.id!;
-                    batchRequests.push({ method: 'PUT', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, body: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: gcalId });
+                    const headers: Record<string, string> = {};
+                    if (existingEvent.etag) headers['If-Match'] = existingEvent.etag;
+                    batchRequests.push({ method: 'PUT', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, headers, body: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: gcalId });
                 } else {
                     skippedCount++;
                 }
@@ -344,7 +352,9 @@ export class SyncLogic {
         if (force) {
             existingGCalEvents.forEach(event => {
                 if (event.id) {
-                    batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(event.id)}`, obsidianTaskId: 'force-delete', operationType: 'delete', originalGcalId: event.id });
+                    const headers: Record<string, string> = {};
+                    if (event.etag) headers['If-Match'] = event.etag;
+                    batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(event.id)}`, headers, obsidianTaskId: 'force-delete', operationType: 'delete', originalGcalId: event.id });
                     processed.add(event.id);
                 }
             });
@@ -359,7 +369,10 @@ export class SyncLogic {
                     return;
                 }
                 if (!processed.has(gId)) {
-                    batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(gId)}`, obsidianTaskId: obsId, operationType: 'delete', originalGcalId: gId });
+                    const ev = existingGCalEvents.find(e => e.id === gId);
+                    const headers: Record<string, string> = {};
+                    if (ev?.etag) headers['If-Match'] = ev.etag;
+                    batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(gId)}`, headers, obsidianTaskId: obsId, operationType: 'delete', originalGcalId: gId });
                     processed.add(gId);
                 }
             }
@@ -369,7 +382,9 @@ export class SyncLogic {
             const id = event.id;
             const obsId = event.extendedProperties?.private?.['obsidianTaskId'];
             if (id && event.extendedProperties?.private?.['isGcalSync'] === 'true' && !processed.has(id) && (!obsId || !taskMap[obsId])) {
-                batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(id)}`, obsidianTaskId: obsId || 'orphan', operationType: 'delete', originalGcalId: id });
+                const headers: Record<string, string> = {};
+                if (event.etag) headers['If-Match'] = event.etag;
+                batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(id)}`, headers, obsidianTaskId: obsId || 'orphan', operationType: 'delete', originalGcalId: id });
                 processed.add(id);
             }
         });
@@ -383,7 +398,7 @@ export class SyncLogic {
         const isTransient = (status: number) => [403, 429, 500, 502, 503, 504].includes(status);
         const treatAsSkipped = (req: BatchRequestItem, status: number) => {
             if (req.operationType === 'insert' && status === 409) return true; // 既存IDでの重複作成
-            if ((req.operationType === 'delete' || req.operationType === 'update' || req.operationType === 'patch') && (status === 404 || status === 410)) return true;
+            if ((req.operationType === 'delete' || req.operationType === 'update' || req.operationType === 'patch') && (status === 404 || status === 410 || status === 412)) return true; // 412: ETag競合
             return false;
         };
 

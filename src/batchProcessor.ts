@@ -120,9 +120,10 @@ export class BatchProcessor {
                 }
                 console.log(`${this.getOperationName(op)}: ${summary}`);
             } else {
-                if ((op==='delete' || op==='patch' || op==='update') && (res.status===404||res.status===410)) {
+                if ((op==='delete' || op==='patch' || op==='update') && (res.status===404||res.status===410||res.status===412)) {
                     skipped++;
-                    console.warn(`リソース未存在: ${req.originalGcalId}`);
+                    const why = res.status===412 ? '競合(412)' : 'リソース未存在';
+                    console.warn(`${why}: ${req.originalGcalId}`);
                 } else if (op==='insert' && res.status===409) {
                     skipped++;
                     console.warn(`挿入スキップ(409): 既存IDまたは重複作成 ${req.obsidianTaskId}`);

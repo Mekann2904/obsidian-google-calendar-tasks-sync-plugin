@@ -140,7 +140,7 @@ export class GCalApiService {
             const results = this.parseBatchResponse(responseText); // FIX: boundary 引数を廃止し自動検出
 
             // 404/409/410 は item-level の警告として集計
-            const ignorable = new Set([404, 409, 410]);
+            const ignorable = new Set([404, 409, 410, 412]);
             const ignorableCount = results.filter(r => ignorable.has(r.status)).length;
             if (ignorableCount > 0) {
                 const counts = results.reduce((acc, r) => {
