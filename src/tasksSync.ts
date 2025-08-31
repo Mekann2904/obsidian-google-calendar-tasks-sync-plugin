@@ -135,13 +135,16 @@ export class TasksSync {
         await processNode(child, undefined, tree.dueDate || startMatch[1]);
       }
 
-      // 不要なリモート（今回の同期で予約されなかった管理タスク）だけ削除
-      for (const t of remote) {
-        if (!this.isManagedTask(t) || !t.id) continue;
-        if (t.title === '[ogcts:list-marker]') continue;
-        if (!reservedRemoteIds.has(t.id)) {
-          try { await this.gtasks.deleteTask(listId!, t.id); } catch {}
-        }
+      // 不要なリモート（今回の同期で予約されなかった、この親に属する管理タスク）だけ削除
+      const recursiveIds = new Set<string>();
+      const walk = (n: NestedTaskNode) => { recursiveIds.add(n.id); n.children.forEach(walk); };
+      tree.children.forEach(walk);
+      for (const [cid, tid] of Object.entries(settings.tasksItemMap || {})) {
+        if (!recursiveIds.has(cid)) continue;
+        if (!tid || reservedRemoteIds.has(tid)) continue;
+        try { await this.gtasks.deleteTask(listId!, tid); } catch {}
+        // マッピングも掃除
+        delete settings.tasksItemMap![cid];
       }
 
       // 子が全て完了ならリストを削除
@@ -261,12 +264,8 @@ export class TasksSync {
     return listId;
   }
 
-  private buildManagedNotes(userNotes: string | undefined, obsidianTaskId: string): string {
-    const meta = `[ogcts] appId=obsidian-gcal-tasks isGtasksSync=true obsidianTaskId=${obsidianTaskId} version=1`;
-    return userNotes && userNotes.trim().length > 0 ? `${userNotes}\n\n${meta}` : meta;
-  }
-
-  private isManagedTask(t: tasks_v1.Schema$Task): boolean {
-    return !!(t.notes && /\[ogcts\]\s+appId=obsidian-gcal-tasks/.test(t.notes));
+  private buildManagedNotes(userNotes: string | undefined, _obsidianTaskId: string): string {
+    // ユーザーが記述した notes のみを送る（管理マーカーは付与しない）
+    return userNotes || '';
   }
 }
