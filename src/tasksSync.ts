@@ -129,16 +129,11 @@ export class TasksSync {
         await processNode(child, undefined, tree.dueDate || startMatch[1]);
       }
 
-      // 不要なリモート（今回の同期で予約されなかった、この親に属する管理タスク）だけ削除
-      const recursiveIds = new Set<string>();
-      const walk = (n: NestedTaskNode) => { recursiveIds.add(n.id); n.children.forEach(walk); };
-      tree.children.forEach(walk);
-      for (const [cid, tid] of Object.entries(settings.tasksItemMap || {})) {
-        if (!recursiveIds.has(cid)) continue;
-        if (!tid || reservedRemoteIds.has(tid)) continue;
-        try { await this.gtasks.deleteTask(listId!, tid); } catch {}
-        // マッピングも掃除
-        delete settings.tasksItemMap![cid];
+      // 不要なリモート（今回の同期で予約されなかったタスク）を一括削除
+      for (const t of remote) {
+        if (!t.id) continue;
+        if (reservedRemoteIds.has(t.id)) continue;
+        try { await this.gtasks.deleteTask(listId!, t.id); } catch {}
       }
 
       // 子が全て完了ならリストを削除
