@@ -195,14 +195,21 @@ export class SyncLogic {
                         }
 
                         const operation = req.operationType || 'unknown';
-                        this.errorLogs.push({
+                        const entry: ErrorLog = {
                             errorType: (status >= 500 || status === 429) ? 'transient' : 'permanent',
                             operation: operation as any,
                             taskId: req.obsidianTaskId || 'unknown',
                             gcalId: req.originalGcalId,
                             retryCount: this.retryCount,
                             errorDetails: { status }
-                        });
+                        };
+                        this.errorLogs.push(entry);
+                        // 診断用に recentErrors を更新（上限 50 件）
+                        const maxSamples = 50;
+                        const arr = this.plugin.settings.recentErrors ?? [];
+                        arr.unshift(entry);
+                        while (arr.length > maxSamples) arr.pop();
+                        this.plugin.settings.recentErrors = arr;
                     }
                 });
 
@@ -247,6 +254,8 @@ export class SyncLogic {
             new Notice('同期中に致命的エラー発生。コンソールを確認してください。', 15000);
         } finally {
             this.plugin.setSyncing(false);
+            // recentErrors を永続化
+            try { await this.plugin.saveData(this.plugin.settings); } catch {}
             this.plugin.refreshSettingsTab();
         }
     }

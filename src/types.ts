@@ -55,6 +55,7 @@ export interface GoogleCalendarTasksSyncSettings {
 		minSyncDurationForNotice: number; // 通知を表示する最小同期時間（秒）
 	};
 	interBatchDelay: number; // バッチリクエスト間の遅延（ミリ秒）
+	recentErrors?: ErrorLog[]; // 最近のエラーサンプル（診断用）
 }
 
 // バッチリクエスト用のインターフェース
