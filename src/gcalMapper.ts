@@ -172,8 +172,8 @@ export class GCalMapper {
         const dueIsDateTime = hasTime(dueStr);
 
         // moment.utc を使用し、厳密なパースを行う
-        const startMoment = moment.utc(startStr, [moment.ISO_8601, 'YYYY-MM-DD HH:mm', 'YYYY-MM-DD'], true);
-        const dueMoment = moment.utc(dueStr, [moment.ISO_8601, 'YYYY-MM-DD HH:mm', 'YYYY-MM-DD'], true);
+        const startMoment = moment(startStr, [moment.ISO_8601, 'YYYY-MM-DD HH:mm', 'YYYY-MM-DD'], true);
+        const dueMoment = moment(dueStr, [moment.ISO_8601, 'YYYY-MM-DD HH:mm', 'YYYY-MM-DD'], true);
 
         if (!startMoment.isValid() || !dueMoment.isValid()) {
             console.error(`タスク "${task.summary || task.id}" の日付パース失敗 (setEventTimeUsingStartDue)。Start: ${startStr}, Due: ${dueStr}。時間をデフォルト設定します。`);
@@ -239,8 +239,8 @@ export class GCalMapper {
         if (task.recurrenceRule && event.start?.dateTime && (!task.startDate?.includes('T') || !task.dueDate?.includes('T'))) {
             const rule = (task.recurrenceRule || '').toUpperCase();
             if (rule.includes('FREQ=DAILY') && !/;COUNT=|;UNTIL=/.test(rule) && task.startDate && task.dueDate) {
-                const s = moment.utc(task.startDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
-                const e = moment.utc(task.dueDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
+                const s = moment(task.startDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
+                const e = moment(task.dueDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
                 const days = e.diff(s, 'days') + 1; // 期間を含める
                 if (days > 0) {
                     event.recurrence = [ `RRULE:FREQ=DAILY;COUNT=${days}` ];
