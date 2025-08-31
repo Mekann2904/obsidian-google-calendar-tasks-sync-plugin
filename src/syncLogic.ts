@@ -331,8 +331,8 @@ export class SyncLogic {
 
             if (force) {
                 // Google Calendar の events.insert は body.id を受け付けないため付与しない
-                const insertBody = { ...eventPayload } as GoogleCalendarEventInput;
-                batchRequests.push({ method: 'POST', path: calendarPath, body: insertBody, obsidianTaskId: obsId, operationType: 'insert' });
+                const bodies = this.expandEventForInsertion(eventPayload, task);
+                bodies.forEach(body => batchRequests.push({ method: 'POST', path: calendarPath, body, obsidianTaskId: obsId, operationType: 'insert' }));
                 continue;
             }
 
@@ -369,13 +369,78 @@ export class SyncLogic {
                             skippedCount++;
                         }
                     } else {
-                        const insertBody = { ...eventPayload } as GoogleCalendarEventInput;
-                        batchRequests.push({ method: 'POST', path: calendarPath, body: insertBody, obsidianTaskId: obsId, operationType: 'insert' });
+                        const bodies = this.expandEventForInsertion(eventPayload, task);
+                        bodies.forEach(body => batchRequests.push({ method: 'POST', path: calendarPath, body, obsidianTaskId: obsId, operationType: 'insert' }));
                     }
                 }
             }
         }
         return { currentObsidianTaskIds, skipped: skippedCount };
+    }
+
+    // 挿入時に必要なら日次スライスや毎日展開に分割
+    private expandEventForInsertion(eventPayload: GoogleCalendarEventInput, task: ObsidianTask): GoogleCalendarEventInput[] {
+        const out: GoogleCalendarEventInput[] = [];
+        const clone = (e: GoogleCalendarEventInput): GoogleCalendarEventInput => JSON.parse(JSON.stringify(e));
+
+        // 1) daily + COUNT の場合は個別イベントに展開
+        const rr = (eventPayload.recurrence || [])[0] || '';
+        const mDaily = rr.match(/FREQ=DAILY(?:;COUNT=(\d+))?/);
+        if (mDaily) {
+            const count = Number(mDaily[1] || '1');
+            const base = eventPayload.start?.dateTime ? moment.parseZone(eventPayload.start.dateTime) : null;
+            if (base && count > 0) {
+                // 時間帯はタスクの timeWindow または payload の時刻から推定
+                const twStart = task.timeWindowStart || moment(base).format('HH:mm');
+                const twEnd = task.timeWindowEnd || (eventPayload.end?.dateTime ? moment.parseZone(eventPayload.end.dateTime).format('HH:mm') : '24:00');
+                for (let i = 0; i < count; i++) {
+                    const sDay = base.clone().add(i, 'day');
+                    const [sh, sm] = twStart.split(':').map(Number);
+                    const [eh, em] = twEnd.split(':').map(x => x === '24:00' ? NaN : Number(x));
+                    const s = sDay.clone().hour(sh).minute(sm).second(0).millisecond(0);
+                    let e: moment.Moment;
+                    if (twEnd === '24:00') {
+                        e = sDay.clone().add(1, 'day').startOf('day');
+                    } else {
+                        e = sDay.clone().hour(eh!).minute(em!).second(0).millisecond(0);
+                    }
+                    const ev = clone(eventPayload);
+                    ev.start = { dateTime: s.toISOString(true) };
+                    ev.end = { dateTime: e.toISOString(true) };
+                    ev.recurrence = undefined;
+                    if ((ev.start as any).date) delete (ev.start as any).date;
+                    if ((ev.end as any).date) delete (ev.end as any).date;
+                    out.push(ev);
+                }
+                return out;
+            }
+        }
+
+        // 2) 単一イベントが日付を跨ぐ場合は日次スライス
+        const sdt = eventPayload.start?.dateTime ? moment.parseZone(eventPayload.start.dateTime) : null;
+        const edt = eventPayload.end?.dateTime ? moment.parseZone(eventPayload.end.dateTime) : null;
+        if (sdt && edt && !sdt.isSame(edt, 'day')) {
+            let cursor = sdt.clone();
+            // 先頭スライス: 開始〜24:00
+            let endOfDay = cursor.clone().add(1,'day').startOf('day');
+            out.push({ ...clone(eventPayload), start: { dateTime: cursor.toISOString(true) }, end: { dateTime: endOfDay.toISOString(true) }, recurrence: undefined });
+            // 中間スライス: 00:00〜24:00
+            cursor = endOfDay.clone();
+            while (cursor.isBefore(edt, 'day')) {
+                const next = cursor.clone().add(1,'day').startOf('day');
+                out.push({ ...clone(eventPayload), start: { dateTime: cursor.toISOString(true) }, end: { dateTime: next.toISOString(true) }, recurrence: undefined });
+                cursor = next;
+            }
+            // 最終スライス: 00:00〜元の終了時刻
+            out.push({ ...clone(eventPayload), start: { dateTime: cursor.startOf('day').toISOString(true) }, end: { dateTime: edt.toISOString(true) }, recurrence: undefined });
+            // 正規化: date を排除
+            out.forEach(ev => { if ((ev.start as any).date) delete (ev.start as any).date; if ((ev.end as any).date) delete (ev.end as any).date; });
+            return out;
+        }
+
+        // 3) それ以外はそのまま単一
+        out.push(eventPayload);
+        return out;
     }
 
     private prepareDeletionRequests(
