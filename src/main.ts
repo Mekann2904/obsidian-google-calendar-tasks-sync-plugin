@@ -46,7 +46,6 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 		await this.loadSettings();
 
         // 設定がロードされた後に、設定に依存するクラスをインスタンス化
-        this.gcalMapper = new GCalMapper(this.app, this.settings);
         this.syncLogic = new SyncLogic(this);
 
 		// useLoopbackServer の強制 (現在は不要だが念のため)
@@ -74,6 +73,28 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 			id: 'sync-tasks-now',
 			name: 'Google Calendar と今すぐタスクを同期する',
 			callback: async () => this.triggerSync(),
+		});
+
+		// 重複整理（ドライラン）
+		this.addCommand({
+			id: 'dedupe-cleanup-dry-run',
+			name: '重複イベントを整理（ドライラン）',
+			callback: async () => {
+				if (this.isCurrentlySyncing()) { new Notice('処理中のため実行できない。'); return; }
+				await this.syncLogic.runDedupeCleanup(true);
+			}
+		});
+
+		// 重複整理（実行）
+		this.addCommand({
+			id: 'dedupe-cleanup-exec',
+			name: '重複イベントを整理（実行）',
+			callback: async () => {
+				if (this.isCurrentlySyncing()) { new Notice('処理中のため実行できない。'); return; }
+				const ok = confirm('重複イベントの削除を実行しますか？ この操作は元に戻せません。');
+				if (!ok) return;
+				await this.syncLogic.runDedupeCleanup(false);
+			}
 		});
 
 		// 設定タブの追加
@@ -116,10 +137,7 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 			this.settings.lastSyncTime = undefined;
         }
 
-        // 設定がロードされたので、設定に依存するクラスを（再）インスタンス化
-        this.gcalMapper = new GCalMapper(this.app, this.settings);
-        // syncLogic はコンストラクタで plugin インスタンスを受け取るだけなので再インスタンス化不要かも
-        // this.syncLogic = new SyncLogic(this); // 必要なら
+        // syncLogic はコンストラクタで plugin インスタンスを受け取るだけなので再インスタンス化不要
 	}
 
 	async saveSettings() {
@@ -127,8 +145,6 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 		console.log("設定が保存されました。再設定をトリガーします...");
         // 設定変更後に必要な再設定を実行
 		await this.reconfigureAfterSettingsChange();
-        // 設定に依存する可能性のある Mapper を再生成
-        this.gcalMapper = new GCalMapper(this.app, this.settings);
         // 設定タブが開いている場合、UIを更新
         this.refreshSettingsTab();
 	}
@@ -192,7 +208,8 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
             return;
         }
         new Notice('手動同期を開始しました...');
-        await this.syncLogic.runSync();
+        // FIX: 設定のスナップショットを渡して競合状態を防止
+        await this.syncLogic.runSync(JSON.parse(JSON.stringify(this.settings)));
     }
 
     /** 強制同期 (リセット) をトリガー */
@@ -206,7 +223,8 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
             return;
         }
         new Notice('強制リセット同期を開始しました...');
-        await this.syncLogic.runSync({ force: true });
+        // FIX: 設定のスナップショットを渡して競合状態を防止
+        await this.syncLogic.runSync(JSON.parse(JSON.stringify(this.settings)), { force: true });
     }
 
 	/** 自動同期を設定 */
@@ -235,7 +253,8 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
                 }
                 // 同期実行
 				console.log(`[${timestamp}] 自動同期実行中...`);
-				await this.syncLogic.runSync();
+                // FIX: 設定のスナップショットを渡して競合状態を防止
+				await this.syncLogic.runSync(JSON.parse(JSON.stringify(this.settings)));
                 console.log(`[${timestamp}] 自動同期完了`);
 			}, intervalMillis);
             console.log(`自動同期タイマー開始 (ID: ${this.syncIntervalId})。初回実行は約 ${moment().add(intervalMillis, 'ms').format('HH:mm')}。`);

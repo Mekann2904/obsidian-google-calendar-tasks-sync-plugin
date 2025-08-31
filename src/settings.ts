@@ -12,6 +12,11 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 	autoSync: true,
 	taskMap: {},
 	lastSyncTime: undefined,
+	fetchWindowPastDays: 90,
+	fetchWindowFutureDays: 180,
+	includeDescriptionInIdentity: false,
+	includeReminderInIdentity: false,
+	useSyncToken: false,
 	syncPriorityToDescription: true,
 	syncTagsToDescription: true,
 	syncBlockLinkToDescription: false, // デフォルトではオフ (Obsidian URI に統合されるため)
@@ -26,6 +31,7 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 		showErrors: true, // エラー通知を表示するか
 		minSyncDurationForNotice: 10, // 通知を表示する最小同期時間（秒）
 	},
+	interBatchDelay: 500, // バッチリクエスト間のデフォルト遅延（ミリ秒）
 };
 
 
@@ -101,6 +107,36 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 						} else if (value !== currentPortSetting.toString()) {
 							new Notice('無効なポート番号です (1024-65535)。', 5000);
 							text.setValue(currentPortSetting.toString()); // 無効な値は元に戻す
+						}
+					});
+			});
+		// バッチ間遅延
+		new Setting(containerEl)
+			.setName('バッチ間遅延 (ミリ秒)')
+			.setDesc('レート制限を回避するため、各バッチリクエスト間に設ける遅延時間 (0-5000ms)。')
+			.addText((text: TextComponent) => {
+				text.inputEl.type = 'number';
+				text.inputEl.min = '0';
+				text.inputEl.max = '5000';
+				const current = this.plugin.settings.interBatchDelay;
+				text.setValue(current.toString())
+					.setPlaceholder(DEFAULT_SETTINGS.interBatchDelay.toString())
+					.onChange(async (value) => {
+						const delay = parseInt(value, 10);
+						let newDelay = current;
+						if (isNaN(delay) || delay < 0) {
+							newDelay = 0;
+						} else if (delay > 5000) {
+							newDelay = 5000;
+						} else {
+							newDelay = delay;
+						}
+						if (current !== newDelay) {
+							this.plugin.settings.interBatchDelay = newDelay;
+							await this.plugin.saveData(this.plugin.settings);
+							text.setValue(newDelay.toString());
+						} else if (value !== newDelay.toString()){
+							text.setValue(newDelay.toString());
 						}
 					});
 			});
@@ -262,6 +298,62 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 						} else if(value !== newDur.toString()){
 							text.setValue(newDur.toString()); // 表示を正規化
 						}
+					});
+			});
+
+		// 重複判定オプション
+		containerEl.createEl('h4', { text: '重複判定オプション' });
+		new Setting(containerEl)
+			.setName('説明文を重複キーに含める')
+			.setDesc('有効にすると、説明文の差異も重複判定に反映する。誤結合を避けたい場合に有効化。')
+			.addToggle(toggle => toggle
+				.setValue(!!this.plugin.settings.includeDescriptionInIdentity)
+				.onChange(async (value) => {
+					this.plugin.settings.includeDescriptionInIdentity = value;
+					await this.plugin.saveData(this.plugin.settings);
+				}));
+		new Setting(containerEl)
+			.setName('リマインダー有無を重複キーに含める')
+			.setDesc('有効にすると、リマインダー（ポップアップ/メール）の有無も重複判定に反映する。')
+			.addToggle(toggle => toggle
+				.setValue(!!this.plugin.settings.includeReminderInIdentity)
+				.onChange(async (value) => {
+					this.plugin.settings.includeReminderInIdentity = value;
+					await this.plugin.saveData(this.plugin.settings);
+				}));
+
+		// 取得窓（フル同期時）
+		new Setting(containerEl)
+			.setName('フル同期の取得窓（過去日数）')
+			.setDesc('lastSyncTime が未設定のフル同期時に、過去N日分に取得を制限する (0 で無制限)。')
+			.addText(text => {
+				text.inputEl.type = 'number';
+				text.inputEl.min = '0';
+				const current = this.plugin.settings.fetchWindowPastDays ?? DEFAULT_SETTINGS.fetchWindowPastDays!;
+				text.setValue(String(current))
+					.onChange(async (value) => {
+						let n = parseInt(value, 10);
+						if (isNaN(n) || n < 0) n = 0;
+						this.plugin.settings.fetchWindowPastDays = n;
+						await this.plugin.saveData(this.plugin.settings);
+						text.setValue(String(n));
+					});
+			});
+
+		new Setting(containerEl)
+			.setName('フル同期の取得窓（未来日数）')
+			.setDesc('lastSyncTime が未設定のフル同期時に、未来M日分に取得を制限する (0 で無制限)。')
+			.addText(text => {
+				text.inputEl.type = 'number';
+				text.inputEl.min = '0';
+				const current = this.plugin.settings.fetchWindowFutureDays ?? DEFAULT_SETTINGS.fetchWindowFutureDays!;
+				text.setValue(String(current))
+					.onChange(async (value) => {
+						let n = parseInt(value, 10);
+						if (isNaN(n) || n < 0) n = 0;
+						this.plugin.settings.fetchWindowFutureDays = n;
+						await this.plugin.saveData(this.plugin.settings);
+						text.setValue(String(n));
 					});
 			});
 		// --- Google イベント説明欄の内容 ---

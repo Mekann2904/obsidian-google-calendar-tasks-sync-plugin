@@ -3,7 +3,9 @@ import { calendar_v3 } from 'googleapis';
 import { BatchRequestItem, BatchResponseItem, GoogleCalendarTasksSyncSettings } from './types';
 
 export class BatchProcessor {
-    private readonly BATCH_SIZE = 100;
+    // Google Calendar API のバッチリクエストは、公式ドキュメント上、最大50リクエストまで。
+    // See: https://developers.google.com/calendar/api/guides/batch
+    private readonly BATCH_SIZE = 50;
 
     constructor(private calendarId: string, private settings: GoogleCalendarTasksSyncSettings) {}
 
@@ -54,6 +56,11 @@ export class BatchProcessor {
                 created += c; updated += u; deleted += d; errors += e; skipped += s;
             } catch (e: any) {
                 errors += this.handleBatchError(e, batchChunk, allResults);
+            }
+
+            // FIX: 次のバッチがある場合、レート制限回避のために遅延を設ける
+            if (i + this.BATCH_SIZE < batchRequests.length && this.settings.interBatchDelay > 0) {
+                await new Promise(resolve => setTimeout(resolve, this.settings.interBatchDelay));
             }
         }
 
@@ -111,11 +118,15 @@ export class BatchProcessor {
                     case 'update': case 'patch': updated++; break;
                     case 'delete': deleted++; break;
                 }
-                console.log(`${this.getOperationName(op)}: ${summary}`);
+                console.log(`${this.getOperationName(op, req)}: ${summary}`);
             } else {
-                if ((op==='delete' || op==='patch' || op==='update') && (res.status===404||res.status===410)) {
+                if ((op==='delete' || op==='patch' || op==='update') && (res.status===404||res.status===410||res.status===412)) {
                     skipped++;
-                    console.warn(`リソース未存在: ${req.originalGcalId}`);
+                    const why = res.status===412 ? '競合(412)' : 'リソース未存在';
+                    console.warn(`${why}: ${req.originalGcalId}`);
+                } else if (op==='insert' && res.status===409) {
+                    skipped++;
+                    console.warn(`挿入スキップ(409): 既存IDまたは重複作成 ${req.obsidianTaskId}`);
                 } else {
                     errors++;
                     const msg = res.body?.error?.message || `Status ${res.status}`;
@@ -127,11 +138,13 @@ export class BatchProcessor {
         return { created, updated, deleted, errors, skipped };
     }
 
-    private getOperationName(op?: string): string {
-        switch(op?.toLowerCase()) {
+    private getOperationName(op?: string, req?: BatchRequestItem): string {
+        const low = op?.toLowerCase();
+        if (low === 'patch' && req?.body && req.body.status === 'cancelled') return 'キャンセル';
+        switch(low) {
             case 'insert': return '作成';
             case 'update': return '更新';
-            case 'patch': return 'キャンセル';
+            case 'patch': return '更新';
             case 'delete': return '削除';
             default: return op || '不明な操作';
         }

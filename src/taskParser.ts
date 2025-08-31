@@ -28,7 +28,28 @@ export class TaskParser {
                 const content = await this.app.vault.read(file);
                 const lines = content.split('\n');
                 const fileTasks: ObsidianTask[] = [];
+                // フェンスドコードブロック (``` や ~~~) 内は同期対象外
+                let inFence = false;
+                let fenceChar: '`' | '~' | '' = '';
+                let fenceLen = 0;
+                const fenceOpenRe = /^\s*(`{3,}|~{3,})/;
                 lines.forEach((line, index) => {
+                    const open = line.match(fenceOpenRe);
+                    if (open) {
+                        const marker = open[1];
+                        const ch = marker[0] as '`' | '~';
+                        const len = marker.length;
+                        if (!inFence) {
+                            inFence = true; fenceChar = ch; fenceLen = len; return; // フェンス開始行はスキップ
+                        }
+                        // 既にフェンス中の場合でも、同種マーカーが来れば終了とみなす
+                        if (inFence && fenceChar === ch) {
+                            inFence = false; fenceChar = ''; fenceLen = 0; return; // 終了行もスキップ
+                        }
+                    }
+
+                    if (inFence) return; // コードブロック内は無視
+
                     const task = this.parseObsidianTask(line, file.path, index);
                     if (task) {
                         fileTasks.push(task);
@@ -66,7 +87,8 @@ export class TaskParser {
         const isCompleted = checkbox !== ' ' && checkbox !== '';
 
         // FIX: ISO拡張の余計な空白を除去し、秒・小数秒・タイムゾーンを正しくオプショナルに
-        const isoOrSimpleDateRegex = `\\d{4}-\\d{2}-\\d{2}(?:T\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?(?:Z|[+-]\\d{2}:\\d{2})?)?`;
+        // 拡張: 'YYYY-MM-DD HH:mm' 形式も許容（T または空白区切り）
+        const isoOrSimpleDateRegex = `\\d{4}-\\d{2}-\\d{2}(?:[T\\s]\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?(?:Z|[+-]\\d{2}:\\d{2})?)?`;
         const simpleDateRegexOnly = `\\d{4}-\\d{2}-\\d{2}`;
 
         // メタデータの抽出関数
@@ -88,6 +110,8 @@ export class TaskParser {
         let completionDate: string | null = null;
         let priority: ObsidianTask['priority'] = null;
         let recurrenceRuleText: string | null = null;
+        let timeWindowStart: string | null = null;
+        let timeWindowEnd: string | null = null;
         let blockLink: string | null = null;
 
         // 日付を抽出
@@ -113,6 +137,16 @@ export class TaskParser {
 
         // 繰り返しルールを抽出
         ({ value: recurrenceRuleText, remainingContent } = extractMetadata(remainingContent, /(?:🔁|repeat:|recur:)\s*([^📅🛫⏳➕✅🔺⏫🔼🔽⏬⏰#^]+)/u));
+        // 🔁 拡張: "hh:mm~hh:mm" を抽出（例: "every day 15:00~24:00" または "15:00~24:00"）
+        if (recurrenceRuleText) {
+            const m = recurrenceRuleText.match(/(\d{1,2}:\d{2})\s*~\s*(\d{1,2}:\d{2}|24:00)/);
+            if (m) {
+                timeWindowStart = m[1];
+                timeWindowEnd = m[2];
+                recurrenceRuleText = recurrenceRuleText.replace(m[0], '').trim();
+                if (recurrenceRuleText.length === 0) recurrenceRuleText = null;
+            }
+        }
 
         // ブロックリンクを抽出 (行末)
         const blockLinkMatch = remainingContent.match(/\s+(\^[a-zA-Z0-9-]+)$/);
@@ -165,6 +199,8 @@ export class TaskParser {
             completionDate: completionDate,
             priority: priority,
             recurrenceRule: recurrenceRule,
+            timeWindowStart,
+            timeWindowEnd,
             tags: tags,
             blockLink: blockLink,
             sourcePath: filePath,
@@ -234,8 +270,11 @@ export class TaskParser {
         ruleText = ruleText.toLowerCase();
         let dtstartDate: Date;
         if (dtstartHint) {
-            const pDate = moment.utc(dtstartHint, [moment.ISO_8601, 'YYYY-MM-DD'], true);
-            dtstartDate = pDate.isValid() ? pDate.toDate() : moment().startOf('day').toDate(); // UTC or Local Today
+            // FIX: moment.utc() を moment() に変更。
+            // 日付のみのヒント("2023-12-25"など)をUTC0時ではなく、ローカルタイムゾーンの0時として解釈させる。
+            // これにより、タイムゾーンがUTCより西にあるユーザーで日付が1日ずれる問題を修正。
+            const pDate = moment(dtstartHint, [moment.ISO_8601, 'YYYY-MM-DD'], true);
+            dtstartDate = pDate.isValid() ? pDate.toDate() : moment().startOf('day').toDate(); // Local Time
         } else {
             dtstartDate = moment().startOf('day').toDate(); // Local Today
         }

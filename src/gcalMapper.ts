@@ -1,6 +1,7 @@
 import { App } from 'obsidian';
 import moment from 'moment';
 import { ObsidianTask, GoogleCalendarEventInput, GoogleCalendarTasksSyncSettings } from './types';
+import { FingerprintUtils } from './commonUtils';
 import { rrulestr } from 'rrule';
 
 export class GCalMapper {
@@ -23,7 +24,9 @@ export class GCalMapper {
             extendedProperties: {
                 private: {
                     obsidianTaskId: task.id,
-                    isGcalSync: 'true'
+                    isGcalSync: 'true',
+                    appId: 'obsidian-gcal-tasks',
+                    version: '1',
                 }
             },
             description: this.buildEventDescription(task),
@@ -42,16 +45,21 @@ export class GCalMapper {
 
         // 繰り返しルール
         if (!task.isCompleted && task.recurrenceRule && event.start) { // 未完了でルールと開始時間がある場合のみ
-            let rruleString = task.recurrenceRule.toUpperCase();
-            if (!rruleString.startsWith('RRULE:')) {
-                rruleString = `RRULE:${rruleString}`;
-            }
+            // RRULE 正規化: 複数行や先頭に DTSTART が付く表現を許容し、RRULE 行のみ抽出
+            const raw = String(task.recurrenceRule).trim();
+            const upper = raw.replace(/\r/g, '\n').toUpperCase();
+            const rruleLineMatch = upper.match(/RRULE:[^\n]+/);
+            let normalized = '';
+            if (rruleLineMatch) normalized = rruleLineMatch[0];
+            else if (/^FREQ=/.test(upper)) normalized = `RRULE:${upper}`;
+            else normalized = upper.replace(/DTSTART:[^\n]+\n?/g, '').trim();
+            if (normalized && !normalized.startsWith('RRULE:')) normalized = `RRULE:${normalized}`;
             try {
-                rrulestr(rruleString); // パース可能かチェック
-                event.recurrence = [rruleString];
+                rrulestr(normalized); // パース可能かチェック
+                event.recurrence = [normalized];
             } catch (e) {
-                 console.warn(`タスク "${task.summary || task.id}" の無効な RRULE 文字列: ${task.recurrenceRule}。繰り返しをスキップします。`, e);
-                 delete event.recurrence;
+                console.warn(`タスク "${task.summary || task.id}" の無効な RRULE 文字列(正規化後): ${normalized}。繰り返しをスキップします。`, e);
+                delete event.recurrence;
             }
         } else {
             delete event.recurrence; // 完了済み、ルールなし、または開始時間がない場合は削除
@@ -92,6 +100,21 @@ export class GCalMapper {
                 }
             }
         }
+
+        // localFp を付与（説明/リマインダーは設定で可変）
+        const includeDesc = !!this.settings.includeDescriptionInIdentity;
+        const includeRem  = !!this.settings.includeReminderInIdentity;
+        const fpEvent = {
+            summary: event.summary,
+            description: includeDesc ? event.description : undefined,
+            start: event.start,
+            end: event.end,
+            status: event.status,
+            recurrence: event.recurrence,
+            reminders: includeRem ? event.reminders : undefined,
+        } as GoogleCalendarEventInput;
+        const localFp = FingerprintUtils.identityKeyFromEvent(fpEvent as any, includeDesc, includeRem);
+        (event.extendedProperties!.private as any).localFp = localFp;
 
         return event;
     }
@@ -148,12 +171,14 @@ export class GCalMapper {
         const startStr = task.startDate!; // null でないことは呼び出し元で保証される想定
         const dueStr = task.dueDate!;   // null でないことは呼び出し元で保証される想定
 
-        const startIsDateTime = startStr.includes('T');
-        const dueIsDateTime = dueStr.includes('T');
+        // 'YYYY-MM-DD HH:mm' も時刻付きとして認識する
+        const hasTime = (s: string) => /(T|\s)\d{1,2}:\d{2}/.test(s);
+        const startIsDateTime = hasTime(startStr);
+        const dueIsDateTime = hasTime(dueStr);
 
         // moment.utc を使用し、厳密なパースを行う
-        const startMoment = moment.utc(startStr, [moment.ISO_8601, 'YYYY-MM-DD'], true);
-        const dueMoment = moment.utc(dueStr, [moment.ISO_8601, 'YYYY-MM-DD'], true);
+        const startMoment = moment(startStr, [moment.ISO_8601, 'YYYY-MM-DD HH:mm', 'YYYY-MM-DD'], true);
+        const dueMoment = moment(dueStr, [moment.ISO_8601, 'YYYY-MM-DD HH:mm', 'YYYY-MM-DD'], true);
 
         if (!startMoment.isValid() || !dueMoment.isValid()) {
             console.error(`タスク "${task.summary || task.id}" の日付パース失敗 (setEventTimeUsingStartDue)。Start: ${startStr}, Due: ${dueStr}。時間をデフォルト設定します。`);
@@ -163,26 +188,74 @@ export class GCalMapper {
         }
 
         if (!startIsDateTime || !dueIsDateTime) {
-            // 終日イベント
-            event.start = { date: startMoment.format('YYYY-MM-DD') };
-            // GCal APIでは終日イベントの終了日は exclusive なので、dueMoment の *翌日* を指定
-            const endDate = dueMoment.add(1, 'day').format('YYYY-MM-DD');
-            event.end = { date: endDate };
+            // 🔁拡張: 時間ウィンドウが指定されている場合は時間指定イベントにする
+            const winStart = (task.timeWindowStart || '').trim();
+            const winEnd = (task.timeWindowEnd || '').trim();
+            const hasWindow = /^\d{1,2}:\d{2}$/.test(winStart) && /^(\d{1,2}:\d{2}|24:00)$/.test(winEnd);
 
-            if (moment.utc(event.end.date).isSameOrBefore(moment.utc(event.start.date))) {
-                console.warn(`タスク "${task.summary || task.id}": 終日イベントの終了日(${dueMoment.subtract(1, 'day').format('YYYY-MM-DD')})が開始日(${startMoment.format('YYYY-MM-DD')})以前。終了日を開始日の翌日に設定。`);
-                event.end = { date: startMoment.clone().add(1, 'day').format('YYYY-MM-DD') };
+            const toIso = (d: moment.Moment, hhmm: string): string => {
+                const [h, m] = hhmm.split(':').map(v => parseInt(v,10));
+                const base = d.clone().hour(h).minute(m).second(0).millisecond(0);
+                return base.toISOString(true);
+            };
+
+            if (hasWindow) {
+                // 時間ウィンドウがある場合は必ず時間指定イベントにする
+                const isDaily = (task.recurrenceRule || '').toUpperCase().includes('FREQ=DAILY');
+                event.start = this.toEventDateTime(moment(toIso(startMoment, winStart)));
+                if (winEnd === '24:00') {
+                    // 24:00 は翌日 00:00
+                    const baseEndDay = isDaily ? startMoment.clone().add(1,'day')
+                                               : (dueMoment.isSame(startMoment,'day') ? startMoment.clone().add(1,'day')
+                                                                                      : dueMoment.clone().add(1,'day'));
+                    event.end = this.toEventDateTime(moment(toIso(baseEndDay, '00:00')));
+                } else {
+                    const baseEndDay = isDaily ? startMoment : dueMoment;
+                    event.end = this.toEventDateTime(moment(toIso(baseEndDay, winEnd)));
+                }
+            } else if (startIsDateTime && !dueIsDateTime && startMoment.isSame(dueMoment, 'day')) {
+                // 仕様: 開始に時刻・終了が日付のみ（同日）の場合は 24:00 まで
+                event.start = this.toEventDateTime(startMoment);
+                event.end = this.toEventDateTime(startMoment.clone().add(1,'day').startOf('day'));
+            } else {
+                // 終日イベント
+                event.start = { date: startMoment.format('YYYY-MM-DD') };
+                // GCal APIでは終日イベントの終了日は exclusive なので、dueMoment の *翌日* を指定
+                const endDate = dueMoment.add(1, 'day').format('YYYY-MM-DD');
+                event.end = { date: endDate };
+
+                if (moment.utc(event.end.date).isSameOrBefore(moment.utc(event.start.date))) {
+                    console.warn(`タスク "${task.summary || task.id}": 終日イベントの終了日(${dueMoment.subtract(1, 'day').format('YYYY-MM-DD')})が開始日(${startMoment.format('YYYY-MM-DD')})以前。終了日を開始日の翌日に設定。`);
+                    event.end = { date: startMoment.clone().add(1, 'day').format('YYYY-MM-DD') };
+                }
             }
         } else {
             // 時間指定イベント
-            event.start = { dateTime: startMoment.toISOString(true) }; // keepOffset=true
-            event.end = { dateTime: dueMoment.toISOString(true) };   // keepOffset=true
+            event.start = this.toEventDateTime(startMoment);
+            event.end = this.toEventDateTime(dueMoment);
 
             if (dueMoment.isSameOrBefore(startMoment)) {
                 console.warn(`タスク "${task.summary || task.id}": 終了時刻 (${dueMoment.toISOString()}) が開始時刻 (${startMoment.toISOString()}) 以前。デフォルト期間 (${this.settings.defaultEventDurationMinutes}分) を使用して調整します。`);
                 event.end = { dateTime: startMoment.clone().add(this.settings.defaultEventDurationMinutes, 'minutes').toISOString(true) };
             }
         }
+
+        // RRULE の期間限定補助: "every day" かつ COUNT/UNTILなし、start/due が日付の範囲の場合は COUNT を補う
+        if (task.recurrenceRule && event.start?.dateTime && (!task.startDate?.includes('T') || !task.dueDate?.includes('T'))) {
+            const rule = (task.recurrenceRule || '').toUpperCase();
+            if (rule.includes('FREQ=DAILY') && !/;COUNT=|;UNTIL=/.test(rule) && task.startDate && task.dueDate) {
+                const s = moment(task.startDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
+                const e = moment(task.dueDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
+                const days = e.diff(s, 'days') + 1; // 期間を含める
+                if (days > 0) {
+                    event.recurrence = [ `RRULE:FREQ=DAILY;COUNT=${days}` ];
+                }
+            }
+        }
+
+        // dateTime があれば date をクリア（Google 側の解釈ブレを防止）
+        if (event.start?.dateTime && (event.start as any).date) delete (event.start as any).date;
+        if (event.end?.dateTime && (event.end as any).date) delete (event.end as any).date;
 
         // 最終チェック
 		if (!event.start || !event.end ||
@@ -192,6 +265,15 @@ export class GCalMapper {
              this.setDefaultEventTime(event);
              event.description = (event.description || '') + `\n\n(注意: イベント時間はデフォルト設定 - 日付処理エラー)`;
         }
+    }
+
+    private toEventDateTime(m: moment.Moment): { dateTime: string; timeZone?: string } {
+        // Google Calendar API は dateTime と timeZone の組合せを許容。
+        // 互換性のため、offset なしのローカル表記 + IANA timeZone を送る。
+        const dateTime = m.format('YYYY-MM-DDTHH:mm:ss');
+        let timeZone: string | undefined = undefined;
+        try { timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch {}
+        return timeZone ? { dateTime, timeZone } : { dateTime };
     }
 
     /**

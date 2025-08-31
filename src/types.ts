@@ -14,6 +14,9 @@ export interface ObsidianTask {
 	completionDate: string | null; // 完了日 (YYYY-MM-DD) (✅ or done:)
 	priority: 'highest' | 'high' | 'medium' | 'low' | 'lowest' | null; // 優先度 (🔺⏫🔼🔽⏬)
 	recurrenceRule: string | null; // 繰り返しルール (iCalendar RRULE 文字列) (🔁 or repeat:/recur:)
+	// 🔁 拡張: 時間ウィンドウ (例: 15:00~24:00)
+	timeWindowStart?: string | null; // 'HH:mm'
+	timeWindowEnd?: string | null;   // 'HH:mm' または '24:00'
 	tags: string[]; // タグ (例: #tag1)
 	blockLink: string | null; // ブロックリンク (例: ^abcdef)
 	sourcePath: string; // タスクが存在するファイルのパス
@@ -37,6 +40,10 @@ export interface GoogleCalendarTasksSyncSettings {
 	autoSync: boolean; // 自動同期を有効にするか
 	taskMap: { [obsidianTaskId: string]: string }; // ObsidianタスクIDとGoogle CalendarイベントIDのマッピング
 	lastSyncTime?: string; // 最後に同期が成功した時刻 (ISO 8601 形式)
+	fetchWindowPastDays?: number; // フル同期時の取得窓: 過去日数
+	fetchWindowFutureDays?: number; // フル同期時の取得窓: 未来日数
+	includeDescriptionInIdentity?: boolean; // 重複判定に説明文を含めるか
+	includeReminderInIdentity?: boolean;    // 重複判定にリマインダー有無を含めるか
 	// Google Calendar イベントの説明欄にどの情報を含めるかの設定
 	syncPriorityToDescription: boolean; // 優先度を説明に追加するか
 	syncTagsToDescription: boolean; // タグを説明に追加するか
@@ -52,6 +59,9 @@ export interface GoogleCalendarTasksSyncSettings {
 		showErrors: boolean; // エラー通知を表示するか
 		minSyncDurationForNotice: number; // 通知を表示する最小同期時間（秒）
 	};
+	interBatchDelay: number; // バッチリクエスト間の遅延（ミリ秒）
+	recentErrors?: ErrorLog[]; // 最近のエラーサンプル（診断用）
+	useSyncToken?: boolean; // 可能な場合、syncToken による増分取得を使用
 }
 
 // バッチリクエスト用のインターフェース
@@ -60,6 +70,7 @@ export interface BatchRequestItem {
 	path: string; // APIのパス (例: /calendar/v3/calendars/{calendarId}/events/{eventId})
 	headers?: { [key: string]: string }; // リクエストヘッダー (オプション)
 	body?: any; // リクエストボディ (JSONなど)
+	fullBody?: any; // PATCHのフォールバック用に保持する完全ボディ (オプション)
 	obsidianTaskId?: string; // どのObsidianタスクに関連するか (結果処理で使用)
 	operationType?: 'insert' | 'update' | 'patch' | 'delete'; // 実行した操作の種類 (結果処理で使用)
 	originalGcalId?: string; // delete/update/patch 操作の対象となる元のGoogle CalendarイベントID
@@ -81,6 +92,7 @@ export interface BatchResult {
     deleted: number;
     errors: number;
     skipped: number;
+    metrics?: SyncMetrics;
 }
 
 // エラーログ用インターフェース
@@ -91,4 +103,13 @@ export interface ErrorLog {
     gcalId?: string;
     retryCount: number;
     errorDetails: any;
+}
+
+// 同期メトリクス
+export interface SyncMetrics {
+    sentSubBatches: number;      // 送信したサブバッチ数（最大50件単位）
+    attempts: number;            // 再送を含む試行回数
+    totalWaitMs: number;         // バックオフ + インターバッチ待機の合計
+    batchLatenciesMs: number[];  // 各サブバッチの往復レイテンシ
+    statusCounts: { [status: number]: number }; // ステータスコード分布
 }

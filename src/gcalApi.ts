@@ -16,7 +16,7 @@ export class GCalApiService {
     /**
      * このプラグインによって作成された Google Calendar イベントを取得します。
      */
-    async fetchGoogleCalendarEvents(): Promise<calendar_v3.Schema$Event[]> {
+    async fetchGoogleCalendarEvents(settings: GoogleCalendarTasksSyncSettings): Promise<calendar_v3.Schema$Event[]> {
         if (!this.plugin.calendar) {
             this.plugin.authService.initializeCalendarApi();
             if (!this.plugin.calendar) {
@@ -26,16 +26,23 @@ export class GCalApiService {
 
         const existingEvents: calendar_v3.Schema$Event[] = [];
         let nextPageToken: string | undefined;
+        let nextSyncToken: string | undefined;
         const requestParams: calendar_v3.Params$Resource$Events$List = {
-            calendarId: this.plugin.settings.calendarId,
+            calendarId: settings.calendarId,
             privateExtendedProperty: ["isGcalSync=true"],
             showDeleted: false,
             maxResults: 250,
             singleEvents: false,
-            timeMin: new Date().toISOString(), // 以後のみ（既存ID検証には十分）
         };
 
-        console.log("このプラグインによってマークされた全ての GCal イベントを取得中...");
+        // 重要: デフォルトは全件取得。一方で設定が有効でsyncTokenがある場合は増分取得を試行（失敗時は全件へフォールバック）。
+        const trySyncToken = !!settings.useSyncToken && !!(this.plugin as any).settings?.syncToken;
+        if (trySyncToken) {
+            (requestParams as any).syncToken = (this.plugin as any).settings.syncToken;
+            console.log(`syncToken による増分取得を試行します。`);
+        } else {
+            console.log(`管理対象イベントを全件取得します（updatedMin/time 窓は使用しません）。`);
+        }
 
         try {
             let page = 1;
@@ -47,16 +54,46 @@ export class GCalApiService {
                 if (response.data.items) {
                     existingEvents.push(...response.data.items);
                 }
+                if (response.data.nextSyncToken) nextSyncToken = response.data.nextSyncToken;
                 nextPageToken = response.data.nextPageToken ?? undefined;
                 page++;
             } while (nextPageToken);
 
             console.log(`合計 ${existingEvents.length} 件の GCal イベントを取得しました。`);
+            // syncToken 保存（増分が有効な場合）
+            if (nextSyncToken && settings.useSyncToken) {
+                (this.plugin as any).settings.syncToken = nextSyncToken;
+                await (this.plugin as any).saveData((this.plugin as any).settings);
+                console.log(`syncToken を保存しました。`);
+            }
             return existingEvents;
         } catch (e: any) {
             const errorMsg = isGaxiosError(e)
                 ? e.response?.data?.error?.message || e.message
                 : String(e);
+            // syncToken が無効化された場合はフル取得へフォールバック
+            if (/Sync token is no longer valid/i.test(errorMsg) || /410/.test(String(e?.response?.status))) {
+                console.warn(`syncToken が無効のため、フル取得へフォールバックします。`);
+                try {
+                    delete (requestParams as any).syncToken;
+                    (this.plugin as any).settings.syncToken = undefined;
+                    await (this.plugin as any).saveData((this.plugin as any).settings);
+                    // 全件再取得
+                    let page = 1;
+                    do {
+                        console.log(`GCal イベントページ ${page} を取得中...(fallback)`);
+                        requestParams.pageToken = nextPageToken;
+                        const response: GaxiosResponse<calendar_v3.Schema$Events> = await this.plugin.calendar!.events.list(requestParams);
+                        if (response.data.items) existingEvents.push(...response.data.items);
+                        nextPageToken = response.data.nextPageToken ?? undefined;
+                        page++;
+                    } while (nextPageToken);
+                    console.log(`フォールバックで合計 ${existingEvents.length} 件を取得しました。`);
+                    return existingEvents;
+                } catch (e2) {
+                    console.error("syncToken フォールバック取得も失敗:", e2);
+                }
+            }
             console.error("GCal イベントの取得中に致命的なエラー:", e);
             new Notice(`GCal イベントの取得エラー: ${errorMsg}。同期を中止しました。`, 10_000);
             throw new Error(`GCal イベントの取得に失敗しました: ${errorMsg}`);
@@ -134,7 +171,7 @@ export class GCalApiService {
             const results = this.parseBatchResponse(responseText); // FIX: boundary 引数を廃止し自動検出
 
             // 404/409/410 は item-level の警告として集計
-            const ignorable = new Set([404, 409, 410]);
+            const ignorable = new Set([404, 409, 410, 412]);
             const ignorableCount = results.filter(r => ignorable.has(r.status)).length;
             if (ignorableCount > 0) {
                 const counts = results.reduce((acc, r) => {
@@ -249,10 +286,11 @@ export class GCalApiService {
         }
 
         // HTTP ヘッダ終端（空行）を探す（statusLine 以降）
-        const headerEndIdx = lines.findIndex((l, idx) => idx > statusLineIdx && l.trim() === "");
+        let headerEndIdx = lines.findIndex((l, idx) => idx > statusLineIdx && l.trim() === "");
         if (headerEndIdx === -1) {
-            console.warn("バッチパート内で HTTP ヘッダ終端が見つかりません:", lines.slice(statusLineIdx, statusLineIdx + 10).join("\n"));
-            return null;
+            // 204 No Content 等でボディが無い場合、空行が省略されることがある。
+            // その場合はパート末尾をヘッダ終端と見なし、ボディ無しで成功として扱う。
+            headerEndIdx = lines.length - 1;
         }
 
         // ステータス
@@ -261,7 +299,7 @@ export class GCalApiService {
         const status = statusMatch ? parseInt(statusMatch[1], 10) : 500;
 
         // ボディ（空のこともある）
-        const bodyRaw = lines.slice(headerEndIdx + 1).join("\n").trim();
+        const bodyRaw = headerEndIdx + 1 < lines.length ? lines.slice(headerEndIdx + 1).join("\n").trim() : "";
         let bodyJson: any = undefined;
         if (bodyRaw) {
             try {
