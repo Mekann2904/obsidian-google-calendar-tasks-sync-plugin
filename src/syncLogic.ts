@@ -1,5 +1,5 @@
 import { Notice } from 'obsidian';
-import { ErrorHandler, DateUtils } from './commonUtils';
+import { ErrorHandler, DateUtils, FingerprintUtils } from './commonUtils';
 import { calendar_v3 } from 'googleapis';
 import GoogleCalendarTasksSyncPlugin from './main';
 import { ObsidianTask, GoogleCalendarEventInput, BatchRequestItem, BatchResponseItem, BatchResult, ErrorLog, GoogleCalendarTasksSyncSettings, SyncMetrics } from './types';
@@ -638,6 +638,22 @@ export class SyncLogic {
         newPayload: GoogleCalendarEventInput
     ): boolean {
         // Summary, Description, Status, Time, Reminders, Recurrence checks
+        // まず localFp を比較（説明/リマインダー含有は設定に従う）
+        const includeDesc = !!this.plugin.settings.includeDescriptionInIdentity;
+        const includeRem  = !!this.plugin.settings.includeReminderInIdentity;
+        const payloadForFp = {
+            summary: newPayload.summary,
+            description: includeDesc ? newPayload.description : undefined,
+            start: newPayload.start,
+            end: newPayload.end,
+            status: newPayload.status,
+            recurrence: newPayload.recurrence,
+            reminders: includeRem ? newPayload.reminders : undefined,
+        } as GoogleCalendarEventInput;
+        const newFp = FingerprintUtils.identityKeyFromEvent(payloadForFp as any, includeDesc, includeRem);
+        const oldFp = existingEvent.extendedProperties?.private?.['localFp'];
+        if (oldFp && oldFp === newFp) return false;
+
         if ((existingEvent.summary || '') !== (newPayload.summary || '')) return true;
         if ((existingEvent.description || '') !== (newPayload.description || '')) return true;
         const oldStat = existingEvent.status === 'cancelled' ? 'cancelled' : 'confirmed';
@@ -754,11 +770,29 @@ export class SyncLogic {
 
         // extendedProperties の obsidianTaskId 差異は更新しない（重複再利用時の所有者揺れを無視）
         // isGcalSync が欠けている場合のみ補う
-        const oldSync = existingEvent.extendedProperties?.private?.['isGcalSync'];
-        const newSync = newPayload.extendedProperties?.private?.['isGcalSync'];
-        if (newSync === 'true' && oldSync !== 'true') {
-            patch.extendedProperties = newPayload.extendedProperties;
-        }
+        // 管理印を最新に（localFp/appId/version）
+        const includeDesc2 = !!this.plugin.settings.includeDescriptionInIdentity;
+        const includeRem2  = !!this.plugin.settings.includeReminderInIdentity;
+        const priv: any = {
+            ...(existingEvent.extendedProperties?.private || {}),
+            isGcalSync: 'true',
+            appId: 'obsidian-gcal-tasks',
+            version: '1',
+            localFp: FingerprintUtils.identityKeyFromEvent(
+                {
+                    summary: newPayload.summary,
+                    description: includeDesc2 ? newPayload.description : undefined,
+                    start: newPayload.start,
+                    end: newPayload.end,
+                    status: newPayload.status,
+                    recurrence: newPayload.recurrence,
+                    reminders: includeRem2 ? newPayload.reminders : undefined,
+                } as any,
+                includeDesc2,
+                includeRem2
+            ),
+        };
+        patch.extendedProperties = { private: priv } as any;
 
         // 何も差分がない場合は summary を noop として入れない（空オブジェクトのまま返す）
         return patch;
@@ -770,7 +804,7 @@ export class SyncLogic {
         newPayload: GoogleCalendarEventInput
     ): Partial<calendar_v3.Schema$Event> {
         const tmp = this.buildPatchBody(existingEvent, newPayload);
-        if (tmp.extendedProperties) delete (tmp as any).extendedProperties; // 所有者差異を無視
+        // 所有者差異は無視するが、管理印(localFp等)は送る
         return tmp;
     }
 

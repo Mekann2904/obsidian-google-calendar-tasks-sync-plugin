@@ -1,6 +1,7 @@
 import { App } from 'obsidian';
 import moment from 'moment';
 import { ObsidianTask, GoogleCalendarEventInput, GoogleCalendarTasksSyncSettings } from './types';
+import { FingerprintUtils } from './commonUtils';
 import { rrulestr } from 'rrule';
 
 export class GCalMapper {
@@ -23,7 +24,9 @@ export class GCalMapper {
             extendedProperties: {
                 private: {
                     obsidianTaskId: task.id,
-                    isGcalSync: 'true'
+                    isGcalSync: 'true',
+                    appId: 'obsidian-gcal-tasks',
+                    version: '1',
                 }
             },
             description: this.buildEventDescription(task),
@@ -92,6 +95,21 @@ export class GCalMapper {
                 }
             }
         }
+
+        // localFp を付与（説明/リマインダーは設定で可変）
+        const includeDesc = !!this.settings.includeDescriptionInIdentity;
+        const includeRem  = !!this.settings.includeReminderInIdentity;
+        const fpEvent = {
+            summary: event.summary,
+            description: includeDesc ? event.description : undefined,
+            start: event.start,
+            end: event.end,
+            status: event.status,
+            recurrence: event.recurrence,
+            reminders: includeRem ? event.reminders : undefined,
+        } as GoogleCalendarEventInput;
+        const localFp = FingerprintUtils.identityKeyFromEvent(fpEvent as any, includeDesc, includeRem);
+        (event.extendedProperties!.private as any).localFp = localFp;
 
         return event;
     }

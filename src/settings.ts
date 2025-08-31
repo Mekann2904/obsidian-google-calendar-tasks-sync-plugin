@@ -16,6 +16,7 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 	fetchWindowFutureDays: 180,
 	includeDescriptionInIdentity: false,
 	includeReminderInIdentity: false,
+	useSyncToken: false,
 	syncPriorityToDescription: true,
 	syncTagsToDescription: true,
 	syncBlockLinkToDescription: false, // デフォルトではオフ (Obsidian URI に統合されるため)
