@@ -481,6 +481,19 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 					await this.plugin.syncNestedToGoogleTasks();
 					new Notice('Google Tasks への同期が完了しました。');
 				}));
+
+		new Setting(containerEl)
+			.setName('Google Tasks マップをクリア')
+			.setDesc('⚠️ 管理中のリスト/タスクIDのキャッシュ(tasksListMap/tasksItemMap)をクリアします。404が続く場合の復旧に使用してください。')
+			.addButton(btn => btn
+				.setButtonText('クリア')
+				.setWarning()
+				.onClick(async () => {
+					this.plugin.settings.tasksListMap = {} as any;
+					this.plugin.settings.tasksItemMap = {} as any;
+					await this.plugin.saveData(this.plugin.settings);
+					new Notice('Google Tasks のIDマップをクリアしました。次回同期時に再検出します。');
+				}));
 		// 強制同期ボタン
 		new Setting(containerEl)
 			.setName('今すぐ強制同期')
