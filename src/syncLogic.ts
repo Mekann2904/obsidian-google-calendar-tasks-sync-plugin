@@ -100,6 +100,8 @@ export class SyncLogic {
             if (!force) {
                 googleEventMap = this.mapGoogleEvents(existingEvents, taskMap);
             }
+            // 重複検出用インデックス
+            const dedupeIndex = this.buildDedupeIndex(existingEvents);
             console.timeEnd("Sync: Fetch GCal Events");
 
             const existingGIdSet = new Set<string>(
@@ -116,7 +118,7 @@ export class SyncLogic {
             }
             console.time("Sync: Prepare Batch Requests");
             const { currentObsidianTaskIds, skipped } = this.prepareBatchRequests(
-                obsidianTasks, googleEventMap, taskMap, batchRequests, gcalMapper, settings, force
+                obsidianTasks, googleEventMap, taskMap, batchRequests, gcalMapper, settings, force, dedupeIndex
             );
             skippedCount += skipped;
             console.timeEnd("Sync: Prepare Batch Requests");
@@ -291,7 +293,8 @@ export class SyncLogic {
         batchRequests: BatchRequestItem[],
         gcalMapper: GCalMapper,
         settings: GoogleCalendarTasksSyncSettings,
-        force: boolean = false
+        force: boolean = false,
+        dedupeIndex?: Map<string, calendar_v3.Schema$Event>
     ): { currentObsidianTaskIds: Set<string>, skipped: number } {
         const currentObsidianTaskIds = new Set<string>();
         let skippedCount = 0;
@@ -344,8 +347,24 @@ export class SyncLogic {
                     skippedCount++;
                 }
             } else {
-                const insertBody = { ...eventPayload, id: this.generateStableEventId(obsId) } as GoogleCalendarEventInput;
-                batchRequests.push({ method: 'POST', path: calendarPath, body: insertBody, obsidianTaskId: obsId, operationType: 'insert' });
+                // 重複防止: 同一性キーで既存イベントを検索
+                const identity = this.buildIdentityKeyFromPayload(eventPayload);
+                const dup = dedupeIndex?.get(identity);
+                if (dup && dup.id) {
+                    // 既存イベントを再利用し、マッピングだけ張る
+                    taskMap[obsId] = dup.id;
+                    // 内容差分があれば PATCH（extendedProperties の obsidianTaskId 差異は無視）
+                    if (this.needsUpdateIgnoringOwner(dup, eventPayload)) {
+                        const headers: Record<string, string> = {};
+                        if (dup.etag) headers['If-Match'] = dup.etag;
+                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(dup.id)}`, headers, body: this.buildPatchBodyIgnoringOwner(dup, eventPayload), fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: dup.id });
+                    } else {
+                        skippedCount++;
+                    }
+                } else {
+                    const insertBody = { ...eventPayload, id: this.generateStableEventId(obsId) } as GoogleCalendarEventInput;
+                    batchRequests.push({ method: 'POST', path: calendarPath, body: insertBody, obsidianTaskId: obsId, operationType: 'insert' });
+                }
             }
         }
         return { currentObsidianTaskIds, skipped: skippedCount };
@@ -375,11 +394,23 @@ export class SyncLogic {
             return;
         }
 
+        // 現在のタスクが参照中の gId を収集
+        const gIdsInUseByCurrent = new Set<string>();
+        for (const id of currentObsidianTaskIds) {
+            const gid = taskMap[id];
+            if (gid) gIdsInUseByCurrent.add(gid);
+        }
+
         Object.entries(taskMap).forEach(([obsId, gId]) => {
             if (!gId) return;
             if (!currentObsidianTaskIds.has(obsId)) {
                 if (!existingGIdSet.has(gId)) {
                     delete taskMap[obsId];
+                    return;
+                }
+                // 他の現行タスクが同じ gId を使用している場合は削除しない
+                if (gIdsInUseByCurrent.has(gId)) {
+                    delete taskMap[obsId]; // 古い片方のマップは掃除
                     return;
                 }
                 if (!processed.has(gId)) {
@@ -523,6 +554,56 @@ export class SyncLogic {
         });
     }
 
+    // 予定の同一性キー（タイトル、開始/終了、終日/時刻、RRULE、状態）
+    private buildIdentityKeyFromPayload(payload: GoogleCalendarEventInput): string {
+        const sum = (payload.summary || '').trim().replace(/\s+/g, ' ');
+        const keyTime = (t?: calendar_v3.Schema$EventDateTime) => {
+            if (!t) return 'N';
+            if (t.date) return `D:${t.date}`; // 終日: exclusive end は比較側でも同じ仕様
+            if (t.dateTime) return `T:${moment(t.dateTime).toISOString(true)}`; // keep offset
+            return 'N';
+        };
+        const startK = keyTime(payload.start);
+        const endK = keyTime(payload.end);
+        const stat = (payload.status === 'cancelled') ? 'X' : 'C';
+        const rec = (payload.recurrence || []).map(r => r.toUpperCase().trim()).sort().join(';');
+        return `S|${sum}|A|${startK}|B|${endK}|R|${rec}|Z|${stat}`;
+    }
+
+    private buildIdentityKeyFromEvent(ev: calendar_v3.Schema$Event): string {
+        const sum = (ev.summary || '').trim().replace(/\s+/g, ' ');
+        const keyTime = (t?: calendar_v3.Schema$EventDateTime) => {
+            if (!t) return 'N';
+            if ((t as any).date) return `D:${(t as any).date}`;
+            if ((t as any).dateTime) return `T:${moment((t as any).dateTime).toISOString(true)}`;
+            return 'N';
+        };
+        const startK = keyTime(ev.start);
+        const endK = keyTime(ev.end);
+        const stat = (ev.status === 'cancelled') ? 'X' : 'C';
+        const rec = (ev.recurrence || []).map(r => r.toUpperCase().trim()).sort().join(';');
+        return `S|${sum}|A|${startK}|B|${endK}|R|${rec}|Z|${stat}`;
+    }
+
+    private buildDedupeIndex(events: calendar_v3.Schema$Event[]): Map<string, calendar_v3.Schema$Event> {
+        const map = new Map<string, calendar_v3.Schema$Event>();
+        for (const ev of events) {
+            if (ev.status === 'cancelled') continue;
+            if (ev.extendedProperties?.private?.['isGcalSync'] !== 'true') continue; // プラグイン管理対象のみ
+            const key = this.buildIdentityKeyFromEvent(ev);
+            const prev = map.get(key);
+            if (!prev) map.set(key, ev);
+            else {
+                // 更新日時が新しい方を残す
+                const newer = (a?: string | null, b?: string | null) => (a && b)
+                    ? moment(a ?? undefined).isAfter(moment(b ?? undefined))
+                    : !!a && !b;
+                map.set(key, newer(ev.updated, prev.updated) ? ev : prev);
+            }
+        }
+        return map;
+    }
+
     private needsUpdate(
         existingEvent: calendar_v3.Schema$Event,
         newPayload: GoogleCalendarEventInput
@@ -559,9 +640,45 @@ export class SyncLogic {
         const newRec = (newPayload.recurrence || []).map(norm).sort();
         if (oldRec.join(',') !== newRec.join(',')) return true;
 
-        const oldId = existingEvent.extendedProperties?.private?.['obsidianTaskId'];
-        const newId = newPayload.extendedProperties?.private?.['obsidianTaskId'];
-        if ((oldId || '') !== (newId || '')) return true;
+        return false;
+    }
+
+    // obsidianTaskId の相違を無視して差分を判定（重複再利用時）
+    private needsUpdateIgnoringOwner(
+        existingEvent: calendar_v3.Schema$Event,
+        newPayload: GoogleCalendarEventInput
+    ): boolean {
+        // Summary, Description, Status, Time, Reminders, Recurrence checks（所有者IDの違いは無視）
+        if ((existingEvent.summary || '') !== (newPayload.summary || '')) return true;
+        if ((existingEvent.description || '') !== (newPayload.description || '')) return true;
+        const oldStat = existingEvent.status === 'cancelled' ? 'cancelled' : 'confirmed';
+        const newStat = newPayload.status === 'cancelled' ? 'cancelled' : 'confirmed';
+        if (oldStat !== newStat) return true;
+
+        const cmpTime = (t1?: calendar_v3.Schema$EventDateTime, t2?: calendar_v3.Schema$EventDateTime) => {
+            if (!t1 && !t2) return false;
+            if (!t1 || !t2) return true;
+            if (t1.date && t2.date) return t1.date !== t2.date;
+            if (t1.dateTime && t2.dateTime) return !DateUtils.isSameDateTime(t1.dateTime, t2.dateTime);
+            return true;
+        };
+        if (cmpTime(existingEvent.start, newPayload.start)) return true;
+        if (cmpTime(existingEvent.end, newPayload.end)) return true;
+
+        const oldUseDefault = existingEvent.reminders?.useDefault ?? true;
+        const newUseDefault = newPayload.reminders?.useDefault ?? true;
+        if (oldUseDefault !== newUseDefault) return true;
+        if (!newUseDefault) {
+            const oldOverrides = existingEvent.reminders?.overrides || [];
+            const newOverrides = newPayload.reminders?.overrides || [];
+            if (oldOverrides.length !== newOverrides.length) return true;
+            if (oldOverrides.some((o, i) => o.minutes !== newOverrides[i].minutes || o.method !== newOverrides[i].method)) return true;
+        }
+
+        const norm = (r?: string) => r ? r.toUpperCase().replace('RRULE:', '').trim() : '';
+        const oldRec = (existingEvent.recurrence || []).map(norm).sort();
+        const newRec = (newPayload.recurrence || []).map(norm).sort();
+        if (oldRec.join(',') !== newRec.join(',')) return true;
 
         return false;
     }
@@ -606,16 +723,26 @@ export class SyncLogic {
         const newRec = (newPayload.recurrence || []).map(norm).sort().join(',');
         if (oldRec !== newRec) patch.recurrence = newPayload.recurrence;
 
-        const oldId = existingEvent.extendedProperties?.private?.['obsidianTaskId'];
-        const newId = newPayload.extendedProperties?.private?.['obsidianTaskId'];
+        // extendedProperties の obsidianTaskId 差異は更新しない（重複再利用時の所有者揺れを無視）
+        // isGcalSync が欠けている場合のみ補う
         const oldSync = existingEvent.extendedProperties?.private?.['isGcalSync'];
         const newSync = newPayload.extendedProperties?.private?.['isGcalSync'];
-        if ((oldId || '') !== (newId || '') || (oldSync || '') !== (newSync || '')) {
+        if (newSync === 'true' && oldSync !== 'true') {
             patch.extendedProperties = newPayload.extendedProperties;
         }
 
         // 何も差分がない場合は summary を noop として入れない（空オブジェクトのまま返す）
         return patch;
+    }
+
+    // 所有者差異を無視してPATCHボディを生成（重複再利用用）
+    private buildPatchBodyIgnoringOwner(
+        existingEvent: calendar_v3.Schema$Event,
+        newPayload: GoogleCalendarEventInput
+    ): Partial<calendar_v3.Schema$Event> {
+        const tmp = this.buildPatchBody(existingEvent, newPayload);
+        if (tmp.extendedProperties) delete (tmp as any).extendedProperties; // 所有者差異を無視
+        return tmp;
     }
 
     // メトリクスのp50/p95/p99を計算して要約ログを出力
