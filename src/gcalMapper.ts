@@ -181,15 +181,41 @@ export class GCalMapper {
         }
 
         if (!startIsDateTime || !dueIsDateTime) {
-            // 終日イベント
-            event.start = { date: startMoment.format('YYYY-MM-DD') };
-            // GCal APIでは終日イベントの終了日は exclusive なので、dueMoment の *翌日* を指定
-            const endDate = dueMoment.add(1, 'day').format('YYYY-MM-DD');
-            event.end = { date: endDate };
+            // 🔁拡張: 時間ウィンドウが指定されている場合は時間指定イベントにする
+            const winStart = (task.timeWindowStart || '').trim();
+            const winEnd = (task.timeWindowEnd || '').trim();
+            const hasWindow = /^\d{1,2}:\d{2}$/.test(winStart) && /^(\d{1,2}:\d{2}|24:00)$/.test(winEnd);
 
-            if (moment.utc(event.end.date).isSameOrBefore(moment.utc(event.start.date))) {
-                console.warn(`タスク "${task.summary || task.id}": 終日イベントの終了日(${dueMoment.subtract(1, 'day').format('YYYY-MM-DD')})が開始日(${startMoment.format('YYYY-MM-DD')})以前。終了日を開始日の翌日に設定。`);
-                event.end = { date: startMoment.clone().add(1, 'day').format('YYYY-MM-DD') };
+            const toIso = (d: moment.Moment, hhmm: string): string => {
+                const [h, m] = hhmm.split(':').map(v => parseInt(v,10));
+                const base = d.clone().hour(h).minute(m).second(0).millisecond(0);
+                return base.toISOString(true);
+            };
+
+            if (hasWindow) {
+                // 両日付のみ or 片方のみ時刻指定のケースを時間ウィンドウで補正
+                event.start = { dateTime: toIso(startMoment, winStart) };
+                if (winEnd === '24:00') {
+                    const end = dueMoment.isSame(startMoment, 'day') ? startMoment.clone().add(1,'day') : dueMoment.clone().add(1,'day');
+                    event.end = { dateTime: toIso(end, '00:00') };
+                } else {
+                    event.end = { dateTime: toIso(dueMoment, winEnd) };
+                }
+            } else if (startIsDateTime && !dueIsDateTime && startMoment.isSame(dueMoment, 'day')) {
+                // 仕様: 開始に時刻・終了が日付のみ（同日）の場合は 24:00 まで
+                event.start = { dateTime: startMoment.toISOString(true) };
+                event.end = { dateTime: startMoment.clone().add(1,'day').startOf('day').toISOString(true) };
+            } else {
+                // 終日イベント
+                event.start = { date: startMoment.format('YYYY-MM-DD') };
+                // GCal APIでは終日イベントの終了日は exclusive なので、dueMoment の *翌日* を指定
+                const endDate = dueMoment.add(1, 'day').format('YYYY-MM-DD');
+                event.end = { date: endDate };
+
+                if (moment.utc(event.end.date).isSameOrBefore(moment.utc(event.start.date))) {
+                    console.warn(`タスク "${task.summary || task.id}": 終日イベントの終了日(${dueMoment.subtract(1, 'day').format('YYYY-MM-DD')})が開始日(${startMoment.format('YYYY-MM-DD')})以前。終了日を開始日の翌日に設定。`);
+                    event.end = { date: startMoment.clone().add(1, 'day').format('YYYY-MM-DD') };
+                }
             }
         } else {
             // 時間指定イベント
@@ -199,6 +225,19 @@ export class GCalMapper {
             if (dueMoment.isSameOrBefore(startMoment)) {
                 console.warn(`タスク "${task.summary || task.id}": 終了時刻 (${dueMoment.toISOString()}) が開始時刻 (${startMoment.toISOString()}) 以前。デフォルト期間 (${this.settings.defaultEventDurationMinutes}分) を使用して調整します。`);
                 event.end = { dateTime: startMoment.clone().add(this.settings.defaultEventDurationMinutes, 'minutes').toISOString(true) };
+            }
+        }
+
+        // RRULE の期間限定補助: "every day" かつ COUNT/UNTILなし、start/due が日付の範囲の場合は COUNT を補う
+        if (task.recurrenceRule && event.start?.dateTime && (!task.startDate?.includes('T') || !task.dueDate?.includes('T'))) {
+            const rule = (task.recurrenceRule || '').toUpperCase();
+            if (rule.includes('FREQ=DAILY') && !/;COUNT=|;UNTIL=/.test(rule) && task.startDate && task.dueDate) {
+                const s = moment.utc(task.startDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
+                const e = moment.utc(task.dueDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
+                const days = e.diff(s, 'days') + 1; // 期間を含める
+                if (days > 0) {
+                    event.recurrence = [ `RRULE:FREQ=DAILY;COUNT=${days}` ];
+                }
             }
         }
 

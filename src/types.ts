@@ -14,6 +14,9 @@ export interface ObsidianTask {
 	completionDate: string | null; // 完了日 (YYYY-MM-DD) (✅ or done:)
 	priority: 'highest' | 'high' | 'medium' | 'low' | 'lowest' | null; // 優先度 (🔺⏫🔼🔽⏬)
 	recurrenceRule: string | null; // 繰り返しルール (iCalendar RRULE 文字列) (🔁 or repeat:/recur:)
+	// 🔁 拡張: 時間ウィンドウ (例: 15:00~24:00)
+	timeWindowStart?: string | null; // 'HH:mm'
+	timeWindowEnd?: string | null;   // 'HH:mm' または '24:00'
 	tags: string[]; // タグ (例: #tag1)
 	blockLink: string | null; // ブロックリンク (例: ^abcdef)
 	sourcePath: string; // タスクが存在するファイルのパス

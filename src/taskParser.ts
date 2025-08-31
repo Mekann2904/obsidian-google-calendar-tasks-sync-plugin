@@ -89,6 +89,8 @@ export class TaskParser {
         let completionDate: string | null = null;
         let priority: ObsidianTask['priority'] = null;
         let recurrenceRuleText: string | null = null;
+        let timeWindowStart: string | null = null;
+        let timeWindowEnd: string | null = null;
         let blockLink: string | null = null;
 
         // 日付を抽出
@@ -114,6 +116,16 @@ export class TaskParser {
 
         // 繰り返しルールを抽出
         ({ value: recurrenceRuleText, remainingContent } = extractMetadata(remainingContent, /(?:🔁|repeat:|recur:)\s*([^📅🛫⏳➕✅🔺⏫🔼🔽⏬⏰#^]+)/u));
+        // 🔁 拡張: "hh:mm~hh:mm" を抽出（例: "every day 15:00~24:00" または "15:00~24:00"）
+        if (recurrenceRuleText) {
+            const m = recurrenceRuleText.match(/(\d{1,2}:\d{2})\s*~\s*(\d{1,2}:\d{2}|24:00)/);
+            if (m) {
+                timeWindowStart = m[1];
+                timeWindowEnd = m[2];
+                recurrenceRuleText = recurrenceRuleText.replace(m[0], '').trim();
+                if (recurrenceRuleText.length === 0) recurrenceRuleText = null;
+            }
+        }
 
         // ブロックリンクを抽出 (行末)
         const blockLinkMatch = remainingContent.match(/\s+(\^[a-zA-Z0-9-]+)$/);
@@ -166,6 +178,8 @@ export class TaskParser {
             completionDate: completionDate,
             priority: priority,
             recurrenceRule: recurrenceRule,
+            timeWindowStart,
+            timeWindowEnd,
             tags: tags,
             blockLink: blockLink,
             sourcePath: filePath,
