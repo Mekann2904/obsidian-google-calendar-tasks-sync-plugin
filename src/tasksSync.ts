@@ -38,7 +38,10 @@ export class TasksSync {
       const remote = await this.gtasks.listTasks(listId);
       const remoteById = new Map<string, tasks_v1.Schema$Task>();
       const remoteByTitle = new Map<string, tasks_v1.Schema$Task>();
-      for (const t of remote) { if (t.id) remoteById.set(t.id, t); if (t.title) remoteByTitle.set(t.title, t); }
+      for (const t of remote) {
+        if (t.id) remoteById.set(t.id, t);
+        if (t.title && this.isManagedTask(t)) remoteByTitle.set(t.title, t);
+      }
 
       // ローカル子の集合
       const localChildIds = new Set<string>(tree.children.map(c => c.id));
@@ -52,18 +55,18 @@ export class TasksSync {
         }
         let gid = settings.tasksItemMap![child.id];
         if (gid && remoteById.has(gid)) {
-          await this.gtasks.upsertTasks(listId!, [{ id: gid, title: child.title, notes: child.notes }]);
+          await this.gtasks.upsertTasks(listId!, [{ id: gid, title: child.title, notes: this.buildManagedNotes(child.notes, child.id) }]);
         } else {
           // タイトル一致の既存があれば再利用
           const dup = remoteByTitle.get(child.title);
           if (dup?.id) {
             settings.tasksItemMap![child.id] = dup.id;
-            await this.gtasks.upsertTasks(listId!, [{ id: dup.id, title: child.title, notes: child.notes }]);
+            await this.gtasks.upsertTasks(listId!, [{ id: dup.id, title: child.title, notes: this.buildManagedNotes(child.notes, child.id) }]);
           } else {
-            await this.gtasks.upsertTasks(listId!, [{ title: child.title, notes: child.notes }]);
+            await this.gtasks.upsertTasks(listId!, [{ title: child.title, notes: this.buildManagedNotes(child.notes, child.id) }]);
             // 新規挿入のID取得は batch では困難なため、簡易に再取得してマッピング（少数前提）
             const refreshed = await this.gtasks.listTasks(listId!);
-            const found = refreshed.find(t => t.title === child.title && (t.notes || '') === (child.notes || ''));
+            const found = refreshed.find(t => t.title === child.title && (t.notes || '').includes(`obsidianTaskId=${child.id}`));
             if (found?.id) settings.tasksItemMap![child.id] = found.id;
           }
         }
@@ -135,5 +138,14 @@ export class TasksSync {
       hash = ((hash << 5) - hash) + ch; hash |= 0;
     }
     return `obsidian-${path}-${index}-${hash}`;
+  }
+
+  private buildManagedNotes(userNotes: string | undefined, obsidianTaskId: string): string {
+    const meta = `[ogcts] appId=obsidian-gcal-tasks isGtasksSync=true obsidianTaskId=${obsidianTaskId} version=1`;
+    return userNotes && userNotes.trim().length > 0 ? `${userNotes}\n\n${meta}` : meta;
+  }
+
+  private isManagedTask(t: tasks_v1.Schema$Task): boolean {
+    return !!(t.notes && /\[ogcts\]\s+appId=obsidian-gcal-tasks/.test(t.notes));
   }
 }
