@@ -568,7 +568,11 @@ export class SyncLogic {
         const endK = keyTime(payload.end);
         const stat = (payload.status === 'cancelled') ? 'X' : 'C';
         const rec = (payload.recurrence || []).map(r => r.toUpperCase().trim()).sort().join(';');
-        return `S|${sum}|A|${startK}|B|${endK}|R|${rec}|Z|${stat}`;
+        const includeDesc = !!this.plugin.settings.includeDescriptionInIdentity;
+        const includeRem  = !!this.plugin.settings.includeReminderInIdentity;
+        const descK = includeDesc ? `|D|${(payload.description || '').trim()}` : '';
+        const remK = includeRem ? `|M|${this.reminderFingerprint(payload)}` : '';
+        return `S|${sum}|A|${startK}|B|${endK}|R|${rec}|Z|${stat}${descK}${remK}`;
     }
 
     private buildIdentityKeyFromEvent(ev: calendar_v3.Schema$Event): string {
@@ -583,7 +587,23 @@ export class SyncLogic {
         const endK = keyTime(ev.end);
         const stat = (ev.status === 'cancelled') ? 'X' : 'C';
         const rec = (ev.recurrence || []).map(r => r.toUpperCase().trim()).sort().join(';');
-        return `S|${sum}|A|${startK}|B|${endK}|R|${rec}|Z|${stat}`;
+        const includeDesc = !!this.plugin.settings.includeDescriptionInIdentity;
+        const includeRem  = !!this.plugin.settings.includeReminderInIdentity;
+        const descK = includeDesc ? `|D|${(ev.description || '').trim()}` : '';
+        const remK = includeRem ? `|M|${this.reminderFingerprint(ev)}` : '';
+        return `S|${sum}|A|${startK}|B|${endK}|R|${rec}|Z|${stat}${descK}${remK}`;
+    }
+
+    private reminderFingerprint(x: any): string {
+        const useDefault = x.reminders?.useDefault ?? undefined;
+        const overridesRaw = x.reminders?.overrides ?? undefined;
+        const overrides = (overridesRaw || []).map((o: any) => ({ method: o?.method ?? 'popup', minutes: o?.minutes ?? 0 }));
+        if (useDefault === undefined && overrides.length === 0) return 'N';
+        if (useDefault) return 'DEF';
+        if (!overrides.length) return 'OFF';
+        // 並び順の影響を排除
+        const sig = overrides.map((o: any) => `${o.method || 'popup'}:${o.minutes ?? 0}`).sort().join(',');
+        return `OVR(${sig})`;
     }
 
     private buildDedupeIndex(events: calendar_v3.Schema$Event[]): Map<string, calendar_v3.Schema$Event> {
@@ -762,5 +782,99 @@ export class SyncLogic {
         const sc = metrics.statusCounts;
         const scStr = Object.keys(sc).sort().map(k=>`${k}:${sc[+k]}`).join(', ');
         console.log(`[Metrics] ${title}: batches=${metrics.sentSubBatches}, attempts=${metrics.attempts}, waitMs=${metrics.totalWaitMs}, avg=${avg.toFixed(1)}ms, p50=${p50.toFixed(1)}ms, p95=${p95.toFixed(1)}ms, p99=${p99.toFixed(1)}ms, statuses={ ${scStr} }`);
+    }
+
+    // 重複整理（ドライラン/実行）
+    async runDedupeCleanup(dryRun: boolean = true): Promise<void> {
+        if (!this.plugin.settings.tokens) {
+            new Notice('未認証のため重複整理を実行できない。設定から認証する。', 7000);
+            return;
+        }
+        const ok = await this.plugin.authService.ensureAccessToken();
+        if (!ok || !this.plugin.calendar) {
+            new Notice('カレンダーAPIクライアント未準備のため中止。', 7000);
+            return;
+        }
+
+        const tmpSettings = JSON.parse(JSON.stringify(this.plugin.settings)) as GoogleCalendarTasksSyncSettings;
+        tmpSettings.lastSyncTime = undefined;
+        tmpSettings.fetchWindowPastDays = 0;
+        tmpSettings.fetchWindowFutureDays = 0;
+
+        console.time('Dedupe: Fetch all managed events');
+        const events = await this.plugin.gcalApi.fetchGoogleCalendarEvents(tmpSettings);
+        console.timeEnd('Dedupe: Fetch all managed events');
+
+        // グルーピング
+        const groups = new Map<string, calendar_v3.Schema$Event[]>();
+        for (const ev of events) {
+            if (ev.status === 'cancelled') continue;
+            if (ev.extendedProperties?.private?.['isGcalSync'] !== 'true') continue;
+            const key = this.buildIdentityKeyFromEvent(ev);
+            const arr = groups.get(key) || [];
+            arr.push(ev);
+            groups.set(key, arr);
+        }
+
+        // タスク参照数
+        const usage = new Map<string, number>();
+        Object.values(this.plugin.settings.taskMap || {}).forEach(id => {
+            if (!id) return; usage.set(id, (usage.get(id) || 0) + 1);
+        });
+
+        type Plan = { key: string; keep: calendar_v3.Schema$Event; removes: calendar_v3.Schema$Event[] };
+        const plans: Plan[] = [];
+        for (const [key, arr] of groups) {
+            if (arr.length <= 1) continue;
+            // 残すイベント: 参照数が最大→同数なら updated が新しい
+            const sorted = arr.slice().sort((a,b) => {
+                const ua = usage.get(a.id || '') || 0;
+                const ub = usage.get(b.id || '') || 0;
+                if (ua !== ub) return ub - ua;
+                const ma = a.updated ? moment(a.updated) : moment(0);
+                const mb = b.updated ? moment(b.updated) : moment(0);
+                return mb.valueOf() - ma.valueOf();
+            });
+            const keep = sorted[0];
+            const removes = sorted.slice(1);
+            plans.push({ key, keep, removes });
+        }
+
+        const totalDupGroups = plans.length;
+        const totalRemoves = plans.reduce((s,p) => s + p.removes.length, 0);
+        console.log(`[Dedupe] 対象グループ: ${totalDupGroups}, 削除候補: ${totalRemoves}`);
+        if (dryRun) {
+            new Notice(`ドライラン: 重複 ${totalDupGroups} グループ、削除候補 ${totalRemoves} 件`, 8000);
+            plans.slice(0, 10).forEach(p => console.log(`[Dedupe] keep=${p.keep.id} removes=${p.removes.map(r=>r.id).join(',')}`));
+            return;
+        }
+
+        // 実行: マッピング更新と削除
+        const calendarPath = `/calendar/v3/calendars/${encodeURIComponent(this.plugin.settings.calendarId)}/events`;
+        const batch: BatchRequestItem[] = [];
+        const taskMap = this.plugin.settings.taskMap || {};
+        for (const p of plans) {
+            const keepId = p.keep.id!;
+            for (const r of p.removes) {
+                const rid = r.id!;
+                // taskMapの参照を差し替え
+                Object.entries(taskMap).forEach(([obsId, gId]) => {
+                    if (gId === rid) taskMap[obsId] = keepId;
+                });
+                const headers: Record<string, string> = {};
+                if (r.etag) headers['If-Match'] = r.etag;
+                batch.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(rid)}`, headers, operationType: 'delete' });
+            }
+        }
+
+        if (batch.length === 0) {
+            new Notice('重複は見つからない。', 4000);
+            return;
+        }
+
+        const bp = new BatchProcessor(this.plugin.settings.calendarId, this.plugin.settings);
+        const result = await this.executeBatchesWithRetry(batch, bp);
+        await this.plugin.saveData(this.plugin.settings); // 更新されたtaskMapを保存
+        new Notice(`重複整理完了: 削除 ${result.deleted}, スキップ ${result.skipped}, エラー ${result.errors}`, 8000);
     }
 }

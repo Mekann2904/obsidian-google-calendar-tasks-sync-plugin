@@ -75,6 +75,28 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 			callback: async () => this.triggerSync(),
 		});
 
+		// 重複整理（ドライラン）
+		this.addCommand({
+			id: 'dedupe-cleanup-dry-run',
+			name: '重複イベントを整理（ドライラン）',
+			callback: async () => {
+				if (this.isCurrentlySyncing()) { new Notice('処理中のため実行できない。'); return; }
+				await this.syncLogic.runDedupeCleanup(true);
+			}
+		});
+
+		// 重複整理（実行）
+		this.addCommand({
+			id: 'dedupe-cleanup-exec',
+			name: '重複イベントを整理（実行）',
+			callback: async () => {
+				if (this.isCurrentlySyncing()) { new Notice('処理中のため実行できない。'); return; }
+				const ok = confirm('重複イベントの削除を実行しますか？ この操作は元に戻せません。');
+				if (!ok) return;
+				await this.syncLogic.runDedupeCleanup(false);
+			}
+		});
+
 		// 設定タブの追加
 		this.addSettingTab(new GoogleCalendarSyncSettingTab(this.app, this));
 

@@ -14,6 +14,8 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 	lastSyncTime: undefined,
 	fetchWindowPastDays: 90,
 	fetchWindowFutureDays: 180,
+	includeDescriptionInIdentity: false,
+	includeReminderInIdentity: false,
 	syncPriorityToDescription: true,
 	syncTagsToDescription: true,
 	syncBlockLinkToDescription: false, // デフォルトではオフ (Obsidian URI に統合されるため)
@@ -297,6 +299,27 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 						}
 					});
 			});
+
+		// 重複判定オプション
+		containerEl.createEl('h4', { text: '重複判定オプション' });
+		new Setting(containerEl)
+			.setName('説明文を重複キーに含める')
+			.setDesc('有効にすると、説明文の差異も重複判定に反映する。誤結合を避けたい場合に有効化。')
+			.addToggle(toggle => toggle
+				.setValue(!!this.plugin.settings.includeDescriptionInIdentity)
+				.onChange(async (value) => {
+					this.plugin.settings.includeDescriptionInIdentity = value;
+					await this.plugin.saveData(this.plugin.settings);
+				}));
+		new Setting(containerEl)
+			.setName('リマインダー有無を重複キーに含める')
+			.setDesc('有効にすると、リマインダー（ポップアップ/メール）の有無も重複判定に反映する。')
+			.addToggle(toggle => toggle
+				.setValue(!!this.plugin.settings.includeReminderInIdentity)
+				.onChange(async (value) => {
+					this.plugin.settings.includeReminderInIdentity = value;
+					await this.plugin.saveData(this.plugin.settings);
+				}));
 
 		// 取得窓（フル同期時）
 		new Setting(containerEl)

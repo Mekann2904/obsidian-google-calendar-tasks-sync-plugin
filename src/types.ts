@@ -39,6 +39,8 @@ export interface GoogleCalendarTasksSyncSettings {
 	lastSyncTime?: string; // 最後に同期が成功した時刻 (ISO 8601 形式)
 	fetchWindowPastDays?: number; // フル同期時の取得窓: 過去日数
 	fetchWindowFutureDays?: number; // フル同期時の取得窓: 未来日数
+	includeDescriptionInIdentity?: boolean; // 重複判定に説明文を含めるか
+	includeReminderInIdentity?: boolean;    // 重複判定にリマインダー有無を含めるか
 	// Google Calendar イベントの説明欄にどの情報を含めるかの設定
 	syncPriorityToDescription: boolean; // 優先度を説明に追加するか
 	syncTagsToDescription: boolean; // タグを説明に追加するか
