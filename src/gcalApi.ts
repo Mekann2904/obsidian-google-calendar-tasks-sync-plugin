@@ -34,24 +34,9 @@ export class GCalApiService {
             singleEvents: false,
         };
 
-        // FIX: API効率化のため、差分同期では updatedMin を使用する
-        if (settings.lastSyncTime) {
-            requestParams.updatedMin = settings.lastSyncTime;
-            console.log(`差分同期をトリガー: ${settings.lastSyncTime} 以降に更新されたイベントのみを取得します。`);
-        } else {
-            // フル同期時は timeMin/timeMax の窓で取得量を制限（singleEvents=false でもシリーズが窓内にかかる場合に返却）
-            const pastDays = Math.max(0, settings.fetchWindowPastDays ?? 0);
-            const futureDays = Math.max(0, settings.fetchWindowFutureDays ?? 0);
-            if (pastDays > 0) {
-                const d = new Date(Date.now() - pastDays * 24 * 60 * 60 * 1000);
-                requestParams.timeMin = d.toISOString();
-            }
-            if (futureDays > 0) {
-                const d = new Date(Date.now() + futureDays * 24 * 60 * 60 * 1000);
-                requestParams.timeMax = d.toISOString();
-            }
-            console.log(`フル同期をトリガー: 取得窓 past=${pastDays}日, future=${futureDays}日 (timeMin=${requestParams.timeMin ?? 'なし'}, timeMax=${requestParams.timeMax ?? 'なし'})。`);
-        }
+        // 重要: 重複抑止のため、管理対象(isGcalSync=true)は常に全件取得する。
+        // updatedMin も timeMin/timeMax も使用しない（見落としが insert 誘発の主因）。
+        console.log(`管理対象イベントを全件取得します（updatedMin/time 窓は使用しません）。`);
 
         try {
             let page = 1;

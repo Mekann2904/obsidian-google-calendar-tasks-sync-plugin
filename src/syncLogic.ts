@@ -347,23 +347,31 @@ export class SyncLogic {
                     skippedCount++;
                 }
             } else {
-                // 重複防止: 同一性キーで既存イベントを検索
-                const identity = this.buildIdentityKeyFromPayload(eventPayload);
-                const dup = dedupeIndex?.get(identity);
-                if (dup && dup.id) {
-                    // 既存イベントを再利用し、マッピングだけ張る
-                    taskMap[obsId] = dup.id;
-                    // 内容差分があれば PATCH（extendedProperties の obsidianTaskId 差異は無視）
-                    if (this.needsUpdateIgnoringOwner(dup, eventPayload)) {
-                        const headers: Record<string, string> = {};
-                        if (dup.etag) headers['If-Match'] = dup.etag;
-                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(dup.id)}`, headers, body: this.buildPatchBodyIgnoringOwner(dup, eventPayload), fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: dup.id });
-                    } else {
-                        skippedCount++;
-                    }
+                // まず taskMap を優先（updatedMin/窓の都合でリストに出てこないケースの重複作成を防ぐ）
+                const mappedId = taskMap[obsId];
+                if (mappedId) {
+                    const headers: Record<string, string> = {};
+                    // ETag 不明のため If-Match は付けない（404時は後段フォールバックがinsert）
+                    batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(mappedId)}`, headers, body: eventPayload, fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: mappedId });
                 } else {
-                    const insertBody = { ...eventPayload } as GoogleCalendarEventInput;
-                    batchRequests.push({ method: 'POST', path: calendarPath, body: insertBody, obsidianTaskId: obsId, operationType: 'insert' });
+                    // 重複防止: 同一性キーで既存イベントを検索
+                    const identity = this.buildIdentityKeyFromPayload(eventPayload);
+                    const dup = dedupeIndex?.get(identity);
+                    if (dup && dup.id) {
+                        // 既存イベントを再利用し、マッピングだけ張る
+                        taskMap[obsId] = dup.id;
+                        // 内容差分があれば PATCH（extendedProperties の obsidianTaskId 差異は無視）
+                        if (this.needsUpdateIgnoringOwner(dup, eventPayload)) {
+                            const headers: Record<string, string> = {};
+                            if (dup.etag) headers['If-Match'] = dup.etag;
+                            batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(dup.id)}`, headers, body: this.buildPatchBodyIgnoringOwner(dup, eventPayload), fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: dup.id });
+                        } else {
+                            skippedCount++;
+                        }
+                    } else {
+                        const insertBody = { ...eventPayload } as GoogleCalendarEventInput;
+                        batchRequests.push({ method: 'POST', path: calendarPath, body: insertBody, obsidianTaskId: obsId, operationType: 'insert' });
+                    }
                 }
             }
         }
