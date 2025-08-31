@@ -44,7 +44,21 @@ export class TasksSync {
       settings.tasksListMap![tree.id] = listId;
 
       // リモートの既存タスク一覧（重複抑止・再利用）
-      const remote = await this.gtasks.listTasks(listId);
+      let remote: tasks_v1.Schema$Task[] = [];
+      try {
+        remote = await this.gtasks.listTasks(listId);
+      } catch (e: any) {
+        // ステールな listId の可能性（404）。マーカー検出→作成へフォールバック
+        try {
+          listId = await this.gtasks.findListByMarker(tree.id) || await this.gtasks.getOrCreateList(tree.title);
+          this.plugin.settings.tasksListMap![tree.id] = listId;
+          await this.gtasks.ensureMarkerTask(listId, tree.id);
+          remote = await this.gtasks.listTasks(listId);
+        } catch {
+          // フォールバック失敗時はこの親をスキップ
+          continue;
+        }
+      }
       const remoteById = new Map<string, tasks_v1.Schema$Task>();
       const remoteByTitle = new Map<string, tasks_v1.Schema$Task>();
       for (const t of remote) {
