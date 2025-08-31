@@ -93,6 +93,27 @@ export class GoogleTasksService {
         await this.tasks.tasklists.delete({ tasklist: listId });
     }
 
+    async insertTask(listId: string, payload: { title: string; notes?: string; due?: string; parentId?: string }): Promise<string> {
+        this.ensureClient();
+        if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');
+        const res = await this.tasks.tasks.insert({ tasklist: listId, parent: payload.parentId, requestBody: { title: payload.title, notes: payload.notes, due: payload.due } });
+        if (!res.data.id) throw new Error('Google Task 作成IDが取得できませんでした');
+        return res.data.id;
+    }
+
+    async patchTask(listId: string, payload: { id: string; title: string; notes?: string; due?: string }): Promise<void> {
+        this.ensureClient();
+        if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');
+        await this.tasks.tasks.patch({ tasklist: listId, task: payload.id, requestBody: { title: payload.title, notes: payload.notes, due: payload.due } });
+    }
+
+    async moveTask(listId: string, taskId: string, parentId?: string): Promise<void> {
+        this.ensureClient();
+        if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');
+        if (!parentId) return; // 親不要
+        await this.tasks.tasks.move({ tasklist: listId, task: taskId, parent: parentId });
+    }
+
     async ensureMarkerTask(listId: string, parentObsidianId: string): Promise<string> {
         this.ensureClient();
         if (!this.tasks) throw new Error('Google Tasks API クライアント未初期化');

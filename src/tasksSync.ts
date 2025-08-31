@@ -88,14 +88,15 @@ export class TasksSync {
         }
       }
       const remoteById = new Map<string, tasks_v1.Schema$Task>();
-      const remoteByTitle = new Map<string, tasks_v1.Schema$Task>();
-      for (const t of remote) {
-        if (t.id) remoteById.set(t.id, t);
-        if (t.title && this.isManagedTask(t)) remoteByTitle.set(t.title, t);
-      }
+      for (const t of remote) { if (t.id) remoteById.set(t.id, t); }
 
       // ローカル子の集合
       const localChildIds = new Set<string>(tree.children.map(c => c.id));
+      const managedIdsForParent = new Set<string>();
+      for (const cid of localChildIds) {
+        const tid = settings.tasksItemMap![cid];
+        if (tid) managedIdsForParent.add(tid);
+      }
       const reservedRemoteIds = new Set<string>();
 
       // 再帰的に（親→子→孫）を処理。due は親から継承
@@ -110,21 +111,14 @@ export class TasksSync {
 
         let gid = settings.tasksItemMap![node.id];
         if (gid && remoteById.has(gid)) {
-          await this.gtasks.upsertTasks(listId!, [{ id: gid, title: node.title, notes: this.buildManagedNotes(node.notes, node.id), due: dueIso, parentId: parentTaskId }]);
+          await this.gtasks.patchTask(listId!, { id: gid, title: node.title, notes: this.buildManagedNotes(node.notes, node.id), due: dueIso });
+          await this.gtasks.moveTask(listId!, gid, parentTaskId);
           reservedRemoteIds.add(gid);
         } else {
-          const dup = remoteByTitle.get(node.title);
-          if (dup?.id) {
-            settings.tasksItemMap![node.id] = dup.id;
-            await this.gtasks.upsertTasks(listId!, [{ id: dup.id, title: node.title, notes: this.buildManagedNotes(node.notes, node.id), due: dueIso, parentId: parentTaskId }]);
-            gid = dup.id;
-            reservedRemoteIds.add(dup.id);
-          } else {
-            await this.gtasks.upsertTasks(listId!, [{ title: node.title, notes: this.buildManagedNotes(node.notes, node.id), due: dueIso, parentId: parentTaskId }]);
-            const refreshed = await this.gtasks.listTasks(listId!);
-            const found = refreshed.find(t => t.title === node.title && (t.notes || '').includes(`obsidianTaskId=${node.id}`));
-            if (found?.id) { gid = settings.tasksItemMap![node.id] = found.id; reservedRemoteIds.add(found.id); }
-          }
+          // 既存IDがない/失効 → 新規作成
+          gid = await this.gtasks.insertTask(listId!, { title: node.title, notes: this.buildManagedNotes(node.notes, node.id), due: dueIso, parentId: parentTaskId });
+          settings.tasksItemMap![node.id] = gid;
+          reservedRemoteIds.add(gid);
         }
         for (const childNode of node.children) {
           await processNode(childNode, gid, effectiveDue);
@@ -159,28 +153,8 @@ export class TasksSync {
   }
 
   private async buildRemoteIndex(): Promise<{ parentToList: Record<string, string>; childToTask: Record<string, string> }> {
-    const parentToList: Record<string, string> = {};
-    const childToTask: Record<string, string> = {};
-    try {
-      const lists = await this.gtasks.listLists(100);
-      for (const l of lists) {
-        if (!l.id) continue;
-        let items: tasks_v1.Schema$Task[] = [];
-        try { items = await this.gtasks.listTasks(l.id); } catch { continue; }
-        const hasMarker = items.some(t => t.title === '[ogcts:list-marker]' && (t.notes || '').includes('[ogcts]'));
-        if (!hasMarker) continue;
-        const marker = items.find(t => t.title === '[ogcts:list-marker]' && (t.notes || '').includes('parentObsidianTaskId='));
-        const pMatch = marker?.notes?.match(/parentObsidianTaskId=([^\s]+)/);
-        const parentId = pMatch ? pMatch[1] : undefined;
-        if (parentId) parentToList[parentId] = l.id;
-        for (const t of items) {
-          if (!this.isManagedTask(t) || !t.id || !t.notes) continue;
-          const m = t.notes.match(/obsidianTaskId=([^\s]+)/);
-          if (m) childToTask[m[1]] = t.id;
-        }
-      }
-    } catch {}
-    return { parentToList, childToTask };
+    // マーカー/notes に依存しない設計へ移行: 自然修復は設定マップとローカルから行うため、ここでは空インデックスを返す
+    return { parentToList: {}, childToTask: {} };
   }
 
   private async collectNestedTasks(): Promise<NestedTaskNode[]> {
