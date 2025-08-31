@@ -30,6 +30,25 @@ export class TasksSync {
     for (const [pid, lid] of Object.entries(remoteIndex.parentToList)) settings.tasksListMap[pid] = lid;
     for (const [cid, tid] of Object.entries(remoteIndex.childToTask)) settings.tasksItemMap[cid] = tid;
 
+    // ローカルに親が一つも無い（全削除）場合、管理対象の全リストを削除
+    const localParentIds = new Set<string>(trees.map(t => t.id));
+    if (localParentIds.size === 0 && Object.keys(remoteIndex.parentToList).length > 0) {
+      for (const [pid, lid] of Object.entries(remoteIndex.parentToList)) {
+        try { await this.gtasks.deleteList(lid); } catch {}
+        delete settings.tasksListMap![pid];
+      }
+      await this.plugin.saveData(settings);
+      return; // すべて削除したので今回の同期は終了
+    }
+
+    // ローカルに存在しない親のリストは削除（部分的な全削除）
+    for (const [pid, lid] of Object.entries(remoteIndex.parentToList)) {
+      if (!localParentIds.has(pid)) {
+        try { await this.gtasks.deleteList(lid); } catch {}
+        delete settings.tasksListMap![pid];
+      }
+    }
+
     for (const tree of trees) {
       if (tree.children.length === 0) continue;
       // 親タスクの条件: 🛫 と 📅 がある（同一日である必要はない）
