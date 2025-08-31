@@ -26,11 +26,10 @@ export class TasksSync {
 
     for (const tree of trees) {
       if (tree.children.length === 0) continue;
-      // 親タスクの条件: 🛫 と 📅 があり、かつ同一日
+      // 親タスクの条件: 🛫 と 📅 がある（同一日である必要はない）
       const startMatch = tree.title.match(/🛫\s*(\d{4}-\d{2}-\d{2})/);
       const dueMatch = tree.title.match(/📅\s*(\d{4}-\d{2}-\d{2})/);
       if (!startMatch || !dueMatch) continue;
-      if (startMatch[1] !== dueMatch[1]) continue;
 
       // 親→リストIDの確定（タイトルで取得/作成し、マップ更新）
       let listId = await this.gtasks.getOrCreateList(tree.title);
