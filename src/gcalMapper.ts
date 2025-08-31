@@ -195,13 +195,18 @@ export class GCalMapper {
             };
 
             if (hasWindow) {
-                // 両日付のみ or 片方のみ時刻指定のケースを時間ウィンドウで補正
+                // 時間ウィンドウがある場合は必ず時間指定イベントにする
+                const isDaily = (task.recurrenceRule || '').toUpperCase().includes('FREQ=DAILY');
                 event.start = { dateTime: toIso(startMoment, winStart) };
                 if (winEnd === '24:00') {
-                    const end = dueMoment.isSame(startMoment, 'day') ? startMoment.clone().add(1,'day') : dueMoment.clone().add(1,'day');
-                    event.end = { dateTime: toIso(end, '00:00') };
+                    // 24:00 は翌日 00:00
+                    const baseEndDay = isDaily ? startMoment.clone().add(1,'day')
+                                               : (dueMoment.isSame(startMoment,'day') ? startMoment.clone().add(1,'day')
+                                                                                      : dueMoment.clone().add(1,'day'));
+                    event.end = { dateTime: toIso(baseEndDay, '00:00') };
                 } else {
-                    event.end = { dateTime: toIso(dueMoment, winEnd) };
+                    const baseEndDay = isDaily ? startMoment : dueMoment;
+                    event.end = { dateTime: toIso(baseEndDay, winEnd) };
                 }
             } else if (startIsDateTime && !dueIsDateTime && startMoment.isSame(dueMoment, 'day')) {
                 // 仕様: 開始に時刻・終了が日付のみ（同日）の場合は 24:00 まで
@@ -242,6 +247,10 @@ export class GCalMapper {
                 }
             }
         }
+
+        // dateTime があれば date をクリア（Google 側の解釈ブレを防止）
+        if (event.start?.dateTime && (event.start as any).date) delete (event.start as any).date;
+        if (event.end?.dateTime && (event.end as any).date) delete (event.end as any).date;
 
         // 最終チェック
 		if (!event.start || !event.end ||
