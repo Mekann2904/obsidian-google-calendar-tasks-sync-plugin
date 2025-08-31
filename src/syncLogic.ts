@@ -427,6 +427,7 @@ export class SyncLogic {
             const id = event.id;
             const obsId = event.extendedProperties?.private?.['obsidianTaskId'];
             if (id && event.extendedProperties?.private?.['isGcalSync'] === 'true' && !processed.has(id) && (!obsId || !taskMap[obsId])) {
+                if (gIdsInUseByCurrent.has(id)) return; // 現行タスクが参照中なら孤児扱いにしない
                 const headers: Record<string, string> = {};
                 if (event.etag) headers['If-Match'] = event.etag;
                 batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(id)}`, headers, obsidianTaskId: obsId || 'orphan', operationType: 'delete', originalGcalId: id });
