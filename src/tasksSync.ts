@@ -221,16 +221,34 @@ export class TasksSync {
 
   private async ensureListForParent(parentId: string, title: string): Promise<string> {
     const settings = this.plugin.settings;
-    // まずマーカーで検出（タイトルや古いIDに依存しない）
-    let listId = await this.gtasks.findListByMarker(parentId);
-    if (!listId) {
-      // 見つからなければ作成
-      listId = await this.gtasks.getOrCreateList(title);
-      try { await this.gtasks.ensureMarkerTask(listId, parentId); } catch {}
+    // 1) マップ済みIDを優先的に使用（リストが存在すれば、そのままタイトルを合わせる）
+    let mapped = settings.tasksListMap?.[parentId];
+    if (mapped) {
+      const ok = await this.gtasks.getList(mapped);
+      if (ok && ok.id) {
+        if (ok.title !== title) {
+          try { await this.gtasks.renameList(ok.id, title); } catch {}
+        }
+        return ok.id;
+      }
     }
-    settings.tasksListMap![parentId] = listId;
+
+    // 2) タイトル一致の既存リストを再利用（marker不使用設計のためタイトル同一を専用リストとみなす）
+    try {
+      const lists = await this.gtasks.listLists(100);
+      const found = lists.find(l => l.title === title && l.id);
+      if (found?.id) {
+        settings.tasksListMap![parentId] = found.id;
+        await this.plugin.saveData(settings);
+        return found.id;
+      }
+    } catch { /* ignore */ }
+
+    // 3) 見つからなければ作成
+    const createdId = await this.gtasks.getOrCreateList(title);
+    settings.tasksListMap![parentId] = createdId;
     await this.plugin.saveData(settings);
-    return listId;
+    return createdId;
   }
 
   private buildManagedNotes(userNotes: string | undefined, _obsidianTaskId: string): string {
