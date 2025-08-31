@@ -123,6 +123,9 @@ export class BatchProcessor {
                 if ((op==='delete' || op==='patch' || op==='update') && (res.status===404||res.status===410)) {
                     skipped++;
                     console.warn(`リソース未存在: ${req.originalGcalId}`);
+                } else if (op==='insert' && res.status===409) {
+                    skipped++;
+                    console.warn(`挿入スキップ(409): 既存IDまたは重複作成 ${req.obsidianTaskId}`);
                 } else {
                     errors++;
                     const msg = res.body?.error?.message || `Status ${res.status}`;

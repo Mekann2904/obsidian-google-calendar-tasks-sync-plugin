@@ -3,6 +3,7 @@ import { ErrorHandler, DateUtils } from './commonUtils';
 import { calendar_v3 } from 'googleapis';
 import GoogleCalendarTasksSyncPlugin from './main';
 import { ObsidianTask, GoogleCalendarEventInput, BatchRequestItem, BatchResponseItem, BatchResult, ErrorLog } from './types';
+import { createHash } from 'crypto';
 import { BatchProcessor } from './batchProcessor';
 import moment from 'moment';
 import { GCalMapper } from './gcalMapper';
@@ -171,11 +172,18 @@ export class SyncLogic {
                                 fallbackInserts.push({
                                     method: 'POST',
                                     path: calendarPath,
-                                    body: req.body,
+                                    body: { ...(req.body || {}), id: this.generateStableEventId(req.obsidianTaskId) },
                                     obsidianTaskId: req.obsidianTaskId,
                                     operationType: 'insert'
                                 });
                             }
+                            return;
+                        }
+
+                        // insert の 409 (既存ID) はスキップ扱いにし、taskMap を安定IDで更新
+                        if (req.operationType === 'insert' && status === 409 && req.obsidianTaskId) {
+                            taskMap[req.obsidianTaskId] = this.generateStableEventId(req.obsidianTaskId);
+                            skippedCount++;
                             return;
                         }
 
@@ -300,7 +308,9 @@ export class SyncLogic {
             const existingEvent = googleEventMap.get(obsId);
 
             if (force) {
-                batchRequests.push({ method: 'POST', path: calendarPath, body: eventPayload, obsidianTaskId: obsId, operationType: 'insert' });
+                // 挿入を冪等化するため、安定イベントIDを付与
+                const insertBody = { ...eventPayload, id: this.generateStableEventId(obsId) } as GoogleCalendarEventInput;
+                batchRequests.push({ method: 'POST', path: calendarPath, body: insertBody, obsidianTaskId: obsId, operationType: 'insert' });
                 continue;
             }
 
@@ -312,7 +322,8 @@ export class SyncLogic {
                     skippedCount++;
                 }
             } else {
-                batchRequests.push({ method: 'POST', path: calendarPath, body: eventPayload, obsidianTaskId: obsId, operationType: 'insert' });
+                const insertBody = { ...eventPayload, id: this.generateStableEventId(obsId) } as GoogleCalendarEventInput;
+                batchRequests.push({ method: 'POST', path: calendarPath, body: insertBody, obsidianTaskId: obsId, operationType: 'insert' });
             }
         }
         return { currentObsidianTaskIds, skipped: skippedCount };
@@ -364,33 +375,96 @@ export class SyncLogic {
         });
     }
 
-    private async executeBatchesWithRetry(batchRequests: BatchRequestItem[], batchProcessor: BatchProcessor): Promise<BatchResult> {
-        while (this.retryCount <= this.MAX_RETRIES) {
-            try {
-                const result = await batchProcessor.executeBatches(
-                    batchRequests,
-                    (batch) => this.plugin.gcalApi.executeBatchRequest(batch)
-                );
+    private async executeBatchesWithRetry(batchRequests: BatchRequestItem[], _batchProcessor: BatchProcessor): Promise<BatchResult> {
+        // 選択的リトライ: 成功/恒久失敗は確定し、403/429/5xx のみ再送
+        const finalResults: BatchResponseItem[] = new Array(batchRequests.length);
+        let created = 0, updated = 0, deleted = 0, errors = 0, skipped = 0;
 
-                if (result.errors > 0) {
-                    const shouldRetry = result.results.some(res => 
-                        [403, 429, 500, 502, 503, 504].includes(res.status));
-                    if (shouldRetry && this.retryCount < this.MAX_RETRIES) {
-                        this.retryCount++;
-                        const delay = this.RETRY_DELAY_MS * Math.pow(2, this.retryCount);
-                        await new Promise(resolve => setTimeout(resolve, delay));
-                        continue;
+        const isTransient = (status: number) => [403, 429, 500, 502, 503, 504].includes(status);
+        const treatAsSkipped = (req: BatchRequestItem, status: number) => {
+            if (req.operationType === 'insert' && status === 409) return true; // 既存IDでの重複作成
+            if ((req.operationType === 'delete' || req.operationType === 'update' || req.operationType === 'patch') && (status === 404 || status === 410)) return true;
+            return false;
+        };
+
+        // 送信対象のインデックス集合
+        let pending = batchRequests.map((_, i) => i);
+        let attempt = 0;
+
+        while (pending.length > 0) {
+            attempt++;
+            this.retryCount = attempt - 1;
+
+            for (let i = 0; i < pending.length; i += 50) {
+                const windowIdx = pending.slice(i, i + 50);
+                const subReq = windowIdx.map(idx => batchRequests[idx]);
+                const subRes = await this.plugin.gcalApi.executeBatchRequest(subReq);
+
+                subRes.forEach((res, k) => {
+                    const origIdx = windowIdx[k];
+                    const req = batchRequests[origIdx];
+
+                    if (res.status >= 200 && res.status < 300) {
+                        finalResults[origIdx] = res;
+                        switch (req.operationType) {
+                            case 'insert': created++; break;
+                            case 'update':
+                            case 'patch': updated++; break;
+                            case 'delete': deleted++; break;
+                        }
+                        return;
                     }
+
+                    if (treatAsSkipped(req, res.status)) {
+                        finalResults[origIdx] = res; // スキップとして記録
+                        skipped++;
+                        return;
+                    }
+
+                    if (isTransient(res.status) && attempt <= this.MAX_RETRIES) {
+                        // 次のラウンドで再送（finalResults は未確定のまま）
+                        return;
+                    }
+
+                    // 恒久失敗として確定
+                    finalResults[origIdx] = res;
+                    errors++;
+                });
+
+                // レート制限回避のためのインターバッチ遅延
+                if (i + 50 < pending.length && this.plugin.settings.interBatchDelay > 0) {
+                    await new Promise(resolve => setTimeout(resolve, this.plugin.settings.interBatchDelay));
                 }
-                return result;
-            } catch (error) {
-                if (this.retryCount >= this.MAX_RETRIES) throw error;
-                this.retryCount++;
-                const delay = this.RETRY_DELAY_MS * Math.pow(2, this.retryCount);
-                await new Promise(resolve => setTimeout(resolve, delay));
             }
+
+            // 未確定（= transient 扱い）だけを次の試行に残す
+            const nextPending: number[] = [];
+            for (const idx of pending) {
+                if (!finalResults[idx]) nextPending.push(idx);
+            }
+
+            if (nextPending.length === 0) break;
+            if (attempt >= this.MAX_RETRIES) {
+                // これ以上の再送は行わない。残りはエラーで確定。
+                for (const idx of nextPending) {
+                    finalResults[idx] = { status: 500, body: { error: { message: 'Retry limit reached' } } };
+                    errors++;
+                }
+                break;
+            }
+
+            const delay = this.RETRY_DELAY_MS * Math.pow(2, attempt) + Math.floor(Math.random() * 250);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            pending = nextPending;
         }
-        throw new Error(`Max retries (${this.MAX_RETRIES}) exceeded`);
+
+        return { results: finalResults, created, updated, deleted, errors, skipped };
+    }
+
+    // 安定イベントIDを生成（Googleの制約: 英小文字/数字/ハイフン/アンダースコア, 5-1024文字）
+    private generateStableEventId(obsidianTaskId: string): string {
+        const sha1 = createHash('sha1').update(`obsidian-task:${obsidianTaskId}`).digest('hex');
+        return `obs-${sha1}`; // 44文字程度、衝突実質無視可能
     }
 
     private handleDeleteError(request: BatchRequestItem, status: number): void {
@@ -448,4 +522,3 @@ export class SyncLogic {
         return false;
     }
 }
-
