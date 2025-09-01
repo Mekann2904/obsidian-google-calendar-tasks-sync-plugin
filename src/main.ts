@@ -190,6 +190,9 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
                         const json = JSON.stringify({ refresh_token: tokens.refresh_token });
                         this.settings.tokensEncrypted = encryptWithPassphrase(json, pass);
                         await super.saveData({ ...this.settings, tokens: null });
+                        // 現在の保存方式
+                        // @ts-ignore
+                        this.encryptionMode = 'passphrase';
                         return;
                     } catch (e) {
                         console.error('パスフレーズ暗号化に失敗:', e);
@@ -199,12 +202,16 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
                 new Notice('警告: 安全な暗号化手段が利用できないため、トークンは永続化しません（再起動で再認証が必要）。', 10000);
                 this.settings.tokensEncrypted = null;
                 await super.saveData({ ...this.settings, tokens: null });
+                // @ts-ignore
+                this.encryptionMode = 'memory';
                 return;
             }
             try {
                 const json = JSON.stringify({ refresh_token: tokens.refresh_token });
                 this.settings.tokensEncrypted = encryptToBase64(json);
                 await super.saveData({ ...this.settings, tokens: null });
+                // @ts-ignore
+                this.encryptionMode = 'safeStorage';
             } catch (e) {
                 console.error('トークン暗号化保存に失敗:', e);
                 new Notice('トークンの暗号化保存に失敗しました。コンソールを確認してください。', 8000);
@@ -212,7 +219,61 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
         } else {
             this.settings.tokensEncrypted = null;
             await super.saveData({ ...this.settings, tokens: null });
+            // @ts-ignore
+            this.encryptionMode = 'memory';
         }
+    }
+
+    // 保存方式を safeStorage に移行
+    async migrateEncryptionToSafeStorage(): Promise<void> {
+        if (!isEncryptionAvailable()) {
+            new Notice('safeStorage が利用できないため移行できません。', 6000);
+            return;
+        }
+        try {
+            let refreshToken: string | null = this.settings.tokens?.refresh_token || null;
+            if (!refreshToken && this.settings.tokensEncrypted) {
+                if (this.settings.tokensEncrypted.startsWith('aesgcm:')) {
+                    const pass = this.passphraseCache || this.settings.encryptionPassphrase || null;
+                    if (!pass) {
+                        new Notice('パスフレーズが未入力のため復号できません。設定で入力してください。', 7000);
+                        return;
+                    }
+                    const json = decryptWithPassphrase(this.settings.tokensEncrypted, pass);
+                    refreshToken = (JSON.parse(json)?.refresh_token) || null;
+                } else {
+                    // 既に safeStorage の可能性
+                    const json = decryptFromBase64(this.settings.tokensEncrypted);
+                    refreshToken = (JSON.parse(json)?.refresh_token) || null;
+                }
+            }
+            if (!refreshToken) {
+                new Notice('refresh_token が見つかりません。設定から再認証してください。', 8000);
+                return;
+            }
+            await this.persistTokens({ refresh_token: refreshToken });
+            // パスフレーズ保存は解除（任意）
+            this.settings.rememberPassphrase = false;
+            this.settings.encryptionPassphrase = null;
+            this.passphraseCache = null;
+            await this.saveData(this.settings);
+            new Notice('保存方式を safeStorage に移行しました。', 5000);
+            this.refreshSettingsTab();
+        } catch (e) {
+            console.error('safeStorage への移行に失敗:', e);
+            new Notice('safeStorage への移行に失敗しました。コンソールを確認してください。', 8000);
+        }
+    }
+
+    // 現在の暗号化/保存モードを文字列で返す
+    getEncryptionModeLabel(): string {
+        const enc = this.settings.tokensEncrypted || '';
+        if (enc.startsWith('aesgcm:')) {
+            return `パスフレーズAES-GCM（${this.settings.rememberPassphrase ? 'パス保存あり' : '一時パス'}）`;
+        }
+        if (enc && isEncryptionAvailable()) return 'OS safeStorage（自動暗号化/復号）';
+        if (!enc && isEncryptionAvailable()) return '未保存（safeStorage利用可。保存時は自動暗号化）';
+        return '未保存（メモリのみ）';
     }
 
 	async saveSettings() {

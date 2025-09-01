@@ -580,26 +580,41 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 
 		// --- セキュリティ/保存方式 ステータス ---
 		containerEl.createEl('h4', { text: 'セキュリティ/保存方式' });
-		{
-			const safeAvail = isEncryptionAvailable();
-			const enc = this.plugin.settings.tokensEncrypted || '';
-			const hasEnc = !!enc;
-			const isPassEnc = hasEnc && enc.startsWith('aesgcm:');
-			const remember = !!this.plugin.settings.rememberPassphrase;
-			let mode = '未保存（メモリのみ）';
-			if (hasEnc) {
-				mode = isPassEnc ? `パスフレーズAES-GCM（${remember ? 'パス保存あり' : '一時パス'}）` : 'OS safeStorage';
-			} else if (safeAvail) {
-				mode = '未保存（safeStorage利用可。保存時は自動暗号化）';
-			}
+        {
+            const safeAvail = isEncryptionAvailable();
+            const enc = this.plugin.settings.tokensEncrypted || '';
+            const hasEnc = !!enc;
+            const isPassEnc = hasEnc && enc.startsWith('aesgcm:');
+            const remember = !!this.plugin.settings.rememberPassphrase;
+            let mode = '未保存（メモリのみ）';
+            if (hasEnc) {
+                mode = isPassEnc ? `パスフレーズAES-GCM（${remember ? 'パス保存あり' : '一時パス'}）` : 'OS safeStorage';
+            } else if (safeAvail) {
+                mode = '未保存（safeStorage利用可。保存時は自動暗号化）';
+            }
 
-			new Setting(containerEl)
-				.setName('暗号化状態')
-				.setDesc(mode)
-				.addExtraButton(b => {
-					b.setIcon(safeAvail ? 'shield' : 'alert-circle')
-					 .setTooltip(safeAvail ? 'safeStorage 利用可能' : 'safeStorage 利用不可');
-				});
+            new Setting(containerEl)
+                .setName('暗号化状態')
+                .setDesc(mode)
+                .addExtraButton(b => {
+                    b.setIcon(safeAvail ? 'shield' : 'alert-circle')
+                     .setTooltip(safeAvail ? 'safeStorage 利用可能' : 'safeStorage 利用不可');
+                });
+
+            // safeStorage へ移行ボタン（利用可能かつ未使用時）
+            if (safeAvail && (!hasEnc || isPassEnc)) {
+                new Setting(containerEl)
+                    .setName('保存方式の移行')
+                    .setDesc('現在のトークン保存方式を OS safeStorage へ移行する。')
+                    .addButton(btn => btn
+                        .setButtonText('safeStorage に移行')
+                        .setIcon('refresh-cw')
+                        .setCta()
+                        .onClick(async () => {
+                            await (this.plugin as any).migrateEncryptionToSafeStorage();
+                            this.display();
+                        }));
+            }
 
 			const detail = document.createElement('div');
 			detail.className = 'setting-item-description';
