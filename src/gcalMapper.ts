@@ -27,10 +27,12 @@ export class GCalMapper {
                     isGcalSync: 'true',
                     appId: 'obsidian-gcal-tasks',
                     version: '1',
+                    isCompleted: task.isCompleted ? 'true' : 'false',
                 }
             },
             description: this.buildEventDescription(task),
-            status: task.isCompleted ? 'cancelled' : 'confirmed',
+            // 完了＝キャンセルではない。イベント自体は confirmed を維持する。
+            status: 'confirmed',
         };
 
         // 開始日と期限日が存在する場合のみ時間を設定 (syncLogicでフィルタされるはず)
@@ -67,15 +69,17 @@ export class GCalMapper {
 
         // リマインダーを scheduledDate から設定、またはデフォルトを設定
         if (event.start) {
+            // ローカル壁時計として扱う（toEventDateTime もローカル＋timeZone を送るため整合）
             const eventStartMoment = event.start.dateTime
-                ? moment.utc(event.start.dateTime)
-                : moment.utc(event.start.date).startOf('day');
+                ? moment(event.start.dateTime)
+                : moment(event.start.date + 'T00:00:00');
 
             let reminderMoment: moment.Moment | null = null;
 
             if (task.scheduledDate) {
                 // ⏳ が指定されている場合、その日時を使用
-                reminderMoment = moment.utc(task.scheduledDate, [moment.ISO_8601, 'YYYY-MM-DD'], true);
+                // ⏳ はローカル前提（UTCにしない）
+                reminderMoment = moment(task.scheduledDate, [moment.ISO_8601, 'YYYY-MM-DD'], true);
                 if (!reminderMoment.isValid()) {
                     console.warn(`タスク "${task.summary}" のリマインダー日時 (scheduledDate) のパースに失敗しました。`);
                     reminderMoment = null;
@@ -128,11 +132,12 @@ export class GCalMapper {
             const vaultName = this.app.vault.getName();
             const encodedVault = encodeURIComponent(vaultName);
             const encodedPath = encodeURIComponent(task.sourcePath);
-            let linkSuffix = '';
+            let fileParam = encodedPath;
             if (task.blockLink) {
-                linkSuffix = `#${task.blockLink}`;
+                // アンカーも含めて file= の値としてURLエンコード
+                fileParam = encodeURIComponent(`${task.sourcePath}#${task.blockLink}`);
             }
-            descParts.push(`Obsidian ノート: obsidian://open?vault=${encodedVault}&file=${encodedPath}${linkSuffix}`);
+            descParts.push(`Obsidian ノート: obsidian://open?vault=${encodedVault}&file=${fileParam}`);
         } catch (e) {
             console.warn("Obsidian URI の生成に失敗しました", e);
             descParts.push(`Obsidian ソース: "${task.sourcePath}" (Line ${task.sourceLine + 1})`);
@@ -220,11 +225,12 @@ export class GCalMapper {
                 // 終日イベント
                 event.start = { date: startMoment.format('YYYY-MM-DD') };
                 // GCal APIでは終日イベントの終了日は exclusive なので、dueMoment の *翌日* を指定
-                const endDate = dueMoment.add(1, 'day').format('YYYY-MM-DD');
-                event.end = { date: endDate };
+                const endDateMoment = dueMoment.clone().add(1, 'day');
+                event.end = { date: endDateMoment.format('YYYY-MM-DD') };
 
-                if (moment.utc(event.end.date).isSameOrBefore(moment.utc(event.start.date))) {
-                    console.warn(`タスク "${task.summary || task.id}": 終日イベントの終了日(${dueMoment.subtract(1, 'day').format('YYYY-MM-DD')})が開始日(${startMoment.format('YYYY-MM-DD')})以前。終了日を開始日の翌日に設定。`);
+                if (moment(event.end.date).isSameOrBefore(moment(event.start.date))) {
+                    const origDue = dueMoment.format('YYYY-MM-DD');
+                    console.warn(`タスク "${task.summary || task.id}": 終日イベントの終了日(${origDue})が開始日(${startMoment.format('YYYY-MM-DD')})以前。終了日を開始日の翌日に設定。`);
                     event.end = { date: startMoment.clone().add(1, 'day').format('YYYY-MM-DD') };
                 }
             }
@@ -240,7 +246,7 @@ export class GCalMapper {
         }
 
         // RRULE の期間限定補助: "every day" かつ COUNT/UNTILなし、start/due が日付の範囲の場合は COUNT を補う
-        if (task.recurrenceRule && event.start?.dateTime && (!task.startDate?.includes('T') || !task.dueDate?.includes('T'))) {
+        if (task.recurrenceRule && (event.start?.dateTime || event.start?.date) && (!task.startDate?.includes('T') || !task.dueDate?.includes('T'))) {
             const rule = (task.recurrenceRule || '').toUpperCase();
             if (rule.includes('FREQ=DAILY') && !/;COUNT=|;UNTIL=/.test(rule) && task.startDate && task.dueDate) {
                 const s = moment(task.startDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
@@ -279,9 +285,9 @@ export class GCalMapper {
      * イベントにデフォルトの終日イベント時間 (今日) を設定します。
      */
     private setDefaultEventTime(event: GoogleCalendarEventInput): void {
-        const today = moment.utc().format('YYYY-MM-DD');
+        const today = moment().format('YYYY-MM-DD'); // ローカル今日
         event.start = { date: today };
-        event.end = { date: moment.utc(today).add(1, 'day').format('YYYY-MM-DD') };
+        event.end = { date: moment(today).add(1, 'day').format('YYYY-MM-DD') };
         delete event.start?.dateTime;
         delete event.end?.dateTime;
     }

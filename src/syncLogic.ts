@@ -373,11 +373,14 @@ export class SyncLogic {
             if (task.isCompleted) {
                 if (!force) {
                     const existingEvent = googleEventMap.get(obsId);
-                    if (existingEvent && existingEvent.status !== 'cancelled') {
+                    if (existingEvent) {
                         const gcalId = existingEvent.id!;
                         const headers: Record<string, string> = {};
                         if (existingEvent.etag) headers['If-Match'] = existingEvent.etag;
-                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, headers, body: { status: 'cancelled' }, obsidianTaskId: obsId, operationType: 'patch', originalGcalId: gcalId });
+                        // 完了は status をキャンセルにせず、extendedProperties.private.isCompleted='true' を更新
+                        const payload = gcalMapper.mapObsidianTaskToGoogleEvent(task);
+                        const patchBody = this.buildPatchBody(existingEvent, payload);
+                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, headers, body: patchBody, obsidianTaskId: obsId, operationType: 'patch', originalGcalId: gcalId });
                     } else {
                         skippedCount++;
                     }
@@ -1053,6 +1056,11 @@ export class SyncLogic {
                 includeRem2
             ),
         };
+        // 完了フラグが新Payloadに含まれる場合は反映
+        const newCompleted = (newPayload.extendedProperties as any)?.private?.isCompleted;
+        if (typeof newCompleted === 'string') {
+            priv.isCompleted = newCompleted;
+        }
         patch.extendedProperties = { private: priv } as any;
 
         // 何も差分がない場合は summary を noop として入れない（空オブジェクトのまま返す）
