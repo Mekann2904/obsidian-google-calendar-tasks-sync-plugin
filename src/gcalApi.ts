@@ -217,7 +217,9 @@ export class GCalApiService {
                 throw e;
             }
         }
-        throw lastError;
+        // 文脈を付けてスロー
+        const code = isGaxiosError(lastError) ? (lastError.response?.status ?? '') : ((lastError as any)?.code || '');
+        throw new Error(`events.list failed after ${max} attempts: ${String(code || lastError)}`);
     }
 
     // ---------------------------------------------------------------------
@@ -444,14 +446,23 @@ export class GCalApiService {
             }
         }
 
+        // 念のため Content-ID の item-N に従って昇順に整列
+        results.sort((a, b) => {
+            const ai = a.contentId?.match(/item-(\d+)/i)?.[1];
+            const bi = b.contentId?.match(/item-(\d+)/i)?.[1];
+            const an = ai ? parseInt(ai, 10) : Number.MAX_SAFE_INTEGER;
+            const bn = bi ? parseInt(bi, 10) : Number.MAX_SAFE_INTEGER;
+            return an - bn;
+        });
+
         console.log(`${results.length} 件のバッチ応答アイテムを抽出しました。`);
         return results;
     }
 
     private detectBoundaryFromContentType(ct?: string): string | null {
         if (!ct) return null;
-        const m = /boundary="?([^";]+)"?/i.exec(ct);
-        return m?.[1] ?? null;
+        const m = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(ct);
+        return (m?.[1] || m?.[2] || null);
     }
 
     // FIX: レスポンス本文から最初の boundary トークンを推定
@@ -505,6 +516,13 @@ export class GCalApiService {
         const statusMatch = statusLine.match(/^HTTP\/\d(?:\.\d+)?\s+(\d+)/);
         const status = statusMatch ? parseInt(statusMatch[1], 10) : 500;
 
+        // パートヘッダ（小文字キーで正規化）
+        const headers: Record<string, string> = {};
+        for (let i = statusLineIdx + 1; i < headerEndIdx; i++) {
+            const mh = /^([^:]+):\s*(.*)$/.exec(lines[i]);
+            if (mh) headers[mh[1].toLowerCase()] = mh[2];
+        }
+
         // ボディ（空のこともある）
         const bodyRaw = headerEndIdx + 1 < lines.length ? lines.slice(headerEndIdx + 1).join("\n").trim() : "";
         let bodyJson: any = undefined;
@@ -517,6 +535,6 @@ export class GCalApiService {
             }
         }
 
-        return { status, body: bodyJson, contentId };
+        return { status, body: bodyJson, contentId, headers };
     }
 }
