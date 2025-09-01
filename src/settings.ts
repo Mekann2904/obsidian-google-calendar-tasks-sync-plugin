@@ -41,6 +41,7 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 	maxBatchPerHttp: 50, // Calendar は保守的に 50 を既定
 	maxInFlightBatches: 2,
 	latencySLAms: 1500,
+	rateErrorCooldownMs: 1000,
 	devLogging: false,
 };
 
@@ -606,6 +607,24 @@ new Setting(containerEl)
 						if (isNaN(n) || n < 200) n = 200;
 						if (n > 10000) n = 10000;
 						this.plugin.settings.latencySLAms = n;
+						await this.plugin.saveData(this.plugin.settings);
+					});
+			});
+
+		// レート/一時障害後のクールダウン
+		new Setting(containerEl)
+			.setName('レート障害後クールダウン (ms)')
+			.setDesc('429/403/5xx を検知した後に待つ時間（既定1000ms）。')
+			.addText(text => {
+				text.inputEl.type = 'number';
+				text.inputEl.min = '0';
+				text.inputEl.max = '10000';
+				text.setValue(String(this.plugin.settings.rateErrorCooldownMs ?? DEFAULT_SETTINGS.rateErrorCooldownMs))
+					.onChange(async (value) => {
+						let n = parseInt(value, 10);
+						if (isNaN(n) || n < 0) n = 0;
+						if (n > 10000) n = 10000;
+						this.plugin.settings.rateErrorCooldownMs = n;
 						await this.plugin.saveData(this.plugin.settings);
 					});
 			});

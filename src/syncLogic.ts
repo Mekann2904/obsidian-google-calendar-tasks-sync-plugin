@@ -743,14 +743,15 @@ export class SyncLogic {
         };
 
         // 設定: ハード上限/開始サイズ/並列度/SLA
-        const hardCap = Math.max(1, Math.min(this.plugin.settings.maxBatchPerHttp ?? 50, 1000));
-        let currentSize = Math.min(
+        const hardCap = Math.max(1, Math.min(1000, this.plugin.settings.maxBatchPerHttp ?? 50));
+        let subBatchSize = Math.min(
             Math.max(1, this.plugin.settings.desiredBatchSize ?? this.plugin.settings.batchSize ?? 50),
             hardCap
         );
-        const step = 10;
+        const step = Math.max(1, Math.floor(subBatchSize * 0.2)); // +20%
         const sla = this.plugin.settings.latencySLAms ?? 1500;
-        let currentMaxInFlight = Math.max(1, this.plugin.settings.maxInFlightBatches ?? 2);
+        let maxInFlight = Math.max(1, this.plugin.settings.maxInFlightBatches ?? 2);
+        const cooldown = this.plugin.settings.rateErrorCooldownMs ?? 1000;
 
         // 送信対象のインデックス集合
         let pending = batchRequests.map((_, i) => i);
@@ -761,40 +762,40 @@ export class SyncLogic {
             this.retryCount = attempt - 1;
             metrics.attempts = attempt; // 最終回数で更新
 
-            // pending を currentSize ずつ区切ったウィンドウ列
-            const makeChunks = (size: number): number[][] => {
-                const out: number[][] = [];
-                for (let i = 0; i < pending.length; i += size) out.push(pending.slice(i, i + size));
-                return out;
-            };
-            const chunks = makeChunks(currentSize);
+            // pending を現行 subBatchSize で分割
+            const windows: number[][] = [];
+            for (let i = 0; i < pending.length; i += subBatchSize) {
+                windows.push(pending.slice(i, i + subBatchSize));
+            }
 
-            let idx = 0;
-            while (idx < chunks.length) {
-                const groupPromises: Array<Promise<{ subRes: BatchResponseItem[]; latency: number; windowIdx: number[] }>> = [];
-                const latenciesThisGroup: number[] = [];
-                for (let k = 0; k < currentMaxInFlight && idx < chunks.length; k++, idx++) {
-                    const windowIdx = chunks[idx];
-                    const subReq = windowIdx.map(i => batchRequests[i]);
+            let hadRateIssuesInWave = false;
+            const waveLatencies: number[] = [];
+
+            for (let w = 0; w < windows.length; w += maxInFlight) {
+                const slice = windows.slice(w, w + maxInFlight);
+
+                const settled = await Promise.allSettled(slice.map(windowIdx => {
+                    const subReq = windowIdx.map(idx => batchRequests[idx]);
                     const start = performance.now();
-                    const p = this.plugin.gcalApi.executeBatchRequest(subReq).then(subRes => {
+                    return this.plugin.gcalApi.executeBatchRequest(subReq).then(subRes => {
                         const end = performance.now();
                         const latency = end - start;
                         metrics.sentSubBatches++;
                         metrics.batchLatenciesMs.push(latency);
-                        latenciesThisGroup.push(latency);
-                        return { subRes, latency, windowIdx };
+                        return { subRes, windowIdx, latency };
                     });
-                    groupPromises.push(p);
-                }
+                }));
 
-                const results = await Promise.all(groupPromises);
+                // 各サブバッチの結果を適用
+                settled.forEach(s => {
+                    if (s.status !== 'fulfilled') {
+                        hadRateIssuesInWave = true; // ネットワーク/未知の失敗
+                        return;
+                    }
+                    const { subRes, windowIdx, latency } = s.value;
+                    waveLatencies.push(latency);
 
-                // 受信処理 + 指標集計
-                let hadRateIssues = false;
-                let had412 = false;
-                for (const { subRes, windowIdx } of results) {
-                    // Content-ID での対応づけ（順序入れ替わりに強く）
+                    // Content-ID -> 元 index
                     const cidToOrig = new Map<string, number>();
                     windowIdx.forEach((orig, j) => cidToOrig.set(`item-${j + 1}`, orig));
 
@@ -813,65 +814,67 @@ export class SyncLogic {
                                 switch (req.operationType) {
                                     case 'insert': created++; break;
                                     case 'update':
-                                    case 'patch': updated++; break;
+                                    case 'patch':  updated++; break;
                                     case 'delete': deleted++; break;
                                 }
                             }
                             return;
                         }
 
-                        // 409/410/404/412 などの恒久的/スキップ対象
+                        // スキップ系
                         if (treatAsSkipped(req, res.status)) {
                             if (!finalResults[origIdx]) {
-                                finalResults[origIdx] = res; // スキップとして記録
+                                finalResults[origIdx] = res;
                                 skipped++;
                             }
                             return;
                         }
 
+                        // レート/一時障害 → 次ラウンド
                         const reason = (res.body?.error?.errors?.[0]?.reason) || (res.body?.error?.status) || '';
-                        const shouldRetry = this.shouldRetry(res.status, String(reason));
-                        if (res.status === 412) had412 = true; // ETag 競合もサイズ調整のシグナル
-                        if (shouldRetry && attempt <= this.MAX_RETRIES) {
-                            // 次のラウンドで再送（finalResults は未確定のまま）
-                            hadRateIssues = hadRateIssues || res.status === 429 || res.status >= 500 || (res.status === 403 && /(rateLimitExceeded|userRateLimitExceeded)/i.test(String(reason)));
-                            return;
+                        const retryable = this.shouldRetry(res.status, String(reason));
+                        if (retryable && attempt <= this.MAX_RETRIES) {
+                            hadRateIssuesInWave = true;
+                            return; // finalResults は未確定
                         }
 
                         if (res.status === 412) {
-                            // 後続の If-Match 無し再送で処理するため、ここでは確定させる
-                            finalResults[origIdx] = res;
+                            finalResults[origIdx] = res; // フォールバック経路で処理
                             return;
                         }
 
-                        // 恒久失敗として確定
+                        // 恒久失敗
                         if (!finalResults[origIdx]) {
                             finalResults[origIdx] = res;
                             errors++;
                         }
                     });
-                }
+                });
 
-                // p95 をこのグループ内で計算
-                const sorted = [...latenciesThisGroup].sort((a,b)=>a-b);
-                const i95 = sorted.length ? Math.min(sorted.length-1, Math.ceil(0.95*sorted.length)-1) : 0;
-                const p95 = sorted[i95] ?? 0;
-
-                // AIMD: レート・エラーや SLA 超過、412 が多いときは半減
-                if (hadRateIssues || had412 || p95 > sla) {
-                    currentSize = Math.max(Math.floor(currentSize / 2), 5);
-                    if (hadRateIssues) currentMaxInFlight = 1; // レートに触れたら並列度を落とす
-                } else {
-                    currentSize = Math.min(currentSize + step, hardCap);
-                }
-
-                // レート制限回避のためのインターバッチ遅延（グループ間）
-                if (idx < chunks.length && (this.plugin.settings.interBatchDelay ?? 0) > 0) {
-                    const base = this.plugin.settings.interBatchDelay!;
-                    const jittered = Math.floor(base * (Math.random() * 0.5 + 0.75)); // ±25% ジッタ
+                // ジッタ付きインターバッチ遅延（並列グループ間）
+                const base = this.plugin.settings.interBatchDelay ?? 0;
+                if (w + maxInFlight < windows.length && base > 0) {
+                    const jittered = Math.floor(base * (Math.random() * 0.5 + 0.75));
                     metrics.totalWaitMs += jittered;
-                    await new Promise(resolve => setTimeout(resolve, jittered));
+                    await new Promise(r => setTimeout(r, jittered));
                 }
+            }
+
+            // 波（wave）単位の適応: p95 とレート状況
+            const latSorted = waveLatencies.slice().sort((a,b)=>a-b);
+            const p95 = latSorted.length ? latSorted[Math.min(latSorted.length - 1, Math.ceil(0.95 * latSorted.length) - 1)] : 0;
+            if (hadRateIssuesInWave || p95 > sla) {
+                subBatchSize = Math.max(Math.floor(subBatchSize / 2), 5);
+                maxInFlight = Math.max(1, Math.floor(maxInFlight / 2));
+                if (cooldown > 0) {
+                    metrics.totalWaitMs += cooldown;
+                    await new Promise(r => setTimeout(r, cooldown));
+                }
+            } else {
+                subBatchSize = Math.min(subBatchSize + step, hardCap);
+                // 目標上限まで少しずつ上げる
+                const limit = Math.max(1, this.plugin.settings.maxInFlightBatches ?? 2);
+                if (maxInFlight < limit) maxInFlight = Math.min(limit, maxInFlight + 1);
             }
 
             // 未確定（= transient 扱い）だけを次の試行に残す

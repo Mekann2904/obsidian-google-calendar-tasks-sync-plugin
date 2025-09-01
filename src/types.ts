@@ -76,6 +76,7 @@ export interface GoogleCalendarTasksSyncSettings {
 	maxBatchPerHttp?: number;       // 1 HTTP バッチ内のハード上限（既定50）
 	maxInFlightBatches?: number;    // 同時送信サブバッチ数（既定2）
 	latencySLAms?: number;          // p95 レイテンシSLA（既定1500ms）
+	rateErrorCooldownMs?: number;    // レート/一時障害後のクールダウン（既定1000ms）
 
 	recentErrors?: ErrorLog[]; // 最近のエラーサンプル（診断用）
 	useSyncToken?: boolean; // 可能な場合、syncToken による増分取得を使用
