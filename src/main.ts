@@ -183,8 +183,18 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
     async persistTokens(tokens: any | null): Promise<void> {
         this.settings.tokens = tokens && tokens.refresh_token ? ({ refresh_token: tokens.refresh_token } as any) : null;
         if (tokens && tokens.refresh_token) {
+            // obfuscationSalt の確保（初回や移行直後などで未設定の場合に生成）
+            if (!this.settings.obfuscationSalt) {
+                try {
+                    const r = (typeof window !== 'undefined' && window.crypto && window.crypto.getRandomValues)
+                        ? (()=>{ const a=new Uint8Array(16); window.crypto.getRandomValues(a); return Buffer.from(a); })()
+                        : Buffer.from(require('crypto').randomBytes(16));
+                    this.settings.obfuscationSalt = r.toString('base64');
+                    await super.saveData({ ...this.settings, tokens: null });
+                } catch {}
+            }
             const json = JSON.stringify({ refresh_token: tokens.refresh_token });
-            const obf = obfuscateToBase64(json, this.settings.obfuscationSalt!);
+            const obf = obfuscateToBase64(json, this.settings.obfuscationSalt || '');
             const pass = this.passphraseCache || this.settings.encryptionPassphrase || null;
             if (pass && pass.length > 0) {
                 try {
@@ -251,11 +261,8 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
     // 現在の暗号化/保存モードを文字列で返す
     getEncryptionModeLabel(): string {
         const enc = this.settings.tokensEncrypted || '';
-        if (enc.startsWith('aesgcm:')) {
-            return `パスフレーズAES-GCM（${this.settings.rememberPassphrase ? 'パス保存あり' : '一時パス'}）`;
-        }
-        if (enc && isEncryptionAvailable()) return 'OS safeStorage（自動暗号化/復号）';
-        if (!enc && isEncryptionAvailable()) return '未保存（safeStorage利用可。保存時は自動暗号化）';
+        if (enc.startsWith('aesgcm:')) return `AES-GCM（二重ラップ） — ${this.settings.rememberPassphrase ? 'パス保存あり' : '一時パス'}`;
+        if (enc.startsWith('obf1:') || enc.startsWith('obf:')) return '難読化 + 永続保存（既定）';
         return '未保存（メモリのみ）';
     }
 

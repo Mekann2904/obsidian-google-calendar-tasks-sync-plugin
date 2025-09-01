@@ -85,8 +85,7 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 		// --- 認証リダイレクト (ローカルサーバー) セクション ---
 		containerEl.createEl('h4', { text: '認証リダイレクト (ローカルサーバー)' });
 		containerEl.createDiv('setting-item-description').append(
-			'認証には、Google からの認証コードを受け取るための一時的なローカルウェブサーバー (HTTP ループバック) を使用します。',
-			createEl('strong', { text: 'これが現在サポートされている唯一の方法です。' })
+			'認証には、Google からの認証コードを受け取るためローカルウェブサーバーを使用します。',
 		);
 
 		// ポート設定 (常に表示)
@@ -148,9 +147,9 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 
 		// 有効なリダイレクト URI (常に表示)
 		const effectiveRedirectUri = this.plugin.getRedirectUri();
-		new Setting(containerEl)
+new Setting(containerEl)
 			.setName('リダイレクト URI')
-			.setDesc('クライアント種別が「デスクトップ アプリ」の場合は事前登録不要。クライアント種別が「Web アプリ」の場合、この正確な URI を Google Cloud Console の「承認済みのリダイレクト URI」に追加する。サーバーが異なるポートで自動起動した場合は登録値を更新する。')
+			.setDesc('Web アプリの場合はこの正確な URI を Google Cloud の承認済みリダイレクト URI に登録する。')
 			.addText(text => {
 				text.inputEl.style.width = "100%";
 				text.inputEl.readOnly = true;
@@ -167,38 +166,38 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 						);
 					});
 				copyButton.extraSettingsEl.addClass('clickable-icon');
-			 });
+			});
 
 		// 認証ステータス表示
-		const hasTokens = !!this.plugin.settings.tokens;
-		const hasAccessToken = !!this.plugin.settings.tokens?.access_token;
-		const isTokenCurrentlyValid = this.plugin.isTokenValid(false);
-		const canRefreshToken = this.plugin.isTokenValid(true);
+			const hasTokens = !!this.plugin.settings.tokens;
+			const hasAccessToken = !!this.plugin.oauth2Client?.credentials?.access_token;
+			const isTokenCurrentlyValid = this.plugin.isTokenValid(false);
+			const canRefreshToken = this.plugin.isTokenValid(true);
 
-		let statusDesc = '未認証です。';
-		let statusIcon = 'x-circle';
-		let statusColor = 'var(--text-error)';
+			let statusDesc = '未認証です。';
+			let statusIcon = 'x-circle';
+			let statusColor = 'var(--text-error)';
 
-		if (hasTokens) {
-			if (hasAccessToken && isTokenCurrentlyValid) {
-				statusDesc = '認証済み。アクセストークンは有効です。';
-				statusIcon = 'check-circle';
-				statusColor = 'var(--text-success)';
-			} else if (canRefreshToken) {
-				statusDesc = '認証済みですが、アクセストークンが期限切れ/欠落しています。自動更新が有効です。';
-				statusIcon = 'refresh-cw';
-				statusColor = 'var(--text-warning)';
-			} else {
-				statusDesc = '認証が期限切れまたは不完全です (リフレッシュトークンなし)。再認証が必要です。';
-				statusIcon = 'alert-circle';
-				statusColor = 'var(--text-error)';
+			if (hasTokens || canRefreshToken) {
+				if (isTokenCurrentlyValid && hasAccessToken) {
+					statusDesc = '認証済み（アクセストークン有効）';
+					statusIcon = 'check-circle';
+					statusColor = 'var(--text-success)';
+				} else if (canRefreshToken) {
+					statusDesc = '認証済み（必要時に自動更新）';
+					statusIcon = 'check-circle';
+					statusColor = 'var(--text-success)';
+				} else {
+					statusDesc = '認証が期限切れまたは不完全です（再認証が必要）';
+					statusIcon = 'alert-circle';
+					statusColor = 'var(--text-error)';
+				}
 			}
-		}
 		// ステータス表示と認証/再認証ボタン
 		new Setting(containerEl)
 			.setName('認証ステータス')
-			.setDesc(statusDesc)
-			.addExtraButton(button => {
+				.setDesc(statusDesc)
+				.addExtraButton(button => {
 				button.setIcon(statusIcon)
 					  .setTooltip(statusDesc);
 				button.extraSettingsEl.style.color = statusColor;
@@ -395,68 +394,77 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 					await this.plugin.saveData(this.plugin.settings); // saveData で十分
 				}));
 
-		// --- 通知設定セクション ---
-		containerEl.createEl('h3', { text: '通知設定' });
-		// 通知表示トグル
-		new Setting(containerEl)
-			.setName('処理完了通知を表示')
-			.setDesc('バッチ処理完了などの通知を表示するかどうか')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.showNotices)
-				.onChange(async (value) => {
-					this.plugin.settings.showNotices = value;
-					await this.plugin.saveData(this.plugin.settings);
-				}));
+        // --- 通知設定 ---
+        containerEl.createEl('h3', { text: '通知設定' });
+        const refreshDisabled = () => this.display();
 
-		// --- 同期通知設定セクション ---
-		containerEl.createEl('h4', { text: '同期通知設定' });
-		// 手動同期進捗表示
-		new Setting(containerEl)
-			.setName('手動同期の進捗を表示')
-			.setDesc('手動同期時の進捗通知と「変更なし」通知を表示するかどうか')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.syncNoticeSettings.showManualSyncProgress)
-				.onChange(async (value) => {
-					this.plugin.settings.syncNoticeSettings.showManualSyncProgress = value;
-					await this.plugin.saveData(this.plugin.settings);
-				}));
-		// 自動同期要約表示
-		new Setting(containerEl)
-			.setName('自動同期の要約を表示')
-			.setDesc('自動同期完了時の要約通知を表示するかどうか')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.syncNoticeSettings.showAutoSyncSummary)
-				.onChange(async (value) => {
-					this.plugin.settings.syncNoticeSettings.showAutoSyncSummary = value;
-					await this.plugin.saveData(this.plugin.settings);
-				}));
-		// エラー通知表示
-		new Setting(containerEl)
-			.setName('エラー通知を表示')
-			.setDesc('同期エラー発生時の通知を表示するかどうか')
-			.addToggle(toggle => toggle
-				.setValue(this.plugin.settings.syncNoticeSettings.showErrors)
-				.onChange(async (value) => {
-					this.plugin.settings.syncNoticeSettings.showErrors = value;
-					await this.plugin.saveData(this.plugin.settings);
-				}));
+        // マスター: 通知を有効化
+        new Setting(containerEl)
+            .setName('通知を有効化')
+            .setDesc('全ての通知のオン/オフを切り替える')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.showNotices)
+                .onChange(async (value) => {
+                    this.plugin.settings.showNotices = value;
+                    await this.plugin.saveData(this.plugin.settings);
+                    refreshDisabled();
+                }));
 
-		// 通知表示最小時間
-		new Setting(containerEl)
-			.setName('通知表示最小時間 (秒)')
-			.setDesc('同期時間がこの値以上の場合のみ通知を表示')
-			.addText(text => {
-				text.inputEl.type = 'number';
-				text.inputEl.min = '0';
-				text.setValue(this.plugin.settings.syncNoticeSettings.minSyncDurationForNotice.toString())
-					.onChange(async (value) => {
-						const num = parseInt(value, 10);
-            if (!isNaN(num)) {
-                this.plugin.settings.syncNoticeSettings.minSyncDurationForNotice = num;
-                await this.plugin.saveData(this.plugin.settings);
-            }
-					});
-			});
+        const noticesEnabled = !!this.plugin.settings.showNotices;
+
+        // 手動同期: 進捗/結果を表示
+        new Setting(containerEl)
+            .setName('手動同期の進捗/結果')
+            .setDesc('手動実行時に進捗と結果を通知する')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.syncNoticeSettings.showManualSyncProgress)
+                .onChange(async (value) => {
+                    this.plugin.settings.syncNoticeSettings.showManualSyncProgress = value;
+                    await this.plugin.saveData(this.plugin.settings);
+                }))
+            .setDisabled(!noticesEnabled);
+
+        // 自動同期: 要約を表示（所要時間しきい値適用）
+        new Setting(containerEl)
+            .setName('自動同期の要約')
+            .setDesc('自動実行が完了した時だけ要約を通知（所要時間しきい値適用）')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.syncNoticeSettings.showAutoSyncSummary)
+                .onChange(async (value) => {
+                    this.plugin.settings.syncNoticeSettings.showAutoSyncSummary = value;
+                    await this.plugin.saveData(this.plugin.settings);
+                }))
+            .setDisabled(!noticesEnabled);
+
+        // しきい値: 自動同期のみに適用
+        new Setting(containerEl)
+            .setName('要約表示の最小所要時間（秒）')
+            .setDesc('自動同期の要約通知は、所要時間がこの秒数以上のときのみ表示')
+            .addText(text => {
+                text.inputEl.type = 'number';
+                text.inputEl.min = '0';
+                text.setValue(this.plugin.settings.syncNoticeSettings.minSyncDurationForNotice.toString())
+                    .onChange(async (value) => {
+                        const num = parseInt(value, 10);
+                        if (!isNaN(num)) {
+                            this.plugin.settings.syncNoticeSettings.minSyncDurationForNotice = num;
+                            await this.plugin.saveData(this.plugin.settings);
+                        }
+                    });
+            })
+            .setDisabled(!noticesEnabled || !this.plugin.settings.syncNoticeSettings.showAutoSyncSummary);
+
+        // エラー: 常に通知（マスターがONのとき）
+        new Setting(containerEl)
+            .setName('エラー通知')
+            .setDesc('同期エラーが発生した場合に通知する')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.syncNoticeSettings.showErrors)
+                .onChange(async (value) => {
+                    this.plugin.settings.syncNoticeSettings.showErrors = value;
+                    await this.plugin.saveData(this.plugin.settings);
+                }))
+            .setDisabled(!noticesEnabled);
 
 		// --- 手動アクション & デバッグセクション ---
 		containerEl.createEl('h3', { text: '手動アクション & デバッグ' });
@@ -505,7 +513,7 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 		// 強制リセットボタン
 		new Setting(containerEl)
 			.setName('Obsidianの状態を強制的にリモートへ反映')
-			.setDesc('🚨【危険】リモートの全イベントを削除し、Obsidianのタスクを再登録します。リモートでの変更は全て失われます。')
+			.setDesc('【危険】リモートの全イベントを削除し、Obsidianのタスクを再登録します。リモートでの変更は全て失われます。')
 			.addButton(button => button
 				.setButtonText('強制的にリモートをリセット')
 				.setIcon('alert-triangle')
@@ -564,80 +572,41 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
                     });
             });
 
+		// --- セキュリティ ---
+		containerEl.createEl('h3', { text: 'セキュリティ' });
+			const mode = (this.plugin as any).getEncryptionModeLabel ? (this.plugin as any).getEncryptionModeLabel() : '難読化 + 永続保存（既定）';
+		new Setting(containerEl)
+			.setName('保存方式')
+			.setDesc(mode);
+
+		new Setting(containerEl)
+			.setName('AESパスフレーズ（任意）')
+			.setDesc('設定すると既定の難読化に加えて AES-GCM で二重に保護する。未設定でも動作。')
+			.addText(text => {
+				text.inputEl.type = 'password';
+				text.setPlaceholder('未設定（任意）')
+					.setValue(this.plugin.settings.rememberPassphrase ? (this.plugin.settings.encryptionPassphrase || '') : '')
+					.onChange(async (value) => {
+						if (this.plugin.settings.rememberPassphrase) {
+							this.plugin.settings.encryptionPassphrase = value || null;
+							await this.plugin.saveData(this.plugin.settings);
+						} else {
+							// @ts-ignore
+							this.plugin.passphraseCache = value || null;
+						}
+					});
+			});
+
 		new Setting(containerEl)
 			.setName('パスフレーズを保存（安全性低下）')
-            .setDesc('ONにするとパスフレーズを設定ファイルに保存し、再起動後も入力不要になる（機密性は低下）。')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.rememberPassphrase || false)
-                .onChange(async (v) => {
-                    this.plugin.settings.rememberPassphrase = v;
-                    if (!v) {
-                        this.plugin.settings.encryptionPassphrase = null; // 保存しない
-                    }
-                    await this.plugin.saveData(this.plugin.settings);
-                    this.display();
+			.setDesc('ONにすると再起動後も入力不要（機密性は下がる）。')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.rememberPassphrase || false)
+				.onChange(async (v) => {
+					this.plugin.settings.rememberPassphrase = v;
+					if (!v) this.plugin.settings.encryptionPassphrase = null;
+					await this.plugin.saveData(this.plugin.settings);
 				}));
 
-		// --- セキュリティ/保存方式 ステータス ---
-		containerEl.createEl('h4', { text: 'セキュリティ/保存方式' });
-        {
-            const status = getSafeStorageStatus();
-            const safeAvail = status.available;
-            const enc = this.plugin.settings.tokensEncrypted || '';
-            const hasEnc = !!enc;
-            const isPassEnc = hasEnc && enc.startsWith('aesgcm:');
-            const remember = !!this.plugin.settings.rememberPassphrase;
-            let mode = '未保存（メモリのみ）';
-            if (hasEnc) {
-                mode = isPassEnc ? `パスフレーズAES-GCM（${remember ? 'パス保存あり' : '一時パス'}）` : 'OS safeStorage';
-            } else if (safeAvail) {
-                mode = '未保存（safeStorage利用可。保存時は自動暗号化）';
-            }
-
-			new Setting(containerEl)
-				.setName('保存方式')
-				.setDesc(mode)
-                .addExtraButton(b => {
-                    b.setIcon(safeAvail ? 'shield' : 'alert-circle')
-                     .setTooltip(safeAvail ? `safeStorage 利用可能 [method=${status.method}]` : `safeStorage 利用不可${status.error ? ' - '+status.error : ''}`);
-                })
-                .addExtraButton(b => {
-                    b.setIcon('refresh-cw')
-                     .setTooltip('状態を再判定')
-                     .onClick(() => this.display());
-                });
-
-			// 現在の動作モード（より明確な表示）
-			const currentMode = (this.plugin as any).getEncryptionModeLabel ? (this.plugin as any).getEncryptionModeLabel() : mode;
-			new Setting(containerEl)
-				.setName('現在の動作')
-				.setDesc(currentMode);
-
-            // safeStorage へ移行ボタン（利用可能かつ未使用時）
-            if (safeAvail && (!hasEnc || isPassEnc)) {
-                new Setting(containerEl)
-                    .setName('保存方式の移行')
-                    .setDesc('現在のトークン保存方式を OS safeStorage へ移行する。')
-                    .addButton(btn => btn
-                        .setButtonText('safeStorage に移行')
-                        .setIcon('refresh-cw')
-                        .setCta()
-                        .onClick(async () => {
-                            await (this.plugin as any).migrateEncryptionToSafeStorage();
-                            this.display();
-                        }));
-            }
-
-			const detail = document.createElement('div');
-			detail.className = 'setting-item-description';
-			detail.style.whiteSpace = 'pre-wrap';
-			detail.textContent = [
-				'- 判定: safeStorage.isEncryptionAvailable() が true なら自動で safeStorage 暗号化/復号。',
-				'- 優先順位: safeStorage →（不可時）パスフレーズAES-GCM →（どちらも不可）メモリのみ。',
-				'- 例外/不可条件: Obsidian Mobile、Linuxで秘密ストア未設定、OS資格情報ストアのロック等。',
-				'- データ移行性: safeStorage の暗号データは端末専用。別PCでは復号不可。移行したい場合はパスフレーズ方式に切替えて保存すること。'
-			].join('\n');
-			containerEl.appendChild(detail);
-		}
-	}
+}
 }
