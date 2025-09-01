@@ -28,6 +28,7 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 	gcalMapper: GCalMapper;
 	gcalApi: GCalApiService;
 	syncLogic: SyncLogic;
+	private passphraseCache: string | null = null;
 	private isSyncing: boolean = false;
 
 	constructor(app: App, manifest: any) {
@@ -143,8 +144,8 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
             if (this.settings.tokensEncrypted && !this.settings.tokens?.refresh_token) {
                 let json: string | null = null;
                 if (this.settings.tokensEncrypted.startsWith('aesgcm:')) {
-                    if (this.settings.encryptionPassphrase) {
-                        json = decryptWithPassphrase(this.settings.tokensEncrypted, this.settings.encryptionPassphrase);
+                    if (this.passphraseCache) {
+                        json = decryptWithPassphrase(this.settings.tokensEncrypted, this.passphraseCache);
                     } else {
                         console.warn('暗号化トークンが存在しますが、パスフレーズが未設定のため復号できません。');
                         new Notice('暗号化されたトークンを復号できません。設定でパスフレーズを入力し、再試行してください。', 10000);
@@ -181,10 +182,10 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
         this.settings.tokens = tokens && tokens.refresh_token ? ({ refresh_token: tokens.refresh_token } as any) : null;
         if (tokens && tokens.refresh_token) {
             if (!isEncryptionAvailable()) {
-                if (this.settings.encryptionPassphrase) {
+                if (this.passphraseCache) {
                     try {
                         const json = JSON.stringify({ refresh_token: tokens.refresh_token });
-                        this.settings.tokensEncrypted = encryptWithPassphrase(json, this.settings.encryptionPassphrase);
+                        this.settings.tokensEncrypted = encryptWithPassphrase(json, this.passphraseCache);
                         await super.saveData({ ...this.settings, tokens: null });
                         return;
                     } catch (e) {

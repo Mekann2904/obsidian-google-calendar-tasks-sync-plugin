@@ -543,15 +543,17 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 
 		// パスフレーズ（安全保存フォールバック用）
 		new Setting(containerEl)
-			.setName('暗号化パスフレーズ（任意）')
-			.setDesc('safeStorage が利用できない環境で、refresh_token をAES-GCMで暗号化保存するためのパスフレーズ。設定するとトークンを永続化できる。')
+			.setName('暗号化パスフレーズ（任意・非保存）')
+			.setDesc('safeStorage が使えない環境での一時的な暗号化鍵。入力はメモリにのみ保持し、ディスクへは保存しない。再起動時は再入力が必要。')
 			.addText(text => {
 				text.inputEl.type = 'password';
-				text.setPlaceholder('未設定（推奨: 任意の強固なパスフレーズ）')
-					.setValue(this.plugin.settings.encryptionPassphrase || '')
-					.onChange(async (value) => {
-						this.plugin.settings.encryptionPassphrase = value || null;
-						await this.plugin.saveData(this.plugin.settings);
+				text.setPlaceholder('未設定（任意）')
+					.setValue('')
+					.onChange((value) => {
+						// 非保存: メモリにのみ保持
+						// @ts-ignore
+						this.plugin.passphraseCache = value || null;
+						new Notice('パスフレーズを一時適用しました（保存されません）。', 3000);
 					});
 			});
 	}
