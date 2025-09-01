@@ -11,6 +11,8 @@ export class AuthService {
     private plugin: GoogleCalendarTasksSyncPlugin;
     private activeOAuthState: string | null = null;
     private activePkceVerifier: string | null = null;
+    private activeOAuthStateIssuedAt: number | null = null;
+    private lastPersistAt = 0;
 
     constructor(plugin: GoogleCalendarTasksSyncPlugin) {
         this.plugin = plugin;
@@ -37,11 +39,12 @@ export class AuthService {
     reconfigureOAuthClient(): void {
         const redirectUri = this.getRedirectUri();
         try {
+            const hasSecret = !!this.plugin.settings.clientSecret;
             this.plugin.oauth2Client = new OAuth2Client({
                 clientId: this.plugin.settings.clientId,
-                clientSecret: this.plugin.settings.clientSecret,
+                ...(hasSecret ? { clientSecret: this.plugin.settings.clientSecret } : {}),
                 redirectUri: redirectUri,
-            });
+            } as any);
         } catch (e) {
             console.error("OAuth2Client インスタンスの作成中にエラー:", e);
             this.plugin.oauth2Client = null; // 作成に失敗した場合は null を割り当てる
@@ -84,7 +87,13 @@ export class AuthService {
             }
 
             try {
+                 const now = Date.now();
+                 if (now - this.lastPersistAt < 3000 && !newRefreshToken) {
+                    // 3秒以内の重複保存（refresh_token 変化なし）はスキップ
+                    return;
+                 }
                  await this.plugin.persistTokens(updatedTokens);
+                 this.lastPersistAt = now;
                  console.log("更新されたトークンは正常に保存されました（暗号化）。");
                  // 再初期化は不要（oauth2Client を calendar に渡しているため自動で反映）
             } catch (saveError) {
@@ -119,9 +128,9 @@ export class AuthService {
      * ブラウザウィンドウを開き、ユーザーに承認を求めます。
      */
     authenticate(): void {
-        // クライアントIDとシークレットが設定されているか確認
-        if (!this.plugin.settings.clientId || !this.plugin.settings.clientSecret) {
-            new Notice('認証失敗: クライアント ID とクライアントシークレットを設定する必要があります。', 7000);
+        // クライアントIDのみ必須（デスクトップ/ループバックでは secret 省略可）
+        if (!this.plugin.settings.clientId) {
+            new Notice('認証失敗: クライアント ID を設定する必要があります。', 7000);
             return;
         }
         // OAuthクライアントが最新の設定を使用するように再設定
@@ -145,6 +154,7 @@ export class AuthService {
         try {
             // CSRF対策のためのランダムなstate値を生成
             this.activeOAuthState = randomBytes(16).toString('hex');
+            this.activeOAuthStateIssuedAt = Date.now();
             console.log("生成された OAuth state:", this.activeOAuthState);
 
             // 認証URLを生成
@@ -153,10 +163,13 @@ export class AuthService {
             this.activePkceVerifier = codeVerifier;
             const codeChallenge = this.pkceChallenge(codeVerifier);
 
+            const needsRefreshToken = !this.plugin.settings.tokens?.refresh_token;
             const authUrl = this.plugin.oauth2Client.generateAuthUrl({
                 access_type: 'offline',
+                include_granted_scopes: true,
+                prompt: needsRefreshToken ? 'consent' : undefined,
                 scope: ['https://www.googleapis.com/auth/calendar.events'],
-                state: this.activeOAuthState,
+                state: this.activeOAuthState!,
                 redirect_uri: currentRedirectUri,
                 code_challenge_method: 'S256' as any,
                 code_challenge: codeChallenge as any,
@@ -186,20 +199,26 @@ export class AuthService {
     async handleOAuthCallback(params: Record<string, string>): Promise<void> {
         const { code, error, state } = params;
         const currentActiveState = this.activeOAuthState; // クリアされる前にローカルに保存
+        const issuedAt = this.activeOAuthStateIssuedAt;
+        const MAX_STATE_AGE_MS = 10 * 60 * 1000; // 10分
 
         // 1. State パラメータの検証 (CSRF 保護)
         if (!currentActiveState) {
             console.warn("アクティブな OAuth state が見つかりません。コールバックを無視します。重複または予期しない可能性があります。");
             throw new Error('アクティブな認証試行が見つかりません。Obsidian の設定から再度認証を開始してください。');
         }
+        if (!issuedAt || (Date.now() - issuedAt) > MAX_STATE_AGE_MS) {
+            this.activeOAuthState = null; this.activeOAuthStateIssuedAt = null;
+            throw new Error('認証フローがタイムアウトしました。再度お試しください。');
+        }
         if (!state || state !== currentActiveState) {
-            this.activeOAuthState = null; // 無効な state を直ちにクリア
+            this.activeOAuthState = null; this.activeOAuthStateIssuedAt = null; // 無効な state を直ちにクリア
             console.error('OAuth エラー: 無効な state パラメータを受信しました。', '受信:', state, '期待値:', currentActiveState);
             new Notice('認証失敗: セキュリティトークンの不一致 (無効な state)。再度認証を試みてください。', 10000);
             throw new Error('無効な state パラメータ。認証フローが侵害されたか、タイムアウトした可能性があります。');
         }
         console.log("OAuth state の検証に成功しました。");
-        this.activeOAuthState = null; // 検証成功後に有効な state をクリア
+        this.activeOAuthState = null; this.activeOAuthStateIssuedAt = null; // 検証成功後にクリア
 
         // 2. Google からのエラーを確認
         if (error) {
@@ -224,11 +243,12 @@ export class AuthService {
             new Notice('認証コードを Google トークンと交換中...', 4000);
             // 現在の設定を使用して一時的なクライアントインスタンスを作成
             const redirectUriForExchange = this.getRedirectUri();
+            const hasSecret = !!this.plugin.settings.clientSecret;
             const tokenExchangeClient = new OAuth2Client({
                 clientId: this.plugin.settings.clientId,
-                clientSecret: this.plugin.settings.clientSecret,
+                ...(hasSecret ? { clientSecret: this.plugin.settings.clientSecret } : {}),
                 redirectUri: redirectUriForExchange,
-            });
+            } as any);
 
             console.log(`リダイレクト URI を使用してトークン交換を試行中: ${redirectUriForExchange}`);
             const tokenParams: any = { code, codeVerifier: this.activePkceVerifier, redirect_uri: redirectUriForExchange };
@@ -273,8 +293,6 @@ export class AuthService {
             this.plugin.setupAutoSync(); // 自動同期を再設定
             this.attachTokenListener(); // リスナーを再アタッチ
 
-            // PKCE verifier は使用後にクリア
-            this.activePkceVerifier = null;
             new Notice('Google 認証に成功しました！', 6000);
 
         } catch (err: any) {
@@ -298,6 +316,10 @@ export class AuthService {
             }
             new Notice(errorMessage + ' Obsidian コンソールで詳細を確認してください。', 15000);
             throw new Error(errorMessage);
+        } finally {
+            this.activePkceVerifier = null;
+            this.activeOAuthState = null;
+            this.activeOAuthStateIssuedAt = null;
         }
     }
 
@@ -339,10 +361,10 @@ export class AuthService {
             return false;
         }
 
-        // クレデンシャルを適用し、getRequestHeaders() で更新をトリガー（Authorization を返す）
+        // クレデンシャルを適用し、getAccessToken() で更新をトリガー
         try {
             if (this.plugin.settings.tokens) client.setCredentials(this.plugin.settings.tokens);
-            await client.getRequestHeaders(); // 期限切れなら自動更新
+            await client.getAccessToken(); // 期限切れなら自動リフレッシュ
             return true;
         } catch (error: any) {
             console.error("アクセストークン取得/更新に失敗:", error);
@@ -357,6 +379,22 @@ export class AuthService {
             }
             new Notice(noticeMsg, 15000);
             return false;
+        }
+    }
+
+    /** 完全サインアウト: トークン取り消しとクリア */
+    async revokeAndClear(): Promise<void> {
+        try {
+            const token = this.plugin.oauth2Client?.credentials?.access_token || this.plugin.settings.tokens?.access_token;
+            if (token && this.plugin.oauth2Client) {
+                await this.plugin.oauth2Client.revokeToken(token);
+            }
+        } catch (e) {
+            console.warn('トークン取り消しに失敗:', e);
+        } finally {
+            await this.plugin.persistTokens(null);
+            this.plugin.clearAutoSync();
+            this.initializeCalendarApi();
         }
     }
 
