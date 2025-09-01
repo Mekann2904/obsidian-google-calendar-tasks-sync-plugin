@@ -1,5 +1,5 @@
 import { App, PluginSettingTab, Setting, Notice, TextComponent, ExtraButtonComponent } from 'obsidian';
-import { isEncryptionAvailable, getSafeStorageStatus } from './security';
+// セキュリティ診断は簡素化のため未使用
 import moment from 'moment';
 import { GoogleCalendarTasksSyncSettings } from './types';
 import GoogleCalendarTasksSyncPlugin from './main'; // main.ts からインポート
@@ -37,6 +37,7 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 	},
 	interBatchDelay: 500, // バッチリクエスト間のデフォルト遅延（ミリ秒）
 	batchSize: 100, // 1バッチあたりの最大リクエスト数（仕様上限は1000）
+	devLogging: false,
 };
 
 
@@ -608,5 +609,19 @@ new Setting(containerEl)
 					await this.plugin.saveData(this.plugin.settings);
 				}));
 
+
+
+		// --- デバッグ ---
+		containerEl.createEl('h3', { text: 'デバッグ' });
+		new Setting(containerEl)
+			.setName('デベロッパーモード（詳細ログ）')
+			.setDesc('コンソールに詳細ログを出力（既定OFF）。エラーは常に出力。')
+			.addToggle(toggle => toggle
+				.setValue(!!this.plugin.settings.devLogging)
+				.onChange(async (v) => {
+					this.plugin.settings.devLogging = v;
+					await this.plugin.saveData(this.plugin.settings);
+					try { const { setDevLogging } = await import('./logger'); setDevLogging(!!v); } catch {}
+				}));
 }
 }

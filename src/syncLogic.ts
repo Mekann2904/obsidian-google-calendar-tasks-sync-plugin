@@ -4,7 +4,6 @@ import { rrulestr } from 'rrule';
 import { calendar_v3 } from 'googleapis';
 import GoogleCalendarTasksSyncPlugin from './main';
 import { ObsidianTask, GoogleCalendarEventInput, BatchRequestItem, BatchResponseItem, BatchResult, ErrorLog, GoogleCalendarTasksSyncSettings, SyncMetrics } from './types';
-import { createHash } from 'crypto';
 import { BatchProcessor } from './batchProcessor';
 import moment from 'moment';
 import { GCalMapper } from './gcalMapper';
@@ -42,7 +41,7 @@ export class SyncLogic {
 
         // --- FIX: ローカルインスタンスの生成 ---
         const gcalMapper = new GCalMapper(this.plugin.app, settings);
-        const batchProcessor = new BatchProcessor(settings.calendarId, settings);
+        const batchProcessor = new BatchProcessor(settings);
 
         // FIX: 強制同期の場合は lastSyncTime をクリアしてフル同期を実行
         if (force) {
@@ -690,7 +689,6 @@ export class SyncLogic {
             statusCounts: {},
         };
 
-        const isTransient = (status: number) => [403, 429, 500, 502, 503, 504].includes(status);
         const treatAsSkipped = (req: BatchRequestItem, status: number) => {
             if (req.operationType === 'insert' && status === 409) return true; // 既存IDでの重複作成
             if ((req.operationType === 'delete' || req.operationType === 'update' || req.operationType === 'patch') && (status === 404 || status === 410 || status === 412)) return true; // 412: ETag競合
@@ -801,10 +799,7 @@ export class SyncLogic {
     }
 
     // 安定イベントIDを生成（Googleの制約: 英小文字/数字/ハイフン/アンダースコア, 5-1024文字）
-    private generateStableEventId(obsidianTaskId: string): string {
-        const sha1 = createHash('sha1').update(`obsidian-task:${obsidianTaskId}`).digest('hex');
-        return `obs-${sha1}`; // 44文字程度、衝突実質無視可能
-    }
+    // generateStableEventId は未使用のため削除
 
     private handleDeleteError(request: BatchRequestItem, status: number): void {
         const errorType = status === 404 ? 'permanent' : 'transient';
@@ -1169,7 +1164,7 @@ export class SyncLogic {
             return;
         }
 
-        const bp = new BatchProcessor(this.plugin.settings.calendarId, this.plugin.settings);
+        const bp = new BatchProcessor(this.plugin.settings);
         const result = await this.executeBatchesWithRetry(batch, bp);
         await this.plugin.saveData(this.plugin.settings); // 更新されたtaskMapを保存
         new Notice(`重複整理完了: 削除 ${result.deleted}, スキップ ${result.skipped}, エラー ${result.errors}`, 8000);

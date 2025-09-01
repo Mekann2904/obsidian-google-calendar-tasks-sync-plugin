@@ -31,20 +31,19 @@ export class TaskParser {
                 // フェンスドコードブロック (``` や ~~~) 内は同期対象外
                 let inFence = false;
                 let fenceChar: '`' | '~' | '' = '';
-                let fenceLen = 0;
                 const fenceOpenRe = /^\s*(`{3,}|~{3,})/;
                 lines.forEach((line, index) => {
                     const open = line.match(fenceOpenRe);
                     if (open) {
                         const marker = open[1];
                         const ch = marker[0] as '`' | '~';
-                        const len = marker.length;
+                        // 長さは現行ロジックでは未使用
                         if (!inFence) {
-                            inFence = true; fenceChar = ch; fenceLen = len; return; // フェンス開始行はスキップ
+                            inFence = true; fenceChar = ch; return; // フェンス開始行はスキップ
                         }
                         // 既にフェンス中の場合でも、同種マーカーが来れば終了とみなす
                         if (inFence && fenceChar === ch) {
-                            inFence = false; fenceChar = ''; fenceLen = 0; return; // 終了行もスキップ
+                            inFence = false; fenceChar = ''; return; // 終了行もスキップ
                         }
                     }
 

@@ -1,5 +1,4 @@
 import { Notice } from 'obsidian';
-import { calendar_v3 } from 'googleapis';
 import { BatchRequestItem, BatchResponseItem, GoogleCalendarTasksSyncSettings } from './types';
 
 export class BatchProcessor {
@@ -7,7 +6,7 @@ export class BatchProcessor {
     // See: https://developers.google.com/calendar/api/guides/batch
     private readonly BATCH_SIZE = 50;
 
-    constructor(private calendarId: string, private settings: GoogleCalendarTasksSyncSettings) {}
+    constructor(private settings: GoogleCalendarTasksSyncSettings) {}
 
     async executeBatches(
         batchRequests: BatchRequestItem[],

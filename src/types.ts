@@ -45,6 +45,7 @@ export interface GoogleCalendarTasksSyncSettings {
     encryptionPassphrase?: string | null; // パスフレーズ保存（任意）
     rememberPassphrase?: boolean; // パスフレーズを設定ファイルに保存（既定false）
     obfuscationSalt?: string | null; // 難読化用のソルト（インストールごとにランダム）
+    devLogging?: boolean; // デベロッパーモード（詳細ログ）
 	calendarId: string; // 同期対象の Google Calendar ID (通常 'primary' または特定のカレンダーID)
 	syncIntervalMinutes: number; // 自動同期の間隔 (分単位)
 	autoSync: boolean; // 自動同期を有効にするか

@@ -1,73 +1,9 @@
 // security.ts
-// Electron safeStorage を利用したシンプルな暗号化/復号ユーティリティ
-
-export function isEncryptionAvailable(): boolean {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { safeStorage } = require('electron');
-    if (!safeStorage) return false;
-    if (typeof safeStorage.isEncryptionAvailable === 'function') {
-      if (safeStorage.isEncryptionAvailable()) return true;
-    }
-    // フォールバック: 実際に暗号→復号を試して可否を判定
-    try {
-      const probe = safeStorage.encryptString('probe');
-      const back = safeStorage.decryptString(probe);
-      return back === 'probe';
-    } catch {
-      return false;
-    }
-  } catch {
-    return false;
-  }
-}
-
-export function getSafeStorageStatus(): { available: boolean; method?: 'isEncryptionAvailable'|'probe'|'none'; error?: string } {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { safeStorage } = require('electron');
-    if (!safeStorage) return { available: false, method: 'none', error: 'electron.safeStorage 未定義' };
-    if (typeof safeStorage.isEncryptionAvailable === 'function') {
-      try {
-        const ok = safeStorage.isEncryptionAvailable();
-        if (ok) return { available: true, method: 'isEncryptionAvailable' };
-      } catch (e: any) {
-        // 続行して probe にフォールバック
-      }
-    }
-    try {
-      const buf = safeStorage.encryptString('probe');
-      const s = safeStorage.decryptString(buf);
-      return { available: s === 'probe', method: 'probe' };
-    } catch (e: any) {
-      return { available: false, method: 'probe', error: String(e?.message || e) };
-    }
-  } catch (e: any) {
-    return { available: false, method: 'none', error: String(e?.message || e) };
-  }
-}
-
-export function encryptToBase64(plain: string): string {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { safeStorage } = require('electron');
-  if (!safeStorage || !safeStorage.encryptString) throw new Error('safeStorage が利用できません');
-  const buf: Buffer = safeStorage.encryptString(plain);
-  return buf.toString('base64');
-}
-
-export function decryptFromBase64(b64: string): string {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { safeStorage } = require('electron');
-  if (!safeStorage || !safeStorage.decryptString) throw new Error('safeStorage が利用できません');
-  const buf = Buffer.from(b64, 'base64');
-  return safeStorage.decryptString(buf);
-}
-
-// ------------------ パスフレーズAES-GCMフォールバック ------------------
-import { randomBytes, createCipheriv, createDecipheriv, pbkdf2Sync } from 'crypto';
-import { createHash, createHmac } from 'crypto';
+// 暗号化/難読化ユーティリティ（safeStorage は未使用）
+import { createHash, createHmac, randomBytes, createCipheriv, createDecipheriv, pbkdf2Sync } from 'crypto';
 import os from 'os';
 
+// ------------------ パスフレーズAES-GCM ------------------
 export function encryptWithPassphrase(plain: string, passphrase: string): string {
   const salt = randomBytes(16);
   const iv = randomBytes(12);
@@ -75,16 +11,15 @@ export function encryptWithPassphrase(plain: string, passphrase: string): string
   const cipher = createCipheriv('aes-256-gcm', key, iv);
   const enc = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
   const tag = cipher.getAuthTag();
-  const packed = Buffer.concat([salt, iv, tag, enc]).toString('base64');
-  return `aesgcm:${packed}`;
+  return 'aesgcm:' + Buffer.concat([salt, iv, tag, enc]).toString('base64');
 }
 
 export function decryptWithPassphrase(packed: string, passphrase: string): string {
   if (!packed.startsWith('aesgcm:')) throw new Error('Invalid encrypted format');
   const buf = Buffer.from(packed.slice(7), 'base64');
-  const salt = buf.subarray(0, 16);
-  const iv = buf.subarray(16, 28);
-  const tag = buf.subarray(28, 44);
+  const salt = buf.subarray(0,16);
+  const iv = buf.subarray(16,28);
+  const tag = buf.subarray(28,44);
   const data = buf.subarray(44);
   const key = pbkdf2Sync(passphrase, salt, 120_000, 32, 'sha256');
   const decipher = createDecipheriv('aes-256-gcm', key, iv);
@@ -93,7 +28,7 @@ export function decryptWithPassphrase(packed: string, passphrase: string): strin
   return dec.toString('utf8');
 }
 
-// ------------------ 難読化 ------------------
+// ------------------ 難読化（obf1） ------------------
 // 形式: "obf1:" + base64( nonce(12) | mac(32) | xored )
 // key = sha256( base64salt || APP_ID || username || hostname )
 // MAC = HMAC-SHA256(key, "obf1|" + nonce + xored)

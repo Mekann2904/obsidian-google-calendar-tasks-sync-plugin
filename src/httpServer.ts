@@ -3,7 +3,6 @@ import * as http from 'http';
 import { URL } from 'url';
 import * as net from 'net';
 import GoogleCalendarTasksSyncPlugin from './main'; // main.ts からインポート
-import { DEFAULT_SETTINGS } from './settings';
 
 export class HttpServerManager {
     private plugin: GoogleCalendarTasksSyncPlugin;

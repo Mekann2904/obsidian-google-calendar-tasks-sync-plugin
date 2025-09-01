@@ -1,12 +1,11 @@
-import { App, Notice, Plugin, TFile } from 'obsidian';
+import { App, Notice, Plugin } from 'obsidian';
 import moment from 'moment';
 import { OAuth2Client } from 'google-auth-library';
 import { calendar_v3 } from 'googleapis';
-import * as http from 'http';
 import * as net from 'net';
 
 // モジュール化されたコンポーネントをインポート
-import { ObsidianTask, GoogleCalendarTasksSyncSettings } from './types';
+import { GoogleCalendarTasksSyncSettings } from './types';
 import { DEFAULT_SETTINGS, GoogleCalendarSyncSettingTab } from './settings';
 import { AuthService } from './auth';
 import { HttpServerManager } from './httpServer';
@@ -15,7 +14,8 @@ import { GCalMapper } from './gcalMapper';
 import { GCalApiService } from './gcalApi';
 import { SyncLogic } from './syncLogic';
 import { validateMoment } from './utils'; // ユーティリティ関数をインポート
-import { isEncryptionAvailable, encryptToBase64, decryptFromBase64, encryptWithPassphrase, decryptWithPassphrase, obfuscateToBase64, deobfuscateFromBase64, deobfuscateLegacyFromBase64 } from './security';
+import { encryptWithPassphrase, decryptWithPassphrase, obfuscateToBase64, deobfuscateFromBase64, deobfuscateLegacyFromBase64 } from './security';
+import { setDevLogging } from './logger';
 
 export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 	settings: GoogleCalendarTasksSyncSettings;
@@ -29,7 +29,6 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 	gcalApi: GCalApiService;
 	syncLogic: SyncLogic;
 	private passphraseCache: string | null = null;
-	private encryptionMode: 'safeStorage' | 'passphrase' | 'memory' = 'memory';
 	private isSyncing: boolean = false;
 
 	constructor(app: App, manifest: any) {
@@ -47,6 +46,7 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 	async onload() {
 		console.log('Google Calendar Sync プラグインをロード中');
 		await this.loadSettings();
+        setDevLogging(!!this.settings.devLogging);
 
         // 設定がロードされた後に、設定に依存するクラスをインスタンス化
         this.syncLogic = new SyncLogic(this);
@@ -216,47 +216,6 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
         }
     }
 
-    // 保存方式を safeStorage に移行
-    async migrateEncryptionToSafeStorage(): Promise<void> {
-        if (!isEncryptionAvailable()) {
-            new Notice('safeStorage が利用できないため移行できません。', 6000);
-            return;
-        }
-        try {
-            let refreshToken: string | null = this.settings.tokens?.refresh_token || null;
-            if (!refreshToken && this.settings.tokensEncrypted) {
-                if (this.settings.tokensEncrypted.startsWith('aesgcm:')) {
-                    const pass = this.passphraseCache || this.settings.encryptionPassphrase || null;
-                    if (!pass) {
-                        new Notice('パスフレーズが未入力のため復号できません。設定で入力してください。', 7000);
-                        return;
-                    }
-                    const inner = decryptWithPassphrase(this.settings.tokensEncrypted, pass);
-                    const json = deobfuscateFromBase64(inner, this.settings.obfuscationSalt!);
-                    refreshToken = (JSON.parse(json)?.refresh_token) || null;
-                } else {
-                    // 現行既定: 難読化
-                    const json = deobfuscateFromBase64(this.settings.tokensEncrypted, this.settings.obfuscationSalt!);
-                    refreshToken = (JSON.parse(json)?.refresh_token) || null;
-                }
-            }
-            if (!refreshToken) {
-                new Notice('refresh_token が見つかりません。設定から再認証してください。', 8000);
-                return;
-            }
-            await this.persistTokens({ refresh_token: refreshToken });
-            // パスフレーズ保存は解除（任意）
-            this.settings.rememberPassphrase = false;
-            this.settings.encryptionPassphrase = null;
-            this.passphraseCache = null;
-            await this.saveData(this.settings);
-            new Notice('保存方式を safeStorage に移行しました。', 5000);
-            this.refreshSettingsTab();
-        } catch (e) {
-            console.error('safeStorage への移行に失敗:', e);
-            new Notice('safeStorage への移行に失敗しました。コンソールを確認してください。', 8000);
-        }
-    }
 
     // 現在の暗号化/保存モードを文字列で返す
     getEncryptionModeLabel(): string {

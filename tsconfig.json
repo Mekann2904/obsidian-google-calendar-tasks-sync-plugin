@@ -12,6 +12,8 @@
     "isolatedModules": true,
     "strictNullChecks": true,
     "esModuleInterop": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "allowSyntheticDefaultImports": true,
     "lib": [
       "DOM",
