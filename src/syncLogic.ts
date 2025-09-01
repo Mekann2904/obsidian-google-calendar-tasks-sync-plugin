@@ -25,8 +25,8 @@ export class SyncLogic {
      */
     private errorLogs: ErrorLog[];
     private retryCount = 0;
-    private readonly MAX_RETRIES = 3;
-    private readonly RETRY_DELAY_MS = 1000;
+    private readonly MAX_RETRIES = 4; // 再試行上限（指数バックオフ＋ジッタ）
+    private readonly BASE_BACKOFF_MS = 400; // 初期バックオフ
 
     async runSync(settings: GoogleCalendarTasksSyncSettings, options: { force?: boolean } = {}): Promise<void> {
         const { force = false } = options;
@@ -706,7 +706,9 @@ export class SyncLogic {
             this.retryCount = attempt - 1;
             metrics.attempts = attempt; // 最終回数で更新
 
-            for (let i = 0; i < pending.length; i += 50) {
+            const batchSize = Math.min(this.plugin.settings.batchSize ?? 100, 1000);
+            // 公式上限は1000。各パートは個別リクエストとしてカウントされ、順序保証はない。
+            for (let i = 0; i < pending.length; i += batchSize) {
                 const windowIdx = pending.slice(i, i + 50);
                 const subReq = windowIdx.map(idx => batchRequests[idx]);
                 const start = performance.now();
@@ -731,13 +733,17 @@ export class SyncLogic {
                         return;
                     }
 
+                    // 409/410/404/412 などの恒久的/スキップ対象
                     if (treatAsSkipped(req, res.status)) {
                         finalResults[origIdx] = res; // スキップとして記録
                         skipped++;
                         return;
                     }
 
-                    if (isTransient(res.status) && attempt <= this.MAX_RETRIES) {
+                    // 再試行条件（429, 403: rateLimitExceeded系, 5xx）
+                    const reason = (res.body?.error?.errors?.[0]?.reason) || (res.body?.error?.status) || '';
+                    const shouldRetry = this.shouldRetry(res.status, String(reason));
+                    if (shouldRetry && attempt <= this.MAX_RETRIES) {
                         // 次のラウンドで再送（finalResults は未確定のまま）
                         return;
                     }
@@ -748,9 +754,11 @@ export class SyncLogic {
                 });
 
                 // レート制限回避のためのインターバッチ遅延
-                if (i + 50 < pending.length && this.plugin.settings.interBatchDelay > 0) {
-                    metrics.totalWaitMs += this.plugin.settings.interBatchDelay;
-                    await new Promise(resolve => setTimeout(resolve, this.plugin.settings.interBatchDelay));
+                if (i + batchSize < pending.length && (this.plugin.settings.interBatchDelay ?? 0) > 0) {
+                    const base = this.plugin.settings.interBatchDelay;
+                    const jittered = Math.floor(base * (Math.random() * 0.5 + 0.75)); // ±25% ジッタ
+                    metrics.totalWaitMs += jittered;
+                    await new Promise(resolve => setTimeout(resolve, jittered));
                 }
             }
 
@@ -770,13 +778,26 @@ export class SyncLogic {
                 break;
             }
 
-            const delay = this.RETRY_DELAY_MS * Math.pow(2, attempt) + Math.floor(Math.random() * 250);
+            const delay = this.backoffDelayMs(attempt);
             metrics.totalWaitMs += delay;
             await new Promise(resolve => setTimeout(resolve, delay));
             pending = nextPending;
         }
 
         return { results: finalResults, created, updated, deleted, errors, skipped, metrics };
+    }
+
+    private shouldRetry(status: number, reason: string): boolean {
+        if (status === 429) return true;
+        if (status === 403 && /(rateLimitExceeded|userRateLimitExceeded)/i.test(reason)) return true;
+        if (status === 500 || status === 502 || status === 503 || status === 504) return true;
+        return false;
+    }
+
+    private backoffDelayMs(attempt: number, cap = 20_000): number {
+        const exp = Math.min(cap, this.BASE_BACKOFF_MS * Math.pow(2, attempt));
+        const jitter = exp * (Math.random() * 0.5 + 0.75); // 0.75x〜1.25x
+        return Math.floor(jitter);
     }
 
     // 安定イベントIDを生成（Googleの制約: 英小文字/数字/ハイフン/アンダースコア, 5-1024文字）

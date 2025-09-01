@@ -32,6 +32,7 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 		minSyncDurationForNotice: 10, // 通知を表示する最小同期時間（秒）
 	},
 	interBatchDelay: 500, // バッチリクエスト間のデフォルト遅延（ミリ秒）
+	batchSize: 100, // 1バッチあたりの最大リクエスト数（仕様上限は1000）
 };
 
 
@@ -519,5 +520,23 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 			text: `キャッシュ内で ${taskCount} 件のタスクのリンクを追跡中。`,
 			cls: 'setting-item-description'
 		});
+
+		// バッチサイズ（最大1000）
+		new Setting(containerEl)
+			.setName('バッチサイズ（最大1000）')
+			.setDesc('1回のバッチに含めるリクエスト数。各パートは個別リクエストとしてカウントされる。実運用は50〜200程度を推奨。')
+			.addText(text => {
+				text.inputEl.type = 'number';
+				text.inputEl.min = '1';
+				text.inputEl.max = '1000';
+				text.setValue(String(this.plugin.settings.batchSize ?? DEFAULT_SETTINGS.batchSize))
+					.onChange(async (value) => {
+						let n = parseInt(value, 10);
+						if (isNaN(n) || n < 1) n = 1;
+						if (n > 1000) n = 1000;
+						this.plugin.settings.batchSize = n;
+						await this.plugin.saveData(this.plugin.settings);
+					});
+			});
 	}
 }

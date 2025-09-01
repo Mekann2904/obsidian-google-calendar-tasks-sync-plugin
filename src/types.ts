@@ -60,6 +60,7 @@ export interface GoogleCalendarTasksSyncSettings {
 		minSyncDurationForNotice: number; // 通知を表示する最小同期時間（秒）
 	};
 	interBatchDelay: number; // バッチリクエスト間の遅延（ミリ秒）
+	batchSize?: number; // バッチ1回あたりの最大リクエスト数（最大1000、課金/レートはアイテム数で加算）
 	recentErrors?: ErrorLog[]; // 最近のエラーサンプル（診断用）
 	useSyncToken?: boolean; // 可能な場合、syncToken による増分取得を使用
 }
@@ -107,7 +108,7 @@ export interface ErrorLog {
 
 // 同期メトリクス
 export interface SyncMetrics {
-    sentSubBatches: number;      // 送信したサブバッチ数（最大50件単位）
+    sentSubBatches: number;      // 送信したサブバッチ数（最大1000件/バッチ。各パートは個別リクエストとしてカウント）
     attempts: number;            // 再送を含む試行回数
     totalWaitMs: number;         // バックオフ + インターバッチ待機の合計
     batchLatenciesMs: number[];  // 各サブバッチの往復レイテンシ
