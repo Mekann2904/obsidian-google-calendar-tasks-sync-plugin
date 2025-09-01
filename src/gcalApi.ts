@@ -53,6 +53,7 @@ export class GCalApiService {
             quotaUser: (requestParams as any).quotaUser || '',
         };
         const savedSig = (this.plugin as any).settings?.listFilterSignature as typeof sig | undefined;
+        let signatureReset = false;
         // 先に calendarId 変更を検出してクリーンリセット（冪等）
         const prevSig = savedSig;
         if (prevSig && prevSig.calendarId !== sig.calendarId) {
@@ -62,17 +63,18 @@ export class GCalApiService {
             try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
             delete (requestParams as any).syncToken;
             requestParams.showDeleted = false;
+            signatureReset = true;
         }
 
         if (!trySyncToken && !savedSig) {
             (this.plugin as any).settings.listFilterSignature = sig;
             try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
-        } else if (trySyncToken && savedSig) {
+        } else if (!signatureReset && trySyncToken && savedSig) {
             const same = (
                 savedSig.calendarId === sig.calendarId &&
                 savedSig.singleEvents === sig.singleEvents &&
                 savedSig.fields === sig.fields &&
-                (savedSig as any).quotaUser === sig.quotaUser &&
+                ((savedSig as any).quotaUser ?? '') === (sig.quotaUser ?? '') &&
                 JSON.stringify(savedSig.privateExtendedProperty) === JSON.stringify(sig.privateExtendedProperty)
             );
             if (!same) {
@@ -88,7 +90,7 @@ export class GCalApiService {
                 requestParams.showDeleted = false;
                 console.warn('切替後状態', { after: { hasSync: false, showDeleted: requestParams.showDeleted } });
             }
-        } else if (trySyncToken && !savedSig) {
+        } else if (!signatureReset && trySyncToken && !savedSig) {
             // アップグレード導入等で signature 不在のケースを救済
             console.warn('listFilterSignature が存在しません。現在の条件をバックフィル保存します。', sig);
             (this.plugin as any).settings.listFilterSignature = sig;
@@ -200,7 +202,13 @@ export class GCalApiService {
                 if (transient || status === 429 || status >= 500 || shouldRetry403 || isResourceExhausted) {
                     const base = Math.min(800 * (2 ** i), 4000);
                     const jitter = Math.floor(Math.random() * 200);
-                    const delay = base + jitter;
+                    let delay = base + jitter;
+                    const ra = isGaxiosError(e) ? ((e.response?.headers?.['retry-after'] as any) || (e.response?.headers as any)?.['Retry-After']) as (string | undefined) : undefined;
+                    if (ra) {
+                        const secs = /^\d+$/.test(ra) ? parseInt(ra, 10)
+                            : (!Number.isNaN(Date.parse(ra)) ? Math.max(0, Math.ceil((Date.parse(ra) - Date.now()) / 1000)) : 0);
+                        if (secs > 0) delay = Math.max(delay, secs * 1000);
+                    }
                     const msg = (respErr as any)?.message || '';
                     console.warn(`events.list ${status}${reason ? ` (${reason})` : ''}${isResourceExhausted ? ' (RESOURCE_EXHAUSTED)' : ''}${msg ? `: ${msg}` : ''}. retry in ${delay}ms...`);
                     await new Promise(r => setTimeout(r, delay));
@@ -318,7 +326,13 @@ export class GCalApiService {
                     if (shouldRetry) {
                         const base = Math.min(1600 * (2 ** i), 8000);
                         const jitter = Math.floor(Math.random() * 400);
-                        const delay = base + jitter;
+                        let delay = base + jitter;
+                        const ra = (res.headers['retry-after'] as string) || (res.headers['Retry-After'] as string);
+                        if (ra) {
+                            const secs = /^\d+$/.test(ra) ? parseInt(ra, 10)
+                                : (!Number.isNaN(Date.parse(ra)) ? Math.max(0, Math.ceil((Date.parse(ra) - Date.now()) / 1000)) : 0);
+                            if (secs > 0) delay = Math.max(delay, secs * 1000);
+                        }
                         console.warn(`Batch top-level ${res.status}${reason ? ` (${reason})` : ''}. retry in ${delay}ms...`);
                         await new Promise(r => setTimeout(r, delay));
                         continue;
