@@ -33,8 +33,9 @@ export class GCalApiService {
 
         // [重要] 同一条件原則: 初回フル取得と同一の検索条件を維持する。
         // 但し、syncToken 使用時は showDeleted を有効化し、削除（cancelled）イベントを確実に取得する。
-        const requestParams: calendar_v3.Params$Resource$Events$List = {
+        const requestParams: calendar_v3.Params$Resource$Events$List & { quotaUser?: string } = {
             calendarId: settings.calendarId,
+            ...(settings as any).quotaUser ? { quotaUser: (settings as any).quotaUser } : {},
             privateExtendedProperty: ["isGcalSync=true", "appId=obsidian-gcal-tasks"], // 初回と増分で同一条件を維持（自プラグイン生成に限定）
             showDeleted: trySyncToken ? true : false, // 増分時は true（仕様順守）。フル取得時は false。
             maxResults: 2500, // ページング削減（上限 2500）
@@ -163,15 +164,18 @@ export class GCalApiService {
             } catch (e: any) {
                 lastError = e;
                 const status = isGaxiosError(e) ? (e.response?.status ?? 0) : 0;
-                const reason = isGaxiosError(e) ? (e.response?.data?.error?.errors?.[0]?.reason ?? '') : '';
+                const respErr = isGaxiosError(e) ? e.response?.data?.error : undefined;
+                const reason  = respErr?.errors?.[0]?.reason ?? '';
+                const statusText = respErr?.status ?? '';
                 const code   = (e as any)?.code || '';
                 const transient = !status || /ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN/i.test(String(code));
                 const shouldRetry403 = status === 403 && /rateLimitExceeded|userRateLimitExceeded/i.test(String(reason));
-                if (transient || status === 429 || status >= 500 || shouldRetry403) {
+                const isResourceExhausted = /RESOURCE_EXHAUSTED/i.test(String(statusText));
+                if (transient || status === 429 || status >= 500 || shouldRetry403 || isResourceExhausted) {
                     const base = Math.min(800 * (2 ** i), 4000);
                     const jitter = Math.floor(Math.random() * 200);
                     const delay = base + jitter;
-                    console.warn(`events.list ${status}${reason ? ` (${reason})` : ''}. retry in ${delay}ms...`);
+                    console.warn(`events.list ${status}${reason ? ` (${reason})` : ''}${isResourceExhausted ? ' (RESOURCE_EXHAUSTED)' : ''}. retry in ${delay}ms...`);
                     await new Promise(r => setTimeout(r, delay));
                     continue;
                 }
@@ -270,11 +274,19 @@ export class GCalApiService {
                     const res = await requestUrl(requestParams);
                     const ct = res.headers['content-type'] || res.headers['Content-Type'] || '';
                     let reason = '';
+                    let statusText = '';
                     if (/json/i.test(String(ct))) {
-                        try { reason = (JSON.parse(res.text))?.error?.errors?.[0]?.reason ?? ''; } catch {}
+                        try {
+                            const j = JSON.parse(res.text);
+                            reason = j?.error?.errors?.[0]?.reason ?? '';
+                            statusText = j?.error?.status ?? '';
+                        } catch {}
                     }
                     const shouldRetry = (
-                        res.status === 429 || res.status >= 500 || (res.status === 403 && /rateLimitExceeded|userRateLimitExceeded/i.test(reason))
+                        res.status === 429 ||
+                        res.status >= 500 ||
+                        (res.status === 403 && /rateLimitExceeded|userRateLimitExceeded/i.test(reason)) ||
+                        /RESOURCE_EXHAUSTED/i.test(statusText)
                     );
                     if (shouldRetry) {
                         const base = Math.min(1600 * (2 ** i), 8000);
@@ -405,12 +417,12 @@ export class GCalApiService {
     private detectResponseBoundary(text: string): string | null {
         // 典型例: `--batch_ABCDEF123\r\n` で開始（RFC2046 準拠のトークン）
         // CRLF あり／なし双方に耐性を持たせる
-        const token = "[A-Za-z0-9'()+_,.\-]+";
+        const token = "[-A-Za-z0-9'()+_.,=/:]+";
         const m = text.match(new RegExp(`(?:^|\\r?\\n)--(${token})\\r?\\n`));
         if (m && m[1]) return m[1];
 
         // 念のため閉じ区切りのパターンも試す
-        const m2 = text.match(new RegExp(`--(${token})--\\r?\\n`));
+        const m2 = text.match(new RegExp(`--(${token})--(?:\\r?\\n|$)`));
         if (m2 && m2[1]) return m2[1];
 
         return null;
