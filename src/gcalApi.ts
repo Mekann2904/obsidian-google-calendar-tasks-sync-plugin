@@ -35,7 +35,7 @@ export class GCalApiService {
         // 但し、syncToken 使用時は showDeleted を有効化し、削除（cancelled）イベントを確実に取得する。
         const requestParams: calendar_v3.Params$Resource$Events$List = {
             calendarId: settings.calendarId,
-            privateExtendedProperty: ["isGcalSync=true"], // 初回と増分で同一条件を維持
+            privateExtendedProperty: ["isGcalSync=true", "appId=obsidian-gcal-tasks"], // 初回と増分で同一条件を維持（自プラグイン生成に限定）
             showDeleted: trySyncToken ? true : false, // 増分時は true（仕様順守）。フル取得時は false。
             maxResults: 2500, // ページング削減（上限 2500）
             singleEvents: false,
@@ -55,7 +55,7 @@ export class GCalApiService {
             do {
                 console.log(`GCal イベントページ ${page} を取得中...`);
                 requestParams.pageToken = nextPageToken;
-                const response: GaxiosResponse<calendar_v3.Schema$Events> = await this.plugin.calendar!.events.list(requestParams);
+                const response: GaxiosResponse<calendar_v3.Schema$Events> = await this.eventsListWithRetry(requestParams);
 
                 if (response.data.items) {
                     existingEvents.push(...response.data.items);
@@ -98,12 +98,19 @@ export class GCalApiService {
                     do {
                         console.log(`GCal イベントページ ${page} を取得中...(fallback)`);
                         requestParams.pageToken = nextPageToken;
-                        const response: GaxiosResponse<calendar_v3.Schema$Events> = await this.plugin.calendar!.events.list(requestParams);
-                        if (response.data.items) existingEvents.push(...response.data.items);
+                        const response: GaxiosResponse<calendar_v3.Schema$Events> = await this.eventsListWithRetry(requestParams);
+                    if (response.data.items) existingEvents.push(...response.data.items);
+                        if (response.data.nextSyncToken) nextSyncToken = response.data.nextSyncToken;
                         nextPageToken = response.data.nextPageToken ?? undefined;
                         page++;
                     } while (nextPageToken);
                     console.log(`フォールバックで合計 ${existingEvents.length} 件を取得しました。`);
+                    // フォールバックでも nextSyncToken を保存して次回から増分に戻す
+                    if (nextSyncToken && settings.useSyncToken) {
+                        (this.plugin as any).settings.syncToken = nextSyncToken;
+                        await (this.plugin as any).saveData((this.plugin as any).settings);
+                        console.log(`syncToken を保存しました。(fallback)`);
+                    }
                     return existingEvents;
                 } catch (e2) {
                     const msg = `syncToken フォールバック取得も失敗: ${String((e2 as any)?.message || e2)}`;
@@ -115,6 +122,29 @@ export class GCalApiService {
             new Notice(`GCal イベントの取得エラー: ${errorMsg}。同期を中止しました。`, 10_000);
             throw new Error(`GCal イベントの取得に失敗しました: ${errorMsg}`);
         }
+    }
+
+    // 軽リトライ付きの events.list 呼び出し（429/5xx 対応）
+    private async eventsListWithRetry(params: calendar_v3.Params$Resource$Events$List): Promise<GaxiosResponse<calendar_v3.Schema$Events>> {
+        const max = 3;
+        let lastError: any = null;
+        for (let i = 0; i < max; i++) {
+            try {
+                const res = await this.plugin.calendar!.events.list(params);
+                return res;
+            } catch (e: any) {
+                lastError = e;
+                const status = isGaxiosError(e) ? (e.response?.status ?? 0) : 0;
+                if (status === 429 || status >= 500) {
+                    const delay = Math.min(800 * (2 ** i), 4000);
+                    console.warn(`events.list ${status}. retry in ${delay}ms...`);
+                    await new Promise(r => setTimeout(r, delay));
+                    continue;
+                }
+                throw e;
+            }
+        }
+        throw lastError;
     }
 
     // ---------------------------------------------------------------------
@@ -192,10 +222,40 @@ export class GCalApiService {
             throw: false, // ステータスコードに関わらずレスポンスを取得
         };
 
-        // 3) 送信
+        // 3) 送信（429/5xx のトップレベルに軽リトライ）
+        const fetchWithRetry = async (): Promise<string> => {
+            const max = 4;
+            for (let i = 0; i < max; i++) {
+                const res = await request(requestParams);
+                // JSON エラー形式ならコードを確認
+                try {
+                    const obj = JSON.parse(res);
+                    const code = obj?.error?.code as number | undefined;
+                    if (code && (code === 429 || code >= 500)) {
+                        const delay = Math.min(1600 * (2 ** i), 8000);
+                        console.warn(`Batch top-level ${code}. retry in ${delay}ms...`);
+                        await new Promise(r => setTimeout(r, delay));
+                        continue;
+                    }
+                } catch {}
+                // 文字列に HTTP ステータス行がある場合（例: エラー応答）
+                const m = /^(?:HTTP\/\d(?:\.\d+)?)\s+(\d{3})/m.exec(res);
+                if (m) {
+                    const code = parseInt(m[1], 10);
+                    if (code === 429 || code >= 500) {
+                        const delay = Math.min(1600 * (2 ** i), 8000);
+                        console.warn(`Batch top-level ${code}. retry in ${delay}ms...`);
+                        await new Promise(r => setTimeout(r, delay));
+                        continue;
+                    }
+                }
+                return res;
+            }
+            return await request(requestParams);
+        };
         try {
             console.log(`${batchRequests.length} 件の操作を含むバッチリクエストを送信中...`);
-            const responseText = await request(requestParams);
+            const responseText = await fetchWithRetry();
 
             // 4) multipart の boundary はレスポンス独自なので本文から検出してパース
             const results = this.parseBatchResponse(responseText); // FIX: boundary 引数を廃止し自動検出
