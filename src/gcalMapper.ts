@@ -193,25 +193,24 @@ export class GCalMapper {
             const winEnd = (task.timeWindowEnd || '').trim();
             const hasWindow = /^\d{1,2}:\d{2}$/.test(winStart) && /^(\d{1,2}:\d{2}|24:00)$/.test(winEnd);
 
-            const toIso = (d: moment.Moment, hhmm: string): string => {
+            const toMomentAt = (d: moment.Moment, hhmm: string): moment.Moment => {
                 const [h, m] = hhmm.split(':').map(v => parseInt(v,10));
-                const base = d.clone().hour(h).minute(m).second(0).millisecond(0);
-                return base.toISOString(true);
+                return d.clone().hour(h).minute(m).second(0).millisecond(0);
             };
 
             if (hasWindow) {
                 // 時間ウィンドウがある場合は必ず時間指定イベントにする
                 const isDaily = (task.recurrenceRule || '').toUpperCase().includes('FREQ=DAILY');
-                event.start = this.toEventDateTime(moment(toIso(startMoment, winStart)));
+                event.start = this.toEventDateTime(toMomentAt(startMoment, winStart));
                 if (winEnd === '24:00') {
                     // 24:00 は翌日 00:00
                     const baseEndDay = isDaily ? startMoment.clone().add(1,'day')
                                                : (dueMoment.isSame(startMoment,'day') ? startMoment.clone().add(1,'day')
                                                                                       : dueMoment.clone().add(1,'day'));
-                    event.end = this.toEventDateTime(moment(toIso(baseEndDay, '00:00')));
+                    event.end = this.toEventDateTime(toMomentAt(baseEndDay, '00:00'));
                 } else {
                     const baseEndDay = isDaily ? startMoment : dueMoment;
-                    event.end = this.toEventDateTime(moment(toIso(baseEndDay, winEnd)));
+                    event.end = this.toEventDateTime(toMomentAt(baseEndDay, winEnd));
                 }
             } else if (startIsDateTime && !dueIsDateTime && startMoment.isSame(dueMoment, 'day')) {
                 // 仕様: 開始に時刻・終了が日付のみ（同日）の場合は 24:00 まで
@@ -236,7 +235,7 @@ export class GCalMapper {
 
             if (dueMoment.isSameOrBefore(startMoment)) {
                 console.warn(`タスク "${task.summary || task.id}": 終了時刻 (${dueMoment.toISOString()}) が開始時刻 (${startMoment.toISOString()}) 以前。デフォルト期間 (${this.settings.defaultEventDurationMinutes}分) を使用して調整します。`);
-                event.end = { dateTime: startMoment.clone().add(this.settings.defaultEventDurationMinutes, 'minutes').toISOString(true) };
+                event.end = this.toEventDateTime(startMoment.clone().add(this.settings.defaultEventDurationMinutes, 'minutes'));
             }
         }
 

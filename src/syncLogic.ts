@@ -201,9 +201,9 @@ export class SyncLogic {
                             return;
                         }
 
-                        // insert の 409 (既存ID) はスキップ扱いにし、taskMap を安定IDで更新
+                        // insert の 409 (既存ID) は通常 body.id 指定時の衝突。現状は安全にスキップのみ。
                         if (req.operationType === 'insert' && status === 409 && req.obsidianTaskId) {
-                            taskMap[req.obsidianTaskId] = this.generateStableEventId(req.obsidianTaskId);
+                            console.warn('Insert 409 detected for', req.obsidianTaskId, '— skipping without mapping.');
                             skippedCount++;
                             return;
                         }
@@ -583,7 +583,13 @@ export class SyncLogic {
             cursor = endOfDay.clone();
             while (cursor.isBefore(edt, 'day')) {
                 const next = cursor.clone().add(1,'day').startOf('day');
-                out.push({ ...clone(eventPayload), start: { dateTime: cursor.toISOString(true) }, end: { dateTime: next.toISOString(true) }, recurrence: undefined });
+                const tzMid = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                out.push({
+                    ...clone(eventPayload),
+                    start: { dateTime: cursor.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tzMid } as any,
+                    end:   { dateTime: next.format('YYYY-MM-DDTHH:mm:ss'),   timeZone: tzMid } as any,
+                    recurrence: undefined
+                });
                 cursor = next;
             }
             // 最終スライス: 00:00〜元の終了時刻
@@ -615,13 +621,17 @@ export class SyncLogic {
         const processed = new Set<string>();
 
         if (force) {
+            // [安全化] プラグイン管理対象 or taskMap が参照している ID のみ削除
+            const managedOrMapped = new Set<string>(Object.values(this.plugin.settings.taskMap || {}));
             existingGCalEvents.forEach(event => {
-                if (event.id) {
-                    const headers: Record<string, string> = {};
-                    if (event.etag) headers['If-Match'] = event.etag;
-                    batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(event.id)}`, headers, obsidianTaskId: 'force-delete', operationType: 'delete', originalGcalId: event.id });
-                    processed.add(event.id);
-                }
+                if (!event.id) return;
+                const isManaged = event.extendedProperties?.private?.['isGcalSync'] === 'true';
+                const isMapped = managedOrMapped.has(event.id);
+                if (!(isManaged || isMapped)) return;
+                const headers: Record<string, string> = {};
+                if (event.etag) headers['If-Match'] = event.etag;
+                batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(event.id)}`, headers, obsidianTaskId: 'force-delete', operationType: 'delete', originalGcalId: event.id });
+                processed.add(event.id);
             });
             return;
         }
