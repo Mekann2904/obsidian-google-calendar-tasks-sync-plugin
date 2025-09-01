@@ -110,9 +110,9 @@ export class GCalApiService {
      */
     async executeBatchRequest(batchRequests: BatchRequestItem[]): Promise<BatchResponseItem[]> {
         // 1) 認証チェックとトークンリフレッシュ
-        if (!this.plugin.oauth2Client || !this.plugin.settings.tokens?.access_token) {
+        if (!this.plugin.oauth2Client) {
             const tokenRefreshed = await this.plugin.authService.ensureAccessToken();
-            if (!tokenRefreshed || !this.plugin.settings.tokens?.access_token) {
+            if (!tokenRefreshed) {
                 throw new Error("バッチリクエストを実行できません: 認証トークンを取得できませんでした。");
             }
         }
@@ -206,8 +206,7 @@ export class GCalApiService {
                 const msg = error.toString();
                 if (/401|invalid_grant|invalid credential/i.test(msg)) {
                     new Notice("同期中の認証エラー。再認証を試みてください。", 10_000);
-                    this.plugin.settings.tokens = null;
-                    await this.plugin.saveData(this.plugin.settings);
+                    await this.plugin.persistTokens(null);
                     this.plugin.authService.initializeCalendarApi();
                     this.plugin.clearAutoSync();
                 } else if (/403/.test(msg)) {

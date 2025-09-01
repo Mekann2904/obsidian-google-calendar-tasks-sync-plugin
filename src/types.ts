@@ -34,7 +34,15 @@ export type GoogleCalendarEventInput = calendar_v3.Schema$Event & {
 export interface GoogleCalendarTasksSyncSettings {
 	clientId: string; // Google Cloud Console で取得したクライアントID
 	clientSecret: string; // Google Cloud Console で取得したクライアントシークレット
-	tokens: Credentials | null; // Google から取得した認証トークン (アクセストークン、リフレッシュトークンなど)
+	/**
+	 * 実行時にメモリ上で保持するトークン。ディスクには保存しない（saveData 時に除外）。
+	 */
+	tokens: Credentials | null;
+	/**
+	 * ディスク保存用の暗号化トークン（Electron safeStorage で暗号化した Base64 文字列）。
+	 */
+	tokensEncrypted?: string | null;
+	encryptionPassphrase?: string | null; // safeStorage不可時のフォールバック用（任意）
 	calendarId: string; // 同期対象の Google Calendar ID (通常 'primary' または特定のカレンダーID)
 	syncIntervalMinutes: number; // 自動同期の間隔 (分単位)
 	autoSync: boolean; // 自動同期を有効にするか

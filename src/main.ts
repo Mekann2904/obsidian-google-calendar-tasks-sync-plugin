@@ -15,6 +15,7 @@ import { GCalMapper } from './gcalMapper';
 import { GCalApiService } from './gcalApi';
 import { SyncLogic } from './syncLogic';
 import { validateMoment } from './utils'; // ユーティリティ関数をインポート
+import { isEncryptionAvailable, encryptToBase64, decryptFromBase64, encryptWithPassphrase, decryptWithPassphrase } from './security';
 
 export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 	settings: GoogleCalendarTasksSyncSettings;
@@ -137,8 +138,78 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 			this.settings.lastSyncTime = undefined;
         }
 
+        // 暗号化トークン（refresh_tokenのみ）の復号
+        try {
+            if (this.settings.tokensEncrypted && !this.settings.tokens?.refresh_token) {
+                let json: string | null = null;
+                if (this.settings.tokensEncrypted.startsWith('aesgcm:')) {
+                    if (this.settings.encryptionPassphrase) {
+                        json = decryptWithPassphrase(this.settings.tokensEncrypted, this.settings.encryptionPassphrase);
+                    } else {
+                        console.warn('暗号化トークンが存在しますが、パスフレーズが未設定のため復号できません。');
+                        new Notice('暗号化されたトークンを復号できません。設定でパスフレーズを入力し、再試行してください。', 10000);
+                    }
+                } else {
+                    if (isEncryptionAvailable()) {
+                        json = decryptFromBase64(this.settings.tokensEncrypted);
+                    } else {
+                        console.warn('暗号化トークンが存在しますが、safeStorage が利用できません。');
+                        new Notice('暗号化トークンを復号できません（safeStorage不可）。パスフレーズを設定して再保存すると復号可能になります。', 10000);
+                    }
+                }
+                if (json) {
+                    const { refresh_token } = JSON.parse(json);
+                    if (refresh_token) this.settings.tokens = { refresh_token } as any;
+                }
+            }
+        } catch (e) {
+            console.error('暗号化トークンの復号に失敗:', e);
+        }
+
         // syncLogic はコンストラクタで plugin インスタンスを受け取るだけなので再インスタンス化不要
 	}
+
+	// saveData をオーバーライドし、平文トークンをディスクに書き込まない
+	async saveData(data: any): Promise<void> {
+		const clone = JSON.parse(JSON.stringify(data ?? {}));
+		if (clone && 'tokens' in clone) clone.tokens = null; // 平文は保存しない
+		return await super.saveData(clone);
+	}
+
+    // トークンを暗号化して保存（refresh_token のみ永続化）
+    async persistTokens(tokens: any | null): Promise<void> {
+        this.settings.tokens = tokens && tokens.refresh_token ? ({ refresh_token: tokens.refresh_token } as any) : null;
+        if (tokens && tokens.refresh_token) {
+            if (!isEncryptionAvailable()) {
+                if (this.settings.encryptionPassphrase) {
+                    try {
+                        const json = JSON.stringify({ refresh_token: tokens.refresh_token });
+                        this.settings.tokensEncrypted = encryptWithPassphrase(json, this.settings.encryptionPassphrase);
+                        await super.saveData({ ...this.settings, tokens: null });
+                        return;
+                    } catch (e) {
+                        console.error('パスフレーズ暗号化に失敗:', e);
+                        new Notice('パスフレーズ暗号化に失敗しました。パスフレーズを見直してください。', 8000);
+                    }
+                }
+                new Notice('警告: 安全な暗号化手段が利用できないため、トークンは永続化しません（再起動で再認証が必要）。', 10000);
+                this.settings.tokensEncrypted = null;
+                await super.saveData({ ...this.settings, tokens: null });
+                return;
+            }
+            try {
+                const json = JSON.stringify({ refresh_token: tokens.refresh_token });
+                this.settings.tokensEncrypted = encryptToBase64(json);
+                await super.saveData({ ...this.settings, tokens: null });
+            } catch (e) {
+                console.error('トークン暗号化保存に失敗:', e);
+                new Notice('トークンの暗号化保存に失敗しました。コンソールを確認してください。', 8000);
+            }
+        } else {
+            this.settings.tokensEncrypted = null;
+            await super.saveData({ ...this.settings, tokens: null });
+        }
+    }
 
 	async saveSettings() {
 		await this.saveData(this.settings);

@@ -6,7 +6,9 @@ import GoogleCalendarTasksSyncPlugin from './main'; // main.ts からインポ�
 export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 	clientId: '',
 	clientSecret: '',
-	tokens: null,
+	tokens: null, // メモリのみ。ディスクは tokensEncrypted を使用
+	tokensEncrypted: null,
+	encryptionPassphrase: null,
 	calendarId: 'primary',
 	syncIntervalMinutes: 15,
 	autoSync: true,
@@ -535,6 +537,20 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 						if (isNaN(n) || n < 1) n = 1;
 						if (n > 1000) n = 1000;
 						this.plugin.settings.batchSize = n;
+						await this.plugin.saveData(this.plugin.settings);
+					});
+			});
+
+		// パスフレーズ（安全保存フォールバック用）
+		new Setting(containerEl)
+			.setName('暗号化パスフレーズ（任意）')
+			.setDesc('safeStorage が利用できない環境で、refresh_token をAES-GCMで暗号化保存するためのパスフレーズ。設定するとトークンを永続化できる。')
+			.addText(text => {
+				text.inputEl.type = 'password';
+				text.setPlaceholder('未設定（推奨: 任意の強固なパスフレーズ）')
+					.setValue(this.plugin.settings.encryptionPassphrase || '')
+					.onChange(async (value) => {
+						this.plugin.settings.encryptionPassphrase = value || null;
 						await this.plugin.saveData(this.plugin.settings);
 					});
 			});

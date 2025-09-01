@@ -176,11 +176,13 @@ export class HttpServerManager {
                 // AuthService の handleOAuthCallback を呼び出す
                 await this.plugin.authService.handleOAuthCallback(params);
                 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-                res.end(`<!DOCTYPE html>...認証成功...</html>`); // HTMLは簡略化
+                res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Auth Success</title></head><body>認証に成功しました。Obsidian に戻ってください。</body></html>`);
             } catch (error: any) {
                 console.error("HTTP経由でのOAuthコールバック処理中にエラー:", error);
                 res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
-                res.end(`<!DOCTYPE html>...認証失敗: ${error.message}...</html>`); // HTMLは簡略化
+                const msg = String(error?.message || '不明なエラー')
+                    .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Auth Failed</title></head><body>認証に失敗しました: ${msg}</body></html>`);
             }
         } else if (currentUrl.pathname === '/favicon.ico' && req.method === 'GET') {
              res.writeHead(204);

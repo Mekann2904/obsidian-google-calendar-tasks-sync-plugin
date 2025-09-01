@@ -83,10 +83,9 @@ export class AuthService {
                 console.log("新しいリフレッシュトークンを受信しました。");
             }
 
-            this.plugin.settings.tokens = updatedTokens;
             try {
-                 await this.plugin.saveData(this.plugin.settings); // 更新されたトークンを永続化
-                 console.log("更新されたトークンは正常に保存されました。");
+                 await this.plugin.persistTokens(updatedTokens);
+                 console.log("更新されたトークンは正常に保存されました（暗号化）。");
                  // 再初期化は不要（oauth2Client を calendar に渡しているため自動で反映）
             } catch (saveError) {
                  console.error("更新されたトークンの保存に失敗しました:", saveError);
@@ -267,16 +266,15 @@ export class AuthService {
                     console.error("トークン交換後、OAuth クライアントを設定できませんでした。");
                 }
             }
-            this.plugin.settings.tokens = finalTokens;
-
-            // saveData を直接使用して、saveSettings の副作用を回避
-            await this.plugin.saveData(this.plugin.settings);
+            await this.plugin.persistTokens(finalTokens);
 
             // 依存コンポーネントを手動で再初期化
             this.initializeCalendarApi(); // API クライアントが新しいトークンを使用するようにする
             this.plugin.setupAutoSync(); // 自動同期を再設定
             this.attachTokenListener(); // リスナーを再アタッチ
 
+            // PKCE verifier は使用後にクリア
+            this.activePkceVerifier = null;
             new Notice('Google 認証に成功しました！', 6000);
 
         } catch (err: any) {
@@ -309,21 +307,13 @@ export class AuthService {
      * @returns トークンが有効な場合は true、そうでない場合は false。
      */
     isTokenValid(checkRefresh: boolean = false): boolean {
-        const tokens = this.plugin.settings.tokens;
-        if (!tokens) return false;
-
         if (checkRefresh) {
-            return !!tokens.refresh_token;
-        } else {
-            if (!tokens.access_token) return false;
-            if (tokens.expiry_date) {
-                // 有効期限の5分前まで有効とみなす（ネットワーク遅延等を考慮）
-                return tokens.expiry_date > Date.now() + (5 * 60 * 1000);
-            }
-            // 有効期限がない場合 (通常は発生しないはずだが)、有効とみなす
-            // API 呼び出し時にエラーになる可能性はある
-            return true;
+            return !!(this.plugin.settings.tokens?.refresh_token || this.plugin.settings.tokensEncrypted);
         }
+        const c = this.plugin.oauth2Client?.credentials;
+        if (!c?.access_token) return false;
+        if (c.expiry_date) return c.expiry_date > Date.now() + 5 * 60 * 1000;
+        return true;
     }
 
     /**
@@ -339,8 +329,7 @@ export class AuthService {
             console.warn("アクセストークンが必要ですが、リフレッシュトークンがありません。");
             new Notice("認証トークンの更新が必要です。設定から再認証してください。", 7000);
             this.plugin.clearAutoSync();
-            this.plugin.settings.tokens = null;
-            await this.plugin.saveData(this.plugin.settings);
+            await this.plugin.persistTokens(null);
             return false;
         }
 
@@ -363,8 +352,7 @@ export class AuthService {
             if (respErrDesc) noticeMsg += ` ${respErrDesc}`;
             if (respErr === 'invalid_grant') {
                 noticeMsg = 'トークンが無効です。再認証してください。';
-                this.plugin.settings.tokens = null;
-                await this.plugin.saveData(this.plugin.settings);
+                await this.plugin.persistTokens(null);
                 this.plugin.clearAutoSync();
             }
             new Notice(noticeMsg, 15000);
