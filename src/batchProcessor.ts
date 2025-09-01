@@ -2,13 +2,13 @@ import { Notice } from 'obsidian';
 import { BatchRequestItem, BatchResponseItem, GoogleCalendarTasksSyncSettings } from './types';
 
 export class BatchProcessor {
-    // Google Calendar API のバッチリクエストは、公式ドキュメント上、最大50リクエストまで。
-    // See: https://developers.google.com/calendar/api/guides/batch
+    // Google Calendar JSON Batch は API ごとに上限が異なるため、
+    // 固定 50 をやめ、設定の maxBatchPerHttp をハード上限として使用する。
     private readonly BATCH_SIZE: number;
 
     constructor(private settings: GoogleCalendarTasksSyncSettings) {
-        const sz = Number(this.settings.batchSize ?? 50);
-        this.BATCH_SIZE = Math.max(1, Math.min(50, isNaN(sz) ? 50 : sz));
+        const hard = Number(this.settings.maxBatchPerHttp ?? 50);
+        this.BATCH_SIZE = Math.max(1, Math.min(1000, isNaN(hard) ? 50 : hard));
     }
 
     async executeBatches(

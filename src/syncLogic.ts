@@ -742,6 +742,16 @@ export class SyncLogic {
             return false;
         };
 
+        // 設定: ハード上限/開始サイズ/並列度/SLA
+        const hardCap = Math.max(1, Math.min(this.plugin.settings.maxBatchPerHttp ?? 50, 1000));
+        let currentSize = Math.min(
+            Math.max(1, this.plugin.settings.desiredBatchSize ?? this.plugin.settings.batchSize ?? 50),
+            hardCap
+        );
+        const step = 10;
+        const sla = this.plugin.settings.latencySLAms ?? 1500;
+        let currentMaxInFlight = Math.max(1, this.plugin.settings.maxInFlightBatches ?? 2);
+
         // 送信対象のインデックス集合
         let pending = batchRequests.map((_, i) => i);
         let attempt = 0;
@@ -751,70 +761,113 @@ export class SyncLogic {
             this.retryCount = attempt - 1;
             metrics.attempts = attempt; // 最終回数で更新
 
-            const subBatchSize = Math.max(1, Math.min(this.plugin.settings.batchSize ?? 100, 1000));
-            // 公式上限は1000。各パートは個別リクエストとしてカウントされ、順序保証はない。
-            for (let i = 0; i < pending.length; i += subBatchSize) {
-                const windowIdx = pending.slice(i, i + subBatchSize);
-                const subReq = windowIdx.map(idx => batchRequests[idx]);
-                const start = performance.now();
-                const subRes = await this.plugin.gcalApi.executeBatchRequest(subReq);
-                const end = performance.now();
-                metrics.sentSubBatches++;
-                metrics.batchLatenciesMs.push(end - start);
+            // pending を currentSize ずつ区切ったウィンドウ列
+            const makeChunks = (size: number): number[][] => {
+                const out: number[][] = [];
+                for (let i = 0; i < pending.length; i += size) out.push(pending.slice(i, i + size));
+                return out;
+            };
+            const chunks = makeChunks(currentSize);
 
-                // Content-ID での対応づけ（順序入れ替わりに強く）
-                const cidToOrig = new Map<string, number>();
-                windowIdx.forEach((orig, j) => cidToOrig.set(`item-${j + 1}`, orig));
+            let idx = 0;
+            while (idx < chunks.length) {
+                const groupPromises: Array<Promise<{ subRes: BatchResponseItem[]; latency: number; windowIdx: number[] }>> = [];
+                const latenciesThisGroup: number[] = [];
+                for (let k = 0; k < currentMaxInFlight && idx < chunks.length; k++, idx++) {
+                    const windowIdx = chunks[idx];
+                    const subReq = windowIdx.map(i => batchRequests[i]);
+                    const start = performance.now();
+                    const p = this.plugin.gcalApi.executeBatchRequest(subReq).then(subRes => {
+                        const end = performance.now();
+                        const latency = end - start;
+                        metrics.sentSubBatches++;
+                        metrics.batchLatenciesMs.push(latency);
+                        latenciesThisGroup.push(latency);
+                        return { subRes, latency, windowIdx };
+                    });
+                    groupPromises.push(p);
+                }
 
-                subRes.forEach((res, k) => {
-                    const mappedIdx = res.contentId ? cidToOrig.get(res.contentId) : undefined;
-                    if (res.contentId && mappedIdx === undefined) {
-                        console.warn('Unknown Content-ID in batch response:', res.contentId);
-                    }
-                    const origIdx = mappedIdx !== undefined ? mappedIdx : windowIdx[k];
-                    const req = batchRequests[origIdx];
+                const results = await Promise.all(groupPromises);
 
-                    metrics.statusCounts[res.status] = (metrics.statusCounts[res.status] || 0) + 1;
-                    if (res.status >= 200 && res.status < 300) {
-                        finalResults[origIdx] = res;
-                        switch (req.operationType) {
-                            case 'insert': created++; break;
-                            case 'update':
-                            case 'patch': updated++; break;
-                            case 'delete': deleted++; break;
+                // 受信処理 + 指標集計
+                let hadRateIssues = false;
+                let had412 = false;
+                for (const { subRes, windowIdx } of results) {
+                    // Content-ID での対応づけ（順序入れ替わりに強く）
+                    const cidToOrig = new Map<string, number>();
+                    windowIdx.forEach((orig, j) => cidToOrig.set(`item-${j + 1}`, orig));
+
+                    subRes.forEach((res, k) => {
+                        const mappedIdx = res.contentId ? cidToOrig.get(res.contentId) : undefined;
+                        if (res.contentId && mappedIdx === undefined) {
+                            console.warn('Unknown Content-ID in batch response:', res.contentId);
                         }
-                        return;
-                    }
+                        const origIdx = mappedIdx !== undefined ? mappedIdx : windowIdx[k];
+                        const req = batchRequests[origIdx];
 
-                    // 409/410/404/412 などの恒久的/スキップ対象
-                    if (treatAsSkipped(req, res.status)) {
-                        finalResults[origIdx] = res; // スキップとして記録
-                        skipped++;
-                        return;
-                    }
+                        metrics.statusCounts[res.status] = (metrics.statusCounts[res.status] || 0) + 1;
+                        if (res.status >= 200 && res.status < 300) {
+                            if (!finalResults[origIdx]) {
+                                finalResults[origIdx] = res;
+                                switch (req.operationType) {
+                                    case 'insert': created++; break;
+                                    case 'update':
+                                    case 'patch': updated++; break;
+                                    case 'delete': deleted++; break;
+                                }
+                            }
+                            return;
+                        }
 
-                    // 再試行条件（429, 403: rateLimitExceeded系, 5xx）
-                    const reason = (res.body?.error?.errors?.[0]?.reason) || (res.body?.error?.status) || '';
-                    const shouldRetry = this.shouldRetry(res.status, String(reason));
-                    if (shouldRetry && attempt <= this.MAX_RETRIES) {
-                        // 次のラウンドで再送（finalResults は未確定のまま）
-                        return;
-                    }
+                        // 409/410/404/412 などの恒久的/スキップ対象
+                        if (treatAsSkipped(req, res.status)) {
+                            if (!finalResults[origIdx]) {
+                                finalResults[origIdx] = res; // スキップとして記録
+                                skipped++;
+                            }
+                            return;
+                        }
 
-                    // 412: 後続の If-Match 無し再送で処理するため、ここではエラー/スキップにカウントしない
-                    if (res.status === 412) {
-                        finalResults[origIdx] = res;
-                        return;
-                    }
+                        const reason = (res.body?.error?.errors?.[0]?.reason) || (res.body?.error?.status) || '';
+                        const shouldRetry = this.shouldRetry(res.status, String(reason));
+                        if (res.status === 412) had412 = true; // ETag 競合もサイズ調整のシグナル
+                        if (shouldRetry && attempt <= this.MAX_RETRIES) {
+                            // 次のラウンドで再送（finalResults は未確定のまま）
+                            hadRateIssues = hadRateIssues || res.status === 429 || res.status >= 500 || (res.status === 403 && /(rateLimitExceeded|userRateLimitExceeded)/i.test(String(reason)));
+                            return;
+                        }
 
-                    // 恒久失敗として確定
-                    finalResults[origIdx] = res;
-                    errors++;
-                });
+                        if (res.status === 412) {
+                            // 後続の If-Match 無し再送で処理するため、ここでは確定させる
+                            finalResults[origIdx] = res;
+                            return;
+                        }
 
-                // レート制限回避のためのインターバッチ遅延
-                if (i + subBatchSize < pending.length && (this.plugin.settings.interBatchDelay ?? 0) > 0) {
-                    const base = this.plugin.settings.interBatchDelay;
+                        // 恒久失敗として確定
+                        if (!finalResults[origIdx]) {
+                            finalResults[origIdx] = res;
+                            errors++;
+                        }
+                    });
+                }
+
+                // p95 をこのグループ内で計算
+                const sorted = [...latenciesThisGroup].sort((a,b)=>a-b);
+                const i95 = sorted.length ? Math.min(sorted.length-1, Math.ceil(0.95*sorted.length)-1) : 0;
+                const p95 = sorted[i95] ?? 0;
+
+                // AIMD: レート・エラーや SLA 超過、412 が多いときは半減
+                if (hadRateIssues || had412 || p95 > sla) {
+                    currentSize = Math.max(Math.floor(currentSize / 2), 5);
+                    if (hadRateIssues) currentMaxInFlight = 1; // レートに触れたら並列度を落とす
+                } else {
+                    currentSize = Math.min(currentSize + step, hardCap);
+                }
+
+                // レート制限回避のためのインターバッチ遅延（グループ間）
+                if (idx < chunks.length && (this.plugin.settings.interBatchDelay ?? 0) > 0) {
+                    const base = this.plugin.settings.interBatchDelay!;
                     const jittered = Math.floor(base * (Math.random() * 0.5 + 0.75)); // ±25% ジッタ
                     metrics.totalWaitMs += jittered;
                     await new Promise(resolve => setTimeout(resolve, jittered));
@@ -823,15 +876,15 @@ export class SyncLogic {
 
             // 未確定（= transient 扱い）だけを次の試行に残す
             const nextPending: number[] = [];
-            for (const idx of pending) {
-                if (!finalResults[idx]) nextPending.push(idx);
+            for (const idx2 of pending) {
+                if (!finalResults[idx2]) nextPending.push(idx2);
             }
 
             if (nextPending.length === 0) break;
             if (attempt >= this.MAX_RETRIES) {
                 // これ以上の再送は行わない。残りはエラーで確定。
-                for (const idx of nextPending) {
-                    finalResults[idx] = { status: 500, body: { error: { message: 'Retry limit reached' } } };
+                for (const idx2 of nextPending) {
+                    finalResults[idx2] = { status: 500, body: { error: { message: 'Retry limit reached' } } };
                     errors++;
                 }
                 break;

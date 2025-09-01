@@ -36,7 +36,11 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 		minSyncDurationForNotice: 10, // 通知を表示する最小同期時間（秒）
 	},
 	interBatchDelay: 500, // バッチリクエスト間のデフォルト遅延（ミリ秒）
-	batchSize: 100, // 1バッチあたりの最大リクエスト数（仕様上限は1000）
+	batchSize: 100, // 互換目的（旧設定）
+	desiredBatchSize: 50,
+	maxBatchPerHttp: 50, // Calendar は保守的に 50 を既定
+	maxInFlightBatches: 2,
+	latencySLAms: 1500,
 	devLogging: false,
 };
 
@@ -534,20 +538,74 @@ new Setting(containerEl)
 			cls: 'setting-item-description'
 		});
 
-		// バッチサイズ（最大1000）
+		// サブバッチ目標サイズ（desired）
 		new Setting(containerEl)
-			.setName('バッチサイズ（最大1000）')
-			.setDesc('1回のバッチに含めるリクエスト数。各パートは個別リクエストとしてカウントされる。実運用は50〜200程度を推奨。')
+			.setName('目標サブバッチサイズ')
+			.setDesc('AIMD により自動調整。ここでの値は開始サイズ（5〜1000、既定50）。')
+			.addText(text => {
+				text.inputEl.type = 'number';
+				text.inputEl.min = '5';
+				text.inputEl.max = '1000';
+				text.setValue(String(this.plugin.settings.desiredBatchSize ?? DEFAULT_SETTINGS.desiredBatchSize))
+					.onChange(async (value) => {
+						let n = parseInt(value, 10);
+						if (isNaN(n) || n < 5) n = 5;
+						if (n > 1000) n = 1000;
+						this.plugin.settings.desiredBatchSize = n;
+						await this.plugin.saveData(this.plugin.settings);
+					});
+			});
+
+		// HTTP 1バッチ内のハード上限（max）
+		new Setting(containerEl)
+			.setName('HTTPバッチ上限/リクエスト')
+			.setDesc('1つの HTTP バッチに含める最大件数（API固有の上限に合わせる。既定50）。')
 			.addText(text => {
 				text.inputEl.type = 'number';
 				text.inputEl.min = '1';
 				text.inputEl.max = '1000';
-				text.setValue(String(this.plugin.settings.batchSize ?? DEFAULT_SETTINGS.batchSize))
+				text.setValue(String(this.plugin.settings.maxBatchPerHttp ?? DEFAULT_SETTINGS.maxBatchPerHttp))
 					.onChange(async (value) => {
 						let n = parseInt(value, 10);
 						if (isNaN(n) || n < 1) n = 1;
 						if (n > 1000) n = 1000;
-						this.plugin.settings.batchSize = n;
+						this.plugin.settings.maxBatchPerHttp = n;
+						await this.plugin.saveData(this.plugin.settings);
+					});
+			});
+
+		// 同時送信サブバッチ数
+		new Setting(containerEl)
+			.setName('同時送信バッチ数')
+			.setDesc('同時に送るサブバッチ数（1〜4、既定2）。レートに触れたら自動で1に落とす。')
+			.addText(text => {
+				text.inputEl.type = 'number';
+				text.inputEl.min = '1';
+				text.inputEl.max = '4';
+				text.setValue(String(this.plugin.settings.maxInFlightBatches ?? DEFAULT_SETTINGS.maxInFlightBatches))
+					.onChange(async (value) => {
+						let n = parseInt(value, 10);
+						if (isNaN(n) || n < 1) n = 1;
+						if (n > 4) n = 4;
+						this.plugin.settings.maxInFlightBatches = n;
+						await this.plugin.saveData(this.plugin.settings);
+					});
+			});
+
+		// p95 レイテンシSLA
+		new Setting(containerEl)
+			.setName('p95 レイテンシSLA (ms)')
+			.setDesc('サブバッチのp95レイテンシがこの値を超えるとサイズを半減（既定1500ms）。')
+			.addText(text => {
+				text.inputEl.type = 'number';
+				text.inputEl.min = '200';
+				text.inputEl.max = '10000';
+				text.setValue(String(this.plugin.settings.latencySLAms ?? DEFAULT_SETTINGS.latencySLAms))
+					.onChange(async (value) => {
+						let n = parseInt(value, 10);
+						if (isNaN(n) || n < 200) n = 200;
+						if (n > 10000) n = 10000;
+						this.plugin.settings.latencySLAms = n;
 						await this.plugin.saveData(this.plugin.settings);
 					});
 			});

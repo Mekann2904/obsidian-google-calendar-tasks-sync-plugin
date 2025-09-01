@@ -71,7 +71,12 @@ export interface GoogleCalendarTasksSyncSettings {
 		minSyncDurationForNotice: number; // 通知を表示する最小同期時間（秒）
 	};
 	interBatchDelay: number; // バッチリクエスト間の遅延（ミリ秒）
-	batchSize?: number; // バッチ1回あたりの最大リクエスト数（最大1000、課金/レートはアイテム数で加算）
+	batchSize?: number; // 互換目的（旧設定）。未設定時は desiredBatchSize を使用
+	desiredBatchSize?: number;      // 目標サブバッチサイズ（既定50）
+	maxBatchPerHttp?: number;       // 1 HTTP バッチ内のハード上限（既定50）
+	maxInFlightBatches?: number;    // 同時送信サブバッチ数（既定2）
+	latencySLAms?: number;          // p95 レイテンシSLA（既定1500ms）
+
 	recentErrors?: ErrorLog[]; // 最近のエラーサンプル（診断用）
 	useSyncToken?: boolean; // 可能な場合、syncToken による増分取得を使用
 	quotaUser?: string; // 任意: quota を論理分離するための識別子（Google グローバルパラメータ）
