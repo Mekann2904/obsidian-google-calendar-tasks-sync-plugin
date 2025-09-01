@@ -94,6 +94,7 @@ export interface BatchResponseItem {
 	status: number; // 個別リクエストのHTTPステータスコード
 	headers?: { [key: string]: string }; // 個別リクエストのレスポンスヘッダー (オプション)
 	body?: any; // 個別リクエストのレスポンスボディ (通常はJSONオブジェクト or エラーメッセージ)
+	contentId?: string; // 応答パートの Content-ID（どのリクエストに対応するかのヒント）
 }
 
 // バッチ処理全体の結果

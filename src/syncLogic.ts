@@ -97,6 +97,19 @@ export class SyncLogic {
             console.time("Sync: Fetch GCal Events");
             // FIX: gcalApi に settings を渡す (将来の拡張性のため)
             existingEvents = await this.plugin.gcalApi.fetchGoogleCalendarEvents(settings);
+            // 増分同期で showDeleted=true の場合、削除イベントは extendedProperties が欠落し得る。
+            // 非削除は isGcalSync=true で判定、削除はローカル管理ID集合で判定する。
+            try {
+                const managedIds = new Set<string>(Object.values(this.plugin.settings.taskMap || {}));
+                existingEvents = existingEvents.filter(ev => {
+                    if (ev.status === 'cancelled') {
+                        return !!(ev.id && managedIds.has(ev.id));
+                    }
+                    return ev.extendedProperties?.private?.['isGcalSync'] === 'true';
+                });
+            } catch (e) {
+                console.warn('取得イベントの仕分けで警告:', e);
+            }
             if (!force) {
                 googleEventMap = this.mapGoogleEvents(existingEvents, taskMap);
             }

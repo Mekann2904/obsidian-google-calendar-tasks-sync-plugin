@@ -35,11 +35,18 @@ export class GCalApiService {
         // 但し、syncToken 使用時は showDeleted を有効化し、削除（cancelled）イベントを確実に取得する。
         const requestParams: calendar_v3.Params$Resource$Events$List = {
             calendarId: settings.calendarId,
-            privateExtendedProperty: ["isGcalSync=true"],
+            // 増分同期時は削除検出のため privateExtendedProperty を付与しない（cancelled では extendedProperties が欠落し得るため）
             showDeleted: trySyncToken ? true : false, // 増分時は true（仕様順守）。フル取得時は false。
             maxResults: 2500, // ページング削減（上限 2500）
             singleEvents: false,
+            // ペイロード削減（必要最小限のフィールド）
+            fields: 'items(id,etag,status,updated,extendedProperties,recurringEventId),nextPageToken,nextSyncToken',
         };
+
+        // フル取得時のみ管理フラグでサーバー側フィルタ
+        if (!trySyncToken) {
+            requestParams.privateExtendedProperty = ["isGcalSync=true"];
+        }
 
         if (trySyncToken) {
             requestParams.syncToken = (this.plugin as any).settings.syncToken;
@@ -122,25 +129,32 @@ export class GCalApiService {
      * 404/409/410 は item-level の警告として扱い、致命停止しません。
      */
     async executeBatchRequest(batchRequests: BatchRequestItem[]): Promise<BatchResponseItem[]> {
-        // 1) 認証チェックとトークンリフレッシュ
-        if (!this.plugin.oauth2Client) {
-            const tokenRefreshed = await this.plugin.authService.ensureAccessToken();
-            if (!tokenRefreshed) {
-                throw new Error("バッチリクエストを実行できません: 認証トークンを取得できませんでした。");
-            }
+        // 1) 認証チェックとトークンリフレッシュ（常時呼び出し）
+        const tokenRefreshed = await this.plugin.authService.ensureAccessToken();
+        if (!tokenRefreshed) {
+            throw new Error("バッチリクエストを実行できません: 認証トークンを取得できませんでした。");
         }
 
         // 2) multipart/mixed リクエストを組み立て
         const boundary = `batch_${randomBytes(16).toString("hex")}`;
         const batchUrl = "https://www.googleapis.com/batch/calendar/v3";
         let body = "";
+        const normalizePath = (p: string) => {
+            try {
+                if (/^https?:\/\//i.test(p)) {
+                    const u = new URL(p);
+                    return u.pathname + (u.search || "");
+                }
+            } catch {}
+            return p;
+        };
 
         batchRequests.forEach((req, idx) => {
             body += `--${boundary}\r\n`;
             body += `Content-Type: application/http\r\n`;
             body += `Content-ID: <item-${idx + 1}>\r\n\r\n`;
             // FIX: HTTP/1.1 を明示し、必ずヘッダ終端の空行を入れる
-            body += `${req.method} ${req.path} HTTP/1.1\r\n`;
+            body += `${req.method} ${normalizePath(req.path)} HTTP/1.1\r\n`;
 
             // ユーザー定義ヘッダー + 必要に応じて Content-Type
             const headerLines: string[] = [];
@@ -302,6 +316,14 @@ export class GCalApiService {
             return null;
         }
 
+        // Content-ID をパート先頭ヘッダから抽出（存在する場合）
+        let contentId: string | undefined = undefined;
+        for (let i = 0; i < statusLineIdx; i++) {
+            const l = lines[i];
+            const m = /^Content-ID:\s*<([^>]+)>/i.exec(l);
+            if (m) { contentId = m[1]; break; }
+        }
+
         // HTTP ヘッダ終端（空行）を探す（statusLine 以降）
         let headerEndIdx = lines.findIndex((l, idx) => idx > statusLineIdx && l.trim() === "");
         if (headerEndIdx === -1) {
@@ -327,6 +349,6 @@ export class GCalApiService {
             }
         }
 
-        return { status, body: bodyJson };
+        return { status, body: bodyJson, contentId };
     }
 }
