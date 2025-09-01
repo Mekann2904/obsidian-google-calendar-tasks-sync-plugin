@@ -35,18 +35,13 @@ export class GCalApiService {
         // 但し、syncToken 使用時は showDeleted を有効化し、削除（cancelled）イベントを確実に取得する。
         const requestParams: calendar_v3.Params$Resource$Events$List = {
             calendarId: settings.calendarId,
-            // 増分同期時は削除検出のため privateExtendedProperty を付与しない（cancelled では extendedProperties が欠落し得るため）
+            privateExtendedProperty: ["isGcalSync=true"], // 初回と増分で同一条件を維持
             showDeleted: trySyncToken ? true : false, // 増分時は true（仕様順守）。フル取得時は false。
             maxResults: 2500, // ページング削減（上限 2500）
             singleEvents: false,
-            // ペイロード削減（必要最小限のフィールド）
-            fields: 'items(id,etag,status,updated,extendedProperties,recurringEventId),nextPageToken,nextSyncToken',
+            // ペイロード削減（必要最小限のフィールド）+ originalStartTime 追加
+            fields: 'items(id,etag,status,updated,extendedProperties,recurringEventId,originalStartTime),nextPageToken,nextSyncToken',
         };
-
-        // フル取得時のみ管理フラグでサーバー側フィルタ
-        if (!trySyncToken) {
-            requestParams.privateExtendedProperty = ["isGcalSync=true"];
-        }
 
         if (trySyncToken) {
             requestParams.syncToken = (this.plugin as any).settings.syncToken;
@@ -111,7 +106,9 @@ export class GCalApiService {
                     console.log(`フォールバックで合計 ${existingEvents.length} 件を取得しました。`);
                     return existingEvents;
                 } catch (e2) {
-                    console.error("syncToken フォールバック取得も失敗:", e2);
+                    const msg = `syncToken フォールバック取得も失敗: ${String((e2 as any)?.message || e2)}`;
+                    console.error(msg);
+                    throw new Error(`${errorMsg} / ${msg}`);
                 }
             }
             console.error("GCal イベントの取得中に致命的なエラー:", e);
@@ -165,6 +162,8 @@ export class GCalApiService {
                 // JSON ボディを送る場合のみ付与
                 headerLines.push(`Content-Type: application/json; charset=UTF-8`);
             }
+            // 相互運用性向上（明示）
+            headerLines.push('Accept: application/json');
             if (headerLines.length > 0) {
                 body += headerLines.join("\r\n") + "\r\n";
             }
