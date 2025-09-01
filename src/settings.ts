@@ -28,6 +28,7 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 	defaultEventDurationMinutes: 60,
 	useLoopbackServer: true, // 常に true
 	loopbackPort: 3000, // デフォルトポート
+	autoStopOnSuccess: false,
 	showNotices: true, // 通知を表示するかどうか
 	syncNoticeSettings: {
 		showManualSyncProgress: true, // 手動同期の進捗表示

@@ -62,8 +62,9 @@ export interface GoogleCalendarTasksSyncSettings {
 	syncScheduledDateToDescription: boolean; // 予定日 (Scheduled Date) を説明に追加するか
 	defaultEventDurationMinutes: number; // 開始時刻と終了時刻が指定されているが、終了が開始より前の場合に使用するデフォルトのイベント時間 (分)
 	useLoopbackServer: boolean; // 認証にローカルループバックサーバーを使用するか (現在はこの方法のみサポート)
-	loopbackPort: number; // ローカルループバックサーバーが使用するポート番号
-	showNotices: boolean; // 全通知のマスタースイッチ
+    loopbackPort: number; // ローカルループバックサーバーが使用するポート番号
+    showNotices: boolean; // 全通知のマスタースイッチ
+    autoStopOnSuccess?: boolean; // OAuth 成功時にサーバーを自動停止
 	syncNoticeSettings: {
 		showManualSyncProgress: boolean; // 手動同期の進捗表示
 		showAutoSyncSummary: boolean; // 自動同期の要約のみ表示

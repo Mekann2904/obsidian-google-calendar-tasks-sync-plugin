@@ -37,10 +37,16 @@ export class HttpServerManager {
         let currentAttempt = 0;
 
         const attemptListen = (portToTry: number) => {
+            if (portToTry > 65535) {
+                console.error(`サーバー起動失敗: 有効なポート範囲を超えました (${portToTry}).`);
+                new Notice(`エラー: 65535 を超えるポートにはバインドできません。設定で別のポートを選択してください。`, 15000);
+                this.server = null;
+                return;
+            }
             if (currentAttempt >= maxAttempts) {
-                const lastTriedPort = configuredPort + maxAttempts - 1;
-                console.error(`サーバーの起動に失敗しました: ポート ${configuredPort} から ${lastTriedPort} までがすべて使用中か、他のエラーが発生しました。`);
-                new Notice(`エラー: サーバーを起動できませんでした。ポート ${configuredPort}-${lastTriedPort} が使用中の可能性があります。実行中のアプリケーションを確認するか、設定で別のポートを選択してください。`, 15000);
+                const lastTriedPort = Math.min(configuredPort + maxAttempts - 1, 65535);
+                console.error(`サーバー起動失敗: ${configuredPort}〜${lastTriedPort} が使用中/エラー`);
+                new Notice(`サーバーを起動できませんでした。${configuredPort}-${lastTriedPort} が使用中の可能性。別ポートを設定してください。`, 15000);
                 this.server = null;
                 return;
             }
@@ -55,6 +61,10 @@ export class HttpServerManager {
                 if (error.code === 'EADDRINUSE') {
                     console.warn(`ポート ${portToTry} は使用中です。次のポート (${portToTry + 1}) を試します...`);
                     attemptListen(portToTry + 1);
+                } else if (error.code === 'EACCES') {
+                    console.error(`ポート ${portToTry} へのバインドに権限がありません。`, error);
+                    new Notice(`ポート ${portToTry} は権限が必要です。別のポートを設定してください。`, 12000);
+                    this.server = null;
                 } else {
                     console.error(`ポート ${portToTry} でのHTTPサーバーエラー:`, error);
                     new Notice(`HTTP サーバーエラー (${error.code}): ${error.message}。サーバーは起動されません。コンソールを確認してください。`, 10000);
@@ -65,6 +75,13 @@ export class HttpServerManager {
             newServer.on('listening', async () => {
                 newServer.removeAllListeners('error');
                 this.server = newServer; // 成功したらサーバーインスタンスを保持
+                // セキュリティ&実運用: タイムアウトの短縮とプロセス解放
+                try {
+                    (newServer as any).headersTimeout = 10_000; // Node型定義が古い環境に備えて any キャスト
+                    (newServer as any).requestTimeout = 10_000;
+                    (newServer as any).keepAliveTimeout = 5_000;
+                    newServer.unref();
+                } catch {}
                 const successfulPort = (newServer.address() as net.AddressInfo).port;
                 console.log(`HTTPサーバーは http://127.0.0.1:${successfulPort}/oauth2callback で正常にリッスンしています`);
 
@@ -174,11 +191,14 @@ export class HttpServerManager {
             try {
                 // AuthService の handleOAuthCallback を呼び出す
                 await this.plugin.authService.handleOAuthCallback(params);
-                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff' });
                 res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Auth Success</title></head><body>認証に成功しました。Obsidian に戻ってください。</body></html>`);
+                if (this.plugin.settings.autoStopOnSuccess) {
+                    setTimeout(() => this.stopServer().catch(()=>{}), 300);
+                }
             } catch (error: any) {
                 console.error("HTTP経由でのOAuthコールバック処理中にエラー:", error);
-                res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+                res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff' });
                 const msg = String(error?.message || '不明なエラー')
                     .replace(/</g, '&lt;').replace(/>/g, '&gt;');
                 res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Auth Failed</title></head><body>認証に失敗しました: ${msg}</body></html>`);
