@@ -40,59 +40,106 @@ export class BatchProcessor {
         }
         console.time("BatchProcessor: Execute All Batches");
 
-        for (let i = 0; i < batchRequests.length; i += this.BATCH_SIZE) {
-            const batchChunk = batchRequests.slice(i, i + this.BATCH_SIZE);
-            const batchIndex = Math.floor(i / this.BATCH_SIZE) + 1;
-            console.log(`バッチ ${batchIndex}/${totalBatches} 実行`);
-            if (this.settings.showNotices) {
-                new Notice(`バッチ ${batchIndex}/${totalBatches} を送信中...`, 2000);
+        // --- 並列 + AIMD（加算増加・乗算減少）制御 ---
+        const hardCap = this.BATCH_SIZE; // HTTP 1 本あたりの上限
+        let unit = Math.min(hardCap, Math.max(1, this.settings.desiredBatchSize ?? 50)); // 投下単位
+        let inFlight = Math.max(1, this.settings.maxInFlightBatches ?? 2);              // 同時本数
+        const step = Math.max(1, Math.floor(unit * 0.2));                                // 成功時の増分（+20%）
+        const sla = this.settings.latencySLAms ?? 1500;                                  // p95 SLA
+        const cooldown = this.settings.rateErrorCooldownMs ?? 1000;                      // レート時の冷却
+        const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
+
+        let idx = 0;
+        console.log(`${batchRequests.length} 件を最大 ${inFlight} 並列・単位 ${unit} で開始（HTTP上限:${hardCap}）`);
+
+        const mapByContentId = (results: BatchResponseItem[], chunk: BatchRequestItem[]) => {
+            const out: BatchResponseItem[] = new Array(chunk.length);
+            for (let j = 0; j < results.length; j++) {
+                const cid = results[j]?.contentId;
+                if (cid && /^item-\d+$/.test(cid)) {
+                    const pos = Number(cid.split('-')[1]) - 1;
+                    if (pos >= 0 && pos < chunk.length) { out[pos] = results[j]; continue; }
+                }
+                out[j] = results[j];
+            }
+            return out;
+        };
+
+        const padResultsIfShort = (results: BatchResponseItem[], expected: number) => {
+            if (results.length >= expected) return results;
+            const missing = expected - results.length;
+            console.warn(`Batch results short by ${missing} item(s). Padding with 500s.`);
+            return results.concat(Array.from({ length: missing }, () => ({ status: 500, body: { error: { message: 'Missing response' } } })));
+        };
+
+        while (idx < batchRequests.length) {
+            if (signal?.aborted) throw new Error('AbortError');
+
+            // 今波で投下する並列チャンクを構築
+            const chunks: BatchRequestItem[][] = [];
+            for (let k = 0; k < inFlight && idx < batchRequests.length; k++) {
+                const next = batchRequests.slice(idx, Math.min(idx + unit, batchRequests.length));
+                if (next.length > 0) chunks.push(next);
+                idx += unit;
             }
 
-            try {
-                console.time(`BatchProcessor: Execute Batch ${batchIndex}`);
-                const raw = await executeBatch(batchChunk, signal);
-                console.timeEnd(`BatchProcessor: Execute Batch ${batchIndex}`);
-                const mapByContentId = (results: BatchResponseItem[], chunk: BatchRequestItem[]) => {
-                    const out: BatchResponseItem[] = new Array(chunk.length);
-                    for (let j = 0; j < results.length; j++) {
-                        const cid = results[j]?.contentId;
-                        if (cid && /^item-\d+$/.test(cid)) {
-                            const idx = Number(cid.split('-')[1]) - 1;
-                            if (idx >= 0 && idx < chunk.length) {
-                                out[idx] = results[j];
-                                continue;
-                            }
+            const waveLatencies: number[] = [];
+            let hadRateIssues = false;
+
+            const settled = await Promise.allSettled(
+                chunks.map(async (chunk) => {
+                    try {
+                        const t0 = performance.now();
+                        const raw = await executeBatch(chunk, signal);
+                        const t1 = performance.now();
+                        const latency = t1 - t0;
+                        waveLatencies.push(latency);
+
+                        let out = mapByContentId(raw, chunk);
+                        out = padResultsIfShort(out, chunk.length);
+
+                        allResults.push(...out);
+                        const agg = this.processBatchResults(out, chunk);
+                        created += agg.created; updated += agg.updated; deleted += agg.deleted; errors += agg.errors; skipped += agg.skipped;
+
+                        // レート/一時エラーのシグナル
+                        if (out.some(r => r?.status === 429 || r?.status === 500 || r?.status === 502 || r?.status === 503 || r?.status === 403)) {
+                            hadRateIssues = true;
                         }
-                        out[j] = results[j];
+                    } catch (e: any) {
+                        // チャンク単位の失敗は 500 で合成し計上
+                        console.error('HTTP バッチ失敗:', e?.message || e);
+                        hadRateIssues = true;
+                        const synthetic: BatchResponseItem[] = Array.from({ length: chunk.length }, () => ({ status: 500, body: { error: { message: e?.message || 'Batch failed' } } }));
+                        allResults.push(...synthetic);
+                        const agg = this.processBatchResults(synthetic, chunk);
+                        created += agg.created; updated += agg.updated; deleted += agg.deleted; errors += agg.errors; skipped += agg.skipped;
                     }
-                    return out;
-                };
+                })
+            );
 
-                const padResultsIfShort = (results: BatchResponseItem[], expected: number) => {
-                    if (results.length >= expected) return results;
-                    const missing = expected - results.length;
-                    console.warn(`Batch results short by ${missing} item(s). Padding with 500s.`);
-                    return results.concat(
-                        Array.from({ length: missing }, () => ({ status: 500, body: { error: { message: 'Missing response' } } }))
-                    );
-                };
+            // 並列のうち致命失敗（settled: rejected）は上の catch で処理済みだが念のためログ
+            settled.forEach(s => { if (s.status === 'rejected') console.error('並列実行失敗:', s.reason); });
 
-                const mapped = mapByContentId(raw, batchChunk);
-                const results = padResultsIfShort(mapped, batchChunk.length);
-                allResults.push(...results);
+            // p95 計算
+            const sorted = waveLatencies.slice().sort((a,b)=>a-b);
+            const p95 = sorted.length ? sorted[Math.min(sorted.length - 1, Math.ceil(0.95 * sorted.length) - 1)] : 0;
 
-                const { created: c, updated: u, deleted: d, errors: e, skipped: s } = 
-                    this.processBatchResults(results, batchChunk);
-                created += c; updated += u; deleted += d; errors += e; skipped += s;
-            } catch (e: any) {
-                errors += this.handleBatchError(e, batchChunk, allResults);
+            // AIMD 調整
+            if (hadRateIssues || p95 > sla) {
+                unit = Math.max(5, Math.floor(unit / 2));
+                inFlight = Math.max(1, Math.floor(inFlight / 2));
+                if (cooldown > 0) await sleep(cooldown);
+            } else {
+                unit = Math.min(hardCap, unit + step);
+                inFlight = Math.min(Math.max(1, this.settings.maxInFlightBatches ?? 2), inFlight + 1);
             }
 
-            // 次のバッチがある場合、レート制限回避のために遅延（±25% ジッタ）
-            if (i + this.BATCH_SIZE < batchRequests.length && (this.settings.interBatchDelay ?? 0) > 0) {
+            // ジッタ付きインターバッチ遅延（次の波がある場合）
+            if (idx < batchRequests.length && (this.settings.interBatchDelay ?? 0) > 0) {
                 const base = this.settings.interBatchDelay!;
                 const jittered = Math.floor(base * (Math.random() * 0.5 + 0.75));
-                await new Promise(resolve => setTimeout(resolve, jittered));
+                await sleep(jittered);
             }
         }
 
@@ -100,41 +147,7 @@ export class BatchProcessor {
         return { results: allResults, created, updated, deleted, errors, skipped };
     }
 
-    private handleBatchError(
-        error: any,
-        batchChunk: BatchRequestItem[],
-        allResults: BatchResponseItem[]
-    ): number {
-        // ネットワークや一括失敗など: ここで 200 を作らない
-        console.error(`バッチエラー:`, error);
-        let errorCount = 0;
-        const isGone = error?.status === 410;
-
-        for (const req of batchChunk) {
-            if (isGone) {
-                if (req.operationType === 'delete' || req.operationType === 'patch' || req.operationType === 'update') {
-                    // 上位でスキップ扱い/後続フォールバックできるよう 404/410 を返す（410 を採用）
-                    allResults.push({ status: 410, body: { error: { message: 'Gone' } } });
-                } else {
-                    // insert は恒久失敗寄りとしてカウント
-                    allResults.push({ status: 500, body: { error: { message: 'Batch Gone' } } });
-                    errorCount++;
-                }
-            } else {
-                // 不明な失敗は 500 相当
-                allResults.push({
-                    status: 500,
-                    body: { error: { message: error?.message || '不明なエラー' } }
-                });
-                errorCount++;
-            }
-        }
-
-        if (this.settings.showNotices) {
-            new Notice(`バッチでエラー発生。コンソールを確認してください。`, 10_000);
-        }
-        return errorCount;
-    }
+    // 旧 handleBatchError は並列+AIMD 化により呼び出し箇所が無くなったため削除
 
     private processBatchResults(
         results: BatchResponseItem[],
