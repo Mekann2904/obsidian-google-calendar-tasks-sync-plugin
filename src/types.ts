@@ -41,9 +41,10 @@ export interface GoogleCalendarTasksSyncSettings {
 	/**
 	 * ディスク保存用の暗号化トークン（Electron safeStorage で暗号化した Base64 文字列）。
 	 */
-	tokensEncrypted?: string | null;
-	encryptionPassphrase?: string | null; // safeStorage不可時のフォールバック用（任意）
-	rememberPassphrase?: boolean; // パスフレーズを設定ファイルに保存（安全性低下・デフォルトfalse）
+    tokensEncrypted?: string | null; // 'obf:<base64>' または 'aesgcm:<base64>' を格納
+    encryptionPassphrase?: string | null; // パスフレーズ保存（任意）
+    rememberPassphrase?: boolean; // パスフレーズを設定ファイルに保存（既定false）
+    obfuscationSalt?: string | null; // 難読化用のソルト（インストールごとにランダム）
 	calendarId: string; // 同期対象の Google Calendar ID (通常 'primary' または特定のカレンダーID)
 	syncIntervalMinutes: number; // 自動同期の間隔 (分単位)
 	autoSync: boolean; // 自動同期を有効にするか

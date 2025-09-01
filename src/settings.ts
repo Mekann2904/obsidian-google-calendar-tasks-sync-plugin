@@ -1,5 +1,5 @@
 import { App, PluginSettingTab, Setting, Notice, TextComponent, ExtraButtonComponent } from 'obsidian';
-import { isEncryptionAvailable } from './security';
+import { isEncryptionAvailable, getSafeStorageStatus } from './security';
 import moment from 'moment';
 import { GoogleCalendarTasksSyncSettings } from './types';
 import GoogleCalendarTasksSyncPlugin from './main'; // main.ts からインポート
@@ -581,7 +581,8 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 		// --- セキュリティ/保存方式 ステータス ---
 		containerEl.createEl('h4', { text: 'セキュリティ/保存方式' });
         {
-            const safeAvail = isEncryptionAvailable();
+            const status = getSafeStorageStatus();
+            const safeAvail = status.available;
             const enc = this.plugin.settings.tokensEncrypted || '';
             const hasEnc = !!enc;
             const isPassEnc = hasEnc && enc.startsWith('aesgcm:');
@@ -596,10 +597,15 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 			new Setting(containerEl)
 				.setName('保存方式')
 				.setDesc(mode)
-				.addExtraButton(b => {
-					b.setIcon(safeAvail ? 'shield' : 'alert-circle')
-					 .setTooltip(safeAvail ? 'safeStorage 利用可能' : 'safeStorage 利用不可');
-				});
+                .addExtraButton(b => {
+                    b.setIcon(safeAvail ? 'shield' : 'alert-circle')
+                     .setTooltip(safeAvail ? `safeStorage 利用可能 [method=${status.method}]` : `safeStorage 利用不可${status.error ? ' - '+status.error : ''}`);
+                })
+                .addExtraButton(b => {
+                    b.setIcon('refresh-cw')
+                     .setTooltip('状態を再判定')
+                     .onClick(() => this.display());
+                });
 
 			// 現在の動作モード（より明確な表示）
 			const currentMode = (this.plugin as any).getEncryptionModeLabel ? (this.plugin as any).getEncryptionModeLabel() : mode;
