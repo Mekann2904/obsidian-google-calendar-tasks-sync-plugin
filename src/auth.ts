@@ -3,13 +3,14 @@
 import { Notice } from 'obsidian';
 import { OAuth2Client, Credentials } from 'google-auth-library';
 import { google } from 'googleapis';
-import { randomBytes } from 'crypto';
+import { randomBytes, createHash } from 'crypto';
 import GoogleCalendarTasksSyncPlugin from './main'; // main.ts からインポート
 import { DEFAULT_SETTINGS } from './settings'; // DEFAULT_SETTINGS をインポート
 
 export class AuthService {
     private plugin: GoogleCalendarTasksSyncPlugin;
     private activeOAuthState: string | null = null;
+    private activePkceVerifier: string | null = null;
 
     constructor(plugin: GoogleCalendarTasksSyncPlugin) {
         this.plugin = plugin;
@@ -86,8 +87,7 @@ export class AuthService {
             try {
                  await this.plugin.saveData(this.plugin.settings); // 更新されたトークンを永続化
                  console.log("更新されたトークンは正常に保存されました。");
-                 // トークンが更新されたので、APIクライアントも再初期化/更新
-                 this.initializeCalendarApi();
+                 // 再初期化は不要（oauth2Client を calendar に渡しているため自動で反映）
             } catch (saveError) {
                  console.error("更新されたトークンの保存に失敗しました:", saveError);
                  new Notice("更新された Google トークンの保存中にエラーが発生しました。コンソールを確認してください。", 5000);
@@ -149,13 +149,19 @@ export class AuthService {
             console.log("生成された OAuth state:", this.activeOAuthState);
 
             // 認証URLを生成
+            // PKCE (S256) を使用
+            const codeVerifier = this.generatePkceVerifier();
+            this.activePkceVerifier = codeVerifier;
+            const codeChallenge = this.pkceChallenge(codeVerifier);
+
             const authUrl = this.plugin.oauth2Client.generateAuthUrl({
-                access_type: 'offline', // リフレッシュトークンを取得するため
-                scope: ['https://www.googleapis.com/auth/calendar.events'], // カレンダーイベントへのアクセス権限
-                prompt: 'consent', // 常に同意画面を表示 (リフレッシュトークン再取得のため)
-                state: this.activeOAuthState, // CSRF対策
-                redirect_uri: currentRedirectUri // コールバックを受け取るURI
-            });
+                access_type: 'offline',
+                scope: ['https://www.googleapis.com/auth/calendar.events'],
+                state: this.activeOAuthState,
+                redirect_uri: currentRedirectUri,
+                code_challenge_method: 'S256' as any,
+                code_challenge: codeChallenge as any,
+            } as any);
 
             // 認証URLを既定ブラウザで開く（Obsidian/Electron 環境に対応）
             console.log('Google 認証 URL を開いています...');
@@ -226,7 +232,8 @@ export class AuthService {
             });
 
             console.log(`リダイレクト URI を使用してトークン交換を試行中: ${redirectUriForExchange}`);
-            const { tokens } = await tokenExchangeClient.getToken(code);
+            const tokenParams: any = { code, codeVerifier: this.activePkceVerifier, redirect_uri: redirectUriForExchange };
+            const { tokens } = await tokenExchangeClient.getToken(tokenParams);
             console.log('トークンを正常に受信しました。');
 
             const currentRefreshToken = this.plugin.settings.tokens?.refresh_token;
@@ -334,7 +341,6 @@ export class AuthService {
             this.plugin.clearAutoSync();
             this.plugin.settings.tokens = null;
             await this.plugin.saveData(this.plugin.settings);
-            this.initializeCalendarApi();
             return false;
         }
 
@@ -344,23 +350,10 @@ export class AuthService {
             return false;
         }
 
-        // クレデンシャルを適用し、必要なら getAccessToken() で更新をトリガー
+        // クレデンシャルを適用し、getRequestHeaders() で更新をトリガー（Authorization を返す）
         try {
             if (this.plugin.settings.tokens) client.setCredentials(this.plugin.settings.tokens);
-            await client.getAccessToken(); // 自動リフレッシュに任せる
-            // 直後に得られる client.credentials を反映（batch用 Authorization ヘッダーのため）
-            const currentRefreshToken = this.plugin.settings.tokens?.refresh_token;
-            const creds = client.credentials as Credentials;
-            const merged: Credentials = {
-                ...this.plugin.settings.tokens,
-                ...creds,
-                refresh_token: creds.refresh_token || currentRefreshToken,
-            };
-            if (merged.access_token) {
-                this.plugin.settings.tokens = merged;
-                await this.plugin.saveData(this.plugin.settings);
-            }
-            this.initializeCalendarApi();
+            await client.getRequestHeaders(); // 期限切れなら自動更新
             return true;
         } catch (error: any) {
             console.error("アクセストークン取得/更新に失敗:", error);
@@ -373,10 +366,27 @@ export class AuthService {
                 this.plugin.settings.tokens = null;
                 await this.plugin.saveData(this.plugin.settings);
                 this.plugin.clearAutoSync();
-                this.initializeCalendarApi();
             }
             new Notice(noticeMsg, 15000);
             return false;
         }
+    }
+
+    // ------------------------------------------------------------------
+    // PKCE ユーティリティ
+    // ------------------------------------------------------------------
+    private generatePkceVerifier(): string {
+        // 43〜128文字の英数+[-._~]
+        const buf = randomBytes(32);
+        return this.base64url(buf);
+    }
+
+    private pkceChallenge(verifier: string): string {
+        const hash = createHash('sha256').update(verifier).digest();
+        return this.base64url(hash);
+    }
+
+    private base64url(input: Buffer): string {
+        return input.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
     }
 }

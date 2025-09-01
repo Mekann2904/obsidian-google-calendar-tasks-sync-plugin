@@ -151,11 +151,15 @@ export class GCalApiService {
         });
         body += `--${boundary}--\r\n`;
 
+        // OAuth クライアントから Authorization ヘッダーを取得（必要なら自動更新）
+        if (!this.plugin.oauth2Client) throw new Error('OAuth クライアント未初期化');
+        const authHeaders = await this.plugin.oauth2Client.getRequestHeaders();
+
         const requestParams: RequestUrlParam = {
             url: batchUrl,
             method: "POST",
             headers: {
-                Authorization: `Bearer ${this.plugin.settings.tokens!.access_token}`,
+                ...authHeaders, // { Authorization: 'Bearer ...' }
                 "Content-Type": `multipart/mixed; boundary=${boundary}`,
             },
             body,
