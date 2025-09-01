@@ -74,6 +74,15 @@ export interface GoogleCalendarTasksSyncSettings {
 	batchSize?: number; // バッチ1回あたりの最大リクエスト数（最大1000、課金/レートはアイテム数で加算）
 	recentErrors?: ErrorLog[]; // 最近のエラーサンプル（診断用）
 	useSyncToken?: boolean; // 可能な場合、syncToken による増分取得を使用
+	/**
+	 * 初回フル取得時の events.list フィルタ署名（syncToken 条件固定の自己監査用）
+	 */
+	listFilterSignature?: {
+		calendarId: string;
+		privateExtendedProperty: string[];
+		singleEvents: boolean;
+		fields: string;
+	};
 }
 
 // バッチリクエスト用のインターフェース

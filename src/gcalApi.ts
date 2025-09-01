@@ -1,4 +1,4 @@
-import { Notice, request, RequestUrlParam } from 'obsidian';
+import { Notice, requestUrl, RequestUrlParam, RequestUrlResponse } from 'obsidian';
 import { calendar_v3 } from 'googleapis';
 import { randomBytes } from 'crypto';
 import GoogleCalendarTasksSyncPlugin from './main';
@@ -42,6 +42,29 @@ export class GCalApiService {
             // ペイロード削減（必要最小限のフィールド）+ originalStartTime 追加
             fields: 'items(id,etag,status,updated,extendedProperties,recurringEventId,originalStartTime),nextPageToken,nextSyncToken',
         };
+
+        // [自己監査] syncToken 条件固定: 初回フル取得のフィルタ署名を保存し、増分時に比較（差異があれば警告）。
+        const sig = {
+            calendarId: requestParams.calendarId!,
+            privateExtendedProperty: (requestParams.privateExtendedProperty || []).slice().sort(),
+            singleEvents: !!requestParams.singleEvents,
+            fields: requestParams.fields || '',
+        };
+        const savedSig = (this.plugin as any).settings?.listFilterSignature as typeof sig | undefined;
+        if (!trySyncToken && !savedSig) {
+            (this.plugin as any).settings.listFilterSignature = sig;
+            try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
+        } else if (trySyncToken && savedSig) {
+            const same = (
+                savedSig.calendarId === sig.calendarId &&
+                savedSig.singleEvents === sig.singleEvents &&
+                savedSig.fields === sig.fields &&
+                JSON.stringify(savedSig.privateExtendedProperty) === JSON.stringify(sig.privateExtendedProperty)
+            );
+            if (!same) {
+                console.warn('syncToken 使用時のクエリ条件が初回と一致しません。将来の無効化(410)の原因になり得ます。', { savedSig, current: sig });
+            }
+        }
 
         if (trySyncToken) {
             requestParams.syncToken = (this.plugin as any).settings.syncToken;
@@ -136,7 +159,9 @@ export class GCalApiService {
                 lastError = e;
                 const status = isGaxiosError(e) ? (e.response?.status ?? 0) : 0;
                 if (status === 429 || status >= 500) {
-                    const delay = Math.min(800 * (2 ** i), 4000);
+                    const base = Math.min(800 * (2 ** i), 4000);
+                    const jitter = Math.floor(Math.random() * 200);
+                    const delay = base + jitter;
                     console.warn(`events.list ${status}. retry in ${delay}ms...`);
                     await new Promise(r => setTimeout(r, delay));
                     continue;
@@ -160,6 +185,12 @@ export class GCalApiService {
         const tokenRefreshed = await this.plugin.authService.ensureAccessToken();
         if (!tokenRefreshed) {
             throw new Error("バッチリクエストを実行できません: 認証トークンを取得できませんでした。");
+        }
+
+        // 0) 空バッチは送らない
+        if (!batchRequests || batchRequests.length === 0) {
+            console.log('バッチ要求は空。送信をスキップします。');
+            return [];
         }
 
         // 2) multipart/mixed リクエストを組み立て
@@ -223,42 +254,30 @@ export class GCalApiService {
         };
 
         // 3) 送信（429/5xx のトップレベルに軽リトライ）
-        const fetchWithRetry = async (): Promise<string> => {
+        const fetchWithRetry = async (): Promise<RequestUrlResponse> => {
             const max = 4;
             for (let i = 0; i < max; i++) {
-                const res = await request(requestParams);
-                // JSON エラー形式ならコードを確認
-                try {
-                    const obj = JSON.parse(res);
-                    const code = obj?.error?.code as number | undefined;
-                    if (code && (code === 429 || code >= 500)) {
-                        const delay = Math.min(1600 * (2 ** i), 8000);
-                        console.warn(`Batch top-level ${code}. retry in ${delay}ms...`);
-                        await new Promise(r => setTimeout(r, delay));
-                        continue;
-                    }
-                } catch {}
-                // 文字列に HTTP ステータス行がある場合（例: エラー応答）
-                const m = /^(?:HTTP\/\d(?:\.\d+)?)\s+(\d{3})/m.exec(res);
-                if (m) {
-                    const code = parseInt(m[1], 10);
-                    if (code === 429 || code >= 500) {
-                        const delay = Math.min(1600 * (2 ** i), 8000);
-                        console.warn(`Batch top-level ${code}. retry in ${delay}ms...`);
-                        await new Promise(r => setTimeout(r, delay));
-                        continue;
-                    }
+                const res = await requestUrl(requestParams);
+                if (res.status === 429 || res.status >= 500) {
+                    const base = Math.min(1600 * (2 ** i), 8000);
+                    const jitter = Math.floor(Math.random() * 400);
+                    const delay = base + jitter;
+                    console.warn(`Batch top-level ${res.status}. retry in ${delay}ms...`);
+                    await new Promise(r => setTimeout(r, delay));
+                    continue;
                 }
                 return res;
             }
-            return await request(requestParams);
+            return await requestUrl(requestParams);
         };
         try {
             console.log(`${batchRequests.length} 件の操作を含むバッチリクエストを送信中...`);
-            const responseText = await fetchWithRetry();
+            const res = await fetchWithRetry();
+            const responseText = res.text;
 
-            // 4) multipart の boundary はレスポンス独自なので本文から検出してパース
-            const results = this.parseBatchResponse(responseText); // FIX: boundary 引数を廃止し自動検出
+            // 4) multipart の boundary は Content-Type ヘッダ優先で検出（本文スキャンはフォールバック）
+            const ct = res.headers['content-type'] || res.headers['Content-Type'];
+            const results = this.parseBatchResponse(responseText, ct as string | undefined);
 
             // 404/409/410 は item-level の警告として集計
             const ignorable = new Set([404, 409, 410, 412]);
@@ -311,11 +330,12 @@ export class GCalApiService {
      * レスポンス本文から boundary を自動検出し、multipart をパースします。
      * 返り値は part ごとの HTTP ステータスと JSON ボディ（可能な範囲で）です。
      */
-    private parseBatchResponse(responseText: string): BatchResponseItem[] {
+    private parseBatchResponse(responseText: string, contentType?: string): BatchResponseItem[] {
         const results: BatchResponseItem[] = [];
 
-        // FIX: レスポンス側 boundary を自動抽出
-        const boundary = this.detectResponseBoundary(responseText);
+        // FIX: レスポンス側 boundary を Content-Type から優先抽出（なければ本文から推定）
+        let boundary = this.detectBoundaryFromContentType(contentType);
+        if (!boundary) boundary = this.detectResponseBoundary(responseText);
         if (!boundary) {
             console.warn("レスポンスの boundary を検出できませんでした。");
             return results;
@@ -343,6 +363,12 @@ export class GCalApiService {
 
         console.log(`${results.length} 件のバッチ応答アイテムを抽出しました。`);
         return results;
+    }
+
+    private detectBoundaryFromContentType(ct?: string): string | null {
+        if (!ct) return null;
+        const m = /boundary="?([^";]+)"?/i.exec(ct);
+        return m?.[1] ?? null;
     }
 
     // FIX: レスポンス本文から最初の boundary トークンを推定
