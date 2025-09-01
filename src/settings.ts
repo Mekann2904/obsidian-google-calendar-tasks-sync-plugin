@@ -9,6 +9,7 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 	tokens: null, // メモリのみ。ディスクは tokensEncrypted を使用
 	tokensEncrypted: null,
 	encryptionPassphrase: null,
+	rememberPassphrase: false,
 	calendarId: 'primary',
 	syncIntervalMinutes: 15,
 	autoSync: true,
@@ -541,20 +542,39 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 					});
 			});
 
-		// パスフレーズ（安全保存フォールバック用）
-		new Setting(containerEl)
-			.setName('暗号化パスフレーズ（任意・非保存）')
-			.setDesc('safeStorage が使えない環境での一時的な暗号化鍵。入力はメモリにのみ保持し、ディスクへは保存しない。再起動時は再入力が必要。')
-			.addText(text => {
-				text.inputEl.type = 'password';
-				text.setPlaceholder('未設定（任意）')
-					.setValue('')
-					.onChange((value) => {
-						// 非保存: メモリにのみ保持
-						// @ts-ignore
-						this.plugin.passphraseCache = value || null;
-						new Notice('パスフレーズを一時適用しました（保存されません）。', 3000);
-					});
-			});
+        // パスフレーズ（安全保存フォールバック用）
+        new Setting(containerEl)
+            .setName('暗号化パスフレーズ')
+            .setDesc('safeStorage が使えない環境で refresh_token を暗号化保存する鍵。保存オプションOFF時はメモリのみ（再起動で消える）。')
+            .addText(text => {
+                text.inputEl.type = 'password';
+                text.setPlaceholder('未設定（任意）')
+                    .setValue(this.plugin.settings.rememberPassphrase ? (this.plugin.settings.encryptionPassphrase || '') : '')
+                    .onChange(async (value) => {
+                        // rememberPassphrase に応じて保存 or 一時適用
+                        if (this.plugin.settings.rememberPassphrase) {
+                            this.plugin.settings.encryptionPassphrase = value || null;
+                            await this.plugin.saveData(this.plugin.settings);
+                        } else {
+                            // @ts-ignore
+                            this.plugin.passphraseCache = value || null;
+                        }
+                        new Notice('パスフレーズを適用しました。', 2000);
+                    });
+            });
+
+        new Setting(containerEl)
+            .setName('パスフレーズを保存（安全性低下）')
+            .setDesc('ONにするとパスフレーズを設定ファイルに保存し、再起動後も入力不要になる（機密性は低下）。')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.rememberPassphrase || false)
+                .onChange(async (v) => {
+                    this.plugin.settings.rememberPassphrase = v;
+                    if (!v) {
+                        this.plugin.settings.encryptionPassphrase = null; // 保存しない
+                    }
+                    await this.plugin.saveData(this.plugin.settings);
+                    this.display();
+                }));
 	}
 }

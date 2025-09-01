@@ -144,8 +144,9 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
             if (this.settings.tokensEncrypted && !this.settings.tokens?.refresh_token) {
                 let json: string | null = null;
                 if (this.settings.tokensEncrypted.startsWith('aesgcm:')) {
-                    if (this.passphraseCache) {
-                        json = decryptWithPassphrase(this.settings.tokensEncrypted, this.passphraseCache);
+                    const pass = this.passphraseCache || this.settings.encryptionPassphrase || null;
+                    if (pass) {
+                        json = decryptWithPassphrase(this.settings.tokensEncrypted, pass);
                     } else {
                         console.warn('暗号化トークンが存在しますが、パスフレーズが未設定のため復号できません。');
                         new Notice('暗号化されたトークンを復号できません。設定でパスフレーズを入力し、再試行してください。', 10000);
@@ -182,10 +183,11 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
         this.settings.tokens = tokens && tokens.refresh_token ? ({ refresh_token: tokens.refresh_token } as any) : null;
         if (tokens && tokens.refresh_token) {
             if (!isEncryptionAvailable()) {
-                if (this.passphraseCache) {
+                const pass = this.passphraseCache || this.settings.encryptionPassphrase || null;
+                if (pass) {
                     try {
                         const json = JSON.stringify({ refresh_token: tokens.refresh_token });
-                        this.settings.tokensEncrypted = encryptWithPassphrase(json, this.passphraseCache);
+                        this.settings.tokensEncrypted = encryptWithPassphrase(json, pass);
                         await super.saveData({ ...this.settings, tokens: null });
                         return;
                     } catch (e) {
