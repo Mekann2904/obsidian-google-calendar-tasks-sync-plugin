@@ -4,13 +4,17 @@ import { BatchRequestItem, BatchResponseItem, GoogleCalendarTasksSyncSettings } 
 export class BatchProcessor {
     // Google Calendar API のバッチリクエストは、公式ドキュメント上、最大50リクエストまで。
     // See: https://developers.google.com/calendar/api/guides/batch
-    private readonly BATCH_SIZE = 50;
+    private readonly BATCH_SIZE: number;
 
-    constructor(private settings: GoogleCalendarTasksSyncSettings) {}
+    constructor(private settings: GoogleCalendarTasksSyncSettings) {
+        const sz = Number(this.settings.batchSize ?? 50);
+        this.BATCH_SIZE = Math.max(1, Math.min(50, isNaN(sz) ? 50 : sz));
+    }
 
     async executeBatches(
         batchRequests: BatchRequestItem[],
-        executeBatch: (batch: BatchRequestItem[]) => Promise<BatchResponseItem[]>
+        executeBatch: (batch: BatchRequestItem[], signal?: AbortSignal) => Promise<BatchResponseItem[]>,
+        signal?: AbortSignal
     ): Promise<{
         results: BatchResponseItem[];
         created: number;
@@ -46,8 +50,35 @@ export class BatchProcessor {
 
             try {
                 console.time(`BatchProcessor: Execute Batch ${batchIndex}`);
-                const results = await executeBatch(batchChunk);
+                const raw = await executeBatch(batchChunk, signal);
                 console.timeEnd(`BatchProcessor: Execute Batch ${batchIndex}`);
+                const mapByContentId = (results: BatchResponseItem[], chunk: BatchRequestItem[]) => {
+                    const out: BatchResponseItem[] = new Array(chunk.length);
+                    for (let j = 0; j < results.length; j++) {
+                        const cid = results[j]?.contentId;
+                        if (cid && /^item-\d+$/.test(cid)) {
+                            const idx = Number(cid.split('-')[1]) - 1;
+                            if (idx >= 0 && idx < chunk.length) {
+                                out[idx] = results[j];
+                                continue;
+                            }
+                        }
+                        out[j] = results[j];
+                    }
+                    return out;
+                };
+
+                const padResultsIfShort = (results: BatchResponseItem[], expected: number) => {
+                    if (results.length >= expected) return results;
+                    const missing = expected - results.length;
+                    console.warn(`Batch results short by ${missing} item(s). Padding with 500s.`);
+                    return results.concat(
+                        Array.from({ length: missing }, () => ({ status: 500, body: { error: { message: 'Missing response' } } }))
+                    );
+                };
+
+                const mapped = mapByContentId(raw, batchChunk);
+                const results = padResultsIfShort(mapped, batchChunk.length);
                 allResults.push(...results);
 
                 const { created: c, updated: u, deleted: d, errors: e, skipped: s } = 
@@ -57,9 +88,11 @@ export class BatchProcessor {
                 errors += this.handleBatchError(e, batchChunk, allResults);
             }
 
-            // FIX: 次のバッチがある場合、レート制限回避のために遅延を設ける
-            if (i + this.BATCH_SIZE < batchRequests.length && this.settings.interBatchDelay > 0) {
-                await new Promise(resolve => setTimeout(resolve, this.settings.interBatchDelay));
+            // 次のバッチがある場合、レート制限回避のために遅延（±25% ジッタ）
+            if (i + this.BATCH_SIZE < batchRequests.length && (this.settings.interBatchDelay ?? 0) > 0) {
+                const base = this.settings.interBatchDelay!;
+                const jittered = Math.floor(base * (Math.random() * 0.5 + 0.75));
+                await new Promise(resolve => setTimeout(resolve, jittered));
             }
         }
 
@@ -72,32 +105,35 @@ export class BatchProcessor {
         batchChunk: BatchRequestItem[],
         allResults: BatchResponseItem[]
     ): number {
+        // ネットワークや一括失敗など: ここで 200 を作らない
+        console.error(`バッチエラー:`, error);
         let errorCount = 0;
-        if (error.status === 410) {
-            console.warn(`バッチが 410 Gone: リソースは既に削除済み`);
-            for (const req of batchChunk) {
-                if (req.operationType === 'delete') {
-                    // 削除済みとして扱う
-                } else if (req.operationType === 'patch' || req.operationType === 'update') {
-                    // スキップとして扱う
+        const isGone = error?.status === 410;
+
+        for (const req of batchChunk) {
+            if (isGone) {
+                if (req.operationType === 'delete' || req.operationType === 'patch' || req.operationType === 'update') {
+                    // 上位でスキップ扱い/後続フォールバックできるよう 404/410 を返す（410 を採用）
+                    allResults.push({ status: 410, body: { error: { message: 'Gone' } } });
                 } else {
+                    // insert は恒久失敗寄りとしてカウント
+                    allResults.push({ status: 500, body: { error: { message: 'Batch Gone' } } });
                     errorCount++;
                 }
-                allResults.push({ status: 200, body: {} });
+            } else {
+                // 不明な失敗は 500 相当
+                allResults.push({
+                    status: 500,
+                    body: { error: { message: error?.message || '不明なエラー' } }
+                });
+                errorCount++;
             }
-            return errorCount;
-        } else {
-            console.error(`バッチエラー:`, error);
-            const fake = batchChunk.map(() => ({ 
-                status: 500, 
-                body: { error: { message: error.message || '不明なエラー' } } 
-            }));
-            allResults.push(...fake);
-            if (this.settings.showNotices) {
-                new Notice(`バッチでエラー発生。コンソールを確認してください。`, 10000);
-            }
-            return batchChunk.length;
         }
+
+        if (this.settings.showNotices) {
+            new Notice(`バッチでエラー発生。コンソールを確認してください。`, 10_000);
+        }
+        return errorCount;
     }
 
     private processBatchResults(
