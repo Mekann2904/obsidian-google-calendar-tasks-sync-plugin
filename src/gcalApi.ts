@@ -27,18 +27,22 @@ export class GCalApiService {
         const existingEvents: calendar_v3.Schema$Event[] = [];
         let nextPageToken: string | undefined;
         let nextSyncToken: string | undefined;
-        const requestParams: calendar_v3.Params$Resource$Events$List = {
-            calendarId: settings.calendarId,
-            privateExtendedProperty: ["isGcalSync=true"],
-            showDeleted: false,
-            maxResults: 250,
-            singleEvents: false,
-        };
 
         // 重要: デフォルトは全件取得。一方で設定が有効でsyncTokenがある場合は増分取得を試行（失敗時は全件へフォールバック）。
         const trySyncToken = !!settings.useSyncToken && !!(this.plugin as any).settings?.syncToken;
+
+        // [重要] 同一条件原則: 初回フル取得と同一の検索条件を維持する。
+        // 但し、syncToken 使用時は showDeleted を有効化し、削除（cancelled）イベントを確実に取得する。
+        const requestParams: calendar_v3.Params$Resource$Events$List = {
+            calendarId: settings.calendarId,
+            privateExtendedProperty: ["isGcalSync=true"],
+            showDeleted: trySyncToken ? true : false, // 増分時は true（仕様順守）。フル取得時は false。
+            maxResults: 2500, // ページング削減（上限 2500）
+            singleEvents: false,
+        };
+
         if (trySyncToken) {
-            (requestParams as any).syncToken = (this.plugin as any).settings.syncToken;
+            requestParams.syncToken = (this.plugin as any).settings.syncToken;
             console.log(`syncToken による増分取得を試行します。`);
         } else {
             console.log(`管理対象イベントを全件取得します（updatedMin/time 窓は使用しません）。`);
@@ -75,9 +79,18 @@ export class GCalApiService {
             if (/Sync token is no longer valid/i.test(errorMsg) || /410/.test(String(e?.response?.status))) {
                 console.warn(`syncToken が無効のため、フル取得へフォールバックします。`);
                 try {
-                    delete (requestParams as any).syncToken;
+                    // フォールバック前に状態を完全クリア
+                    existingEvents.length = 0;
+                    nextPageToken = undefined;
+                    nextSyncToken = undefined;
+
+                    // パラメータ／保存トークンのクリア
+                    delete requestParams.syncToken;
+                    requestParams.showDeleted = false; // フル取得では削除ノイズを避ける
+                    requestParams.pageToken = undefined;
                     (this.plugin as any).settings.syncToken = undefined;
                     await (this.plugin as any).saveData((this.plugin as any).settings);
+
                     // 全件再取得
                     let page = 1;
                     do {
@@ -282,7 +295,8 @@ export class GCalApiService {
         const lines = partText.split(/\r?\n/);
 
         // `HTTP/` 行を探す
-        const statusLineIdx = lines.findIndex(l => /^HTTP\/\d\.\d\s+\d+/.test(l));
+        // HTTP/1.1 だけでなく HTTP/2 形式にも耐性を持たせる
+        const statusLineIdx = lines.findIndex(l => /^HTTP\/\d(?:\.\d+)?\s+\d+/.test(l));
         if (statusLineIdx === -1) {
             console.warn("バッチパート内で HTTP ステータス行が見つかりません:", lines.slice(0, 6).join("\n"));
             return null;
@@ -298,7 +312,7 @@ export class GCalApiService {
 
         // ステータス
         const statusLine = lines[statusLineIdx];
-        const statusMatch = statusLine.match(/^HTTP\/\d\.\d\s+(\d+)/);
+        const statusMatch = statusLine.match(/^HTTP\/\d(?:\.\d+)?\s+(\d+)/);
         const status = statusMatch ? parseInt(statusMatch[1], 10) : 500;
 
         // ボディ（空のこともある）
