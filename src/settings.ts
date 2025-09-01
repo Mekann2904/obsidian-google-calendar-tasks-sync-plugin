@@ -144,8 +144,8 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 		// 有効なリダイレクト URI (常に表示)
 		const effectiveRedirectUri = this.plugin.getRedirectUri();
 		new Setting(containerEl)
-			.setName('リダイレクト URI (Google Console に必要)')
-			.setDesc('この正確な URI を Google Cloud Console の「承認済みのリダイレクト URI」に追加してください。サーバーが異なるポートで自動起動した場合、Google Console の URI を更新する必要があります。')
+			.setName('リダイレクト URI')
+			.setDesc('クライアント種別が「デスクトップ アプリ」の場合は事前登録不要。クライアント種別が「Web アプリ」の場合、この正確な URI を Google Cloud Console の「承認済みのリダイレクト URI」に追加する。サーバーが異なるポートで自動起動した場合は登録値を更新する。')
 			.addText(text => {
 				text.inputEl.style.width = "100%";
 				text.inputEl.readOnly = true;

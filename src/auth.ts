@@ -2,7 +2,7 @@
 
 import { Notice } from 'obsidian';
 import { OAuth2Client, Credentials } from 'google-auth-library';
-import { google, calendar_v3 } from 'googleapis';
+import { google } from 'googleapis';
 import { randomBytes } from 'crypto';
 import GoogleCalendarTasksSyncPlugin from './main'; // main.ts からインポート
 import { DEFAULT_SETTINGS } from './settings'; // DEFAULT_SETTINGS をインポート
@@ -97,35 +97,21 @@ export class AuthService {
 
     /**
      * Google Calendar API サービスクライアントを初期化します。
-     * 有効な OAuth クライアントとトークンが必要です。
-     * プラグインインスタンスの calendar プロパティを更新します。
+     * OAuth クライアントがあれば常に作成し、自動リフレッシュに委ねる。
      */
     initializeCalendarApi(): void {
-        if (!this.plugin.oauth2Client) {
-            console.warn("Calendar API を初期化できません: OAuth クライアントが設定されていません。");
-            if (this.plugin.calendar) this.plugin.calendar = null; // 既存のクライアントがあればクリア
+        const client = this.plugin.oauth2Client;
+        if (!client) {
+            console.warn("Calendar API を初期化できません: OAuth クライアント未設定。");
+            this.plugin.calendar = null;
             return;
         }
-        // 認証情報（特にアクセストークン）が存在するか確認
-        const credentials = this.plugin.oauth2Client.credentials;
-        if (this.plugin.settings.tokens && credentials && credentials.access_token) {
-            // calendar インスタンスが存在しないか、認証クライアントが異なる場合にのみ再作成
-            // または、認証情報が更新された場合（アクセストークンが変わった場合など）も再作成を検討
-             if (!this.plugin.calendar || (this.plugin.calendar as any)._options?.auth !== this.plugin.oauth2Client || (this.plugin.calendar as any)._options.auth.credentials.access_token !== credentials.access_token) {
-                 try {
-                    this.plugin.calendar = google.calendar({ version: 'v3', auth: this.plugin.oauth2Client });
-                    console.log('Google Calendar API クライアントが初期化または更新されました。');
-                 } catch(e) {
-                     console.error("Google Calendar API クライアントの初期化に失敗しました:", e);
-                     this.plugin.calendar = null;
-                 }
-            }
-        } else {
-            // トークンがない、またはアクセストークンがない場合は、APIクライアントをクリア
-            if (this.plugin.calendar) {
-                console.log('Google Calendar API クライアントを解除します (トークン欠落または無効なクライアント)。');
-                this.plugin.calendar = null;
-            }
+        try {
+            this.plugin.calendar = google.calendar({ version: 'v3', auth: client });
+            console.log('Google Calendar API クライアントを初期化しました。');
+        } catch (e) {
+            console.error('Google Calendar API クライアントの初期化に失敗:', e);
+            this.plugin.calendar = null;
         }
     }
 
@@ -171,9 +157,15 @@ export class AuthService {
                 redirect_uri: currentRedirectUri // コールバックを受け取るURI
             });
 
-            // 認証URLをブラウザで開く
+            // 認証URLを既定ブラウザで開く（Obsidian/Electron 環境に対応）
             console.log('Google 認証 URL を開いています...');
-            window.open(authUrl);
+            try {
+                // Obsidianの実行環境ではElectronが利用可能
+                // eslint-disable-next-line @typescript-eslint/no-var-requires
+                require('electron').shell.openExternal(authUrl);
+            } catch {
+                window.open(authUrl, '_blank');
+            }
             new Notice('開いたブラウザウィンドウでこのプラグインを承認してください。', 7000);
         } catch (error) {
             this.activeOAuthState = null; // エラー発生時はstateをクリア
@@ -332,10 +324,10 @@ export class AuthService {
      * @returns {Promise<boolean>} リフレッシュが成功したか、または不要だった場合は true、失敗した場合は false。
      */
     async ensureAccessToken(): Promise<boolean> {
-        if (this.isTokenValid(false)) {
-            return true;
-        }
+        // 現在のアクセストークンが有効なら何もしない
+        if (this.isTokenValid(false)) return true;
 
+        // リフレッシュ可能でない場合は再認証を促す
         if (!this.isTokenValid(true)) {
             console.warn("アクセストークンが必要ですが、リフレッシュトークンがありません。");
             new Notice("認証トークンの更新が必要です。設定から再認証してください。", 7000);
@@ -348,55 +340,36 @@ export class AuthService {
 
         const client = this.plugin.oauth2Client;
         if (!client) {
-            console.error("トークンリフレッシュを試行できません: OAuthクライアントがありません。");
+            console.error("トークン確認を実行できません: OAuth クライアントがありません。");
             return false;
         }
 
-        console.log("アクセストークンが期限切れまたは欠落しています。リフレッシュを試行中...");
+        // クレデンシャルを適用し、必要なら getAccessToken() で更新をトリガー
         try {
-            if (this.plugin.settings.tokens) {
-                client.setCredentials(this.plugin.settings.tokens);
-            }
-
-            const { credentials } = await client.refreshAccessToken();
-            console.log("トークンリフレッシュAPI呼び出し成功。");
-
-            // 'tokens' イベントリスナーに頼らず、ここで直接トークンを処理する
+            if (this.plugin.settings.tokens) client.setCredentials(this.plugin.settings.tokens);
+            await client.getAccessToken(); // 自動リフレッシュに任せる
+            // 直後に得られる client.credentials を反映（batch用 Authorization ヘッダーのため）
             const currentRefreshToken = this.plugin.settings.tokens?.refresh_token;
-            const newRefreshToken = credentials.refresh_token;
-
-            const updatedTokens: Credentials = {
+            const creds = client.credentials as Credentials;
+            const merged: Credentials = {
                 ...this.plugin.settings.tokens,
-                ...credentials,
-                refresh_token: newRefreshToken || currentRefreshToken,
+                ...creds,
+                refresh_token: creds.refresh_token || currentRefreshToken,
             };
-
-            if (newRefreshToken && newRefreshToken !== currentRefreshToken) {
-                console.log("新しいリフレッシュトークンを受信しました。");
+            if (merged.access_token) {
+                this.plugin.settings.tokens = merged;
+                await this.plugin.saveData(this.plugin.settings);
             }
-
-            this.plugin.settings.tokens = updatedTokens;
-            // client のクレデンシャルも更新しておく
-            client.setCredentials(updatedTokens);
-
-            await this.plugin.saveData(this.plugin.settings);
-            console.log("更新されたトークンは正常に保存されました。");
-
             this.initializeCalendarApi();
-
-            console.log("トークンのリフレッシュ成功。");
-            new Notice('Google 認証トークンが更新されました。', 4000);
             return true;
-
         } catch (error: any) {
-            console.error("トークンのリフレッシュに失敗しました:", error);
+            console.error("アクセストークン取得/更新に失敗:", error);
             const respErr = error?.response?.data?.error;
             const respErrDesc = error?.response?.data?.error_description;
-            let noticeMsg = `トークンのリフレッシュに失敗しました (${respErr || '不明なエラー'})。`;
+            let noticeMsg = `トークンの更新に失敗しました (${respErr || '不明なエラー'})。`;
             if (respErrDesc) noticeMsg += ` ${respErrDesc}`;
-
             if (respErr === 'invalid_grant') {
-                noticeMsg = 'トークンリフレッシュ失敗: 認証が無効になりました。再認証してください。';
+                noticeMsg = 'トークンが無効です。再認証してください。';
                 this.plugin.settings.tokens = null;
                 await this.plugin.saveData(this.plugin.settings);
                 this.plugin.clearAutoSync();
