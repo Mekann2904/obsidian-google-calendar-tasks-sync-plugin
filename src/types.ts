@@ -75,8 +75,9 @@ export interface GoogleCalendarTasksSyncSettings {
 	desiredBatchSize?: number;      // 目標サブバッチサイズ（既定50）
 	maxBatchPerHttp?: number;       // 1 HTTP バッチ内のハード上限（既定50）
 	maxInFlightBatches?: number;    // 同時送信サブバッチ数（既定2）
-	latencySLAms?: number;          // p95 レイテンシSLA（既定1500ms）
-	rateErrorCooldownMs?: number;    // レート/一時障害後のクールダウン（既定1000ms）
+    latencySLAms?: number;          // p95 レイテンシSLA（既定1500ms）
+    rateErrorCooldownMs?: number;    // レート/一時障害後のクールダウン（既定1000ms）
+    minDesiredBatchSize?: number;    // AIMD の最小単位（既定5, hardCap 以下にクランプ）
 
 	recentErrors?: ErrorLog[]; // 最近のエラーサンプル（診断用）
 	useSyncToken?: boolean; // 可能な場合、syncToken による増分取得を使用

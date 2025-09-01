@@ -42,6 +42,7 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 	maxInFlightBatches: 2,
 	latencySLAms: 1500,
 	rateErrorCooldownMs: 1000,
+	minDesiredBatchSize: 5,
 	devLogging: false,
 };
 

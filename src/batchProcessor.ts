@@ -25,7 +25,6 @@ export class BatchProcessor {
     }> {
         let allResults: BatchResponseItem[] = [];
         let created = 0, updated = 0, deleted = 0, errors = 0, skipped = 0;
-        const totalBatches = Math.ceil(batchRequests.length / this.BATCH_SIZE);
 
         if (batchRequests.length === 0) {
             if (this.settings.showNotices) {
@@ -34,23 +33,22 @@ export class BatchProcessor {
             return { results: [], created, updated, deleted, errors, skipped };
         }
 
-        console.log(`${batchRequests.length} 件を ${totalBatches} バッチで実行`);
-        if (this.settings.showNotices) {
-            new Notice('Google に変更を送信中...', 3000);
-        }
+        if (this.settings.showNotices) new Notice('Google に変更を送信中...', 3000);
         console.time("BatchProcessor: Execute All Batches");
 
         // --- 並列 + AIMD（加算増加・乗算減少）制御 ---
         const hardCap = this.BATCH_SIZE; // HTTP 1 本あたりの上限
-        let unit = Math.min(hardCap, Math.max(1, this.settings.desiredBatchSize ?? 50)); // 投下単位
+        const minUnit = Math.max(1, Math.min(hardCap, this.settings.minDesiredBatchSize ?? 5));
+        let unit = Math.min(hardCap, Math.max(minUnit, this.settings.desiredBatchSize ?? 50)); // 投下単位
         let inFlight = Math.max(1, this.settings.maxInFlightBatches ?? 2);              // 同時本数
         const step = Math.max(1, Math.floor(unit * 0.2));                                // 成功時の増分（+20%）
         const sla = this.settings.latencySLAms ?? 1500;                                  // p95 SLA
         const cooldown = this.settings.rateErrorCooldownMs ?? 1000;                      // レート時の冷却
         const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
+        const clampUnit = (v: number) => Math.max(minUnit, Math.min(hardCap, v));
 
         let idx = 0;
-        console.log(`${batchRequests.length} 件を最大 ${inFlight} 並列・単位 ${unit} で開始（HTTP上限:${hardCap}）`);
+        console.log(`${batchRequests.length} 件を開始 — HTTP上限/本:${hardCap}, 初期単位:${unit}, 初期並列:${inFlight}`);
 
         const mapByContentId = (results: BatchResponseItem[], chunk: BatchRequestItem[]) => {
             const out: BatchResponseItem[] = new Array(chunk.length);
@@ -97,15 +95,23 @@ export class BatchProcessor {
 
                         let out = mapByContentId(raw, chunk);
                         out = padResultsIfShort(out, chunk.length);
+                        if (out.length > chunk.length) out.length = chunk.length; // 過剰レス保険
 
                         allResults.push(...out);
                         const agg = this.processBatchResults(out, chunk);
                         created += agg.created; updated += agg.updated; deleted += agg.deleted; errors += agg.errors; skipped += agg.skipped;
 
-                        // レート/一時エラーのシグナル
-                        if (out.some(r => r?.status === 429 || r?.status === 500 || r?.status === 502 || r?.status === 503 || r?.status === 403)) {
-                            hadRateIssues = true;
-                        }
+                        // レート/一時エラーのシグナル検出（403のreasonも考慮）
+                        const isRatey = (r?: BatchResponseItem) => {
+                            if (!r) return false;
+                            if (r.status === 429 || r.status === 500 || r.status === 502 || r.status === 503) return true;
+                            if (r.status === 403) {
+                                const reason = r.body?.error?.errors?.[0]?.reason || r.body?.error?.status || '';
+                                return /rateLimitExceeded|userRateLimitExceeded/i.test(String(reason));
+                            }
+                            return false;
+                        };
+                        if (out.some(isRatey)) hadRateIssues = true;
                     } catch (e: any) {
                         // チャンク単位の失敗は 500 で合成し計上
                         console.error('HTTP バッチ失敗:', e?.message || e);
@@ -127,11 +133,11 @@ export class BatchProcessor {
 
             // AIMD 調整
             if (hadRateIssues || p95 > sla) {
-                unit = Math.max(5, Math.floor(unit / 2));
+                unit = clampUnit(Math.floor(unit / 2));
                 inFlight = Math.max(1, Math.floor(inFlight / 2));
                 if (cooldown > 0) await sleep(cooldown);
             } else {
-                unit = Math.min(hardCap, unit + step);
+                unit = clampUnit(unit + step);
                 inFlight = Math.min(Math.max(1, this.settings.maxInFlightBatches ?? 2), inFlight + 1);
             }
 
