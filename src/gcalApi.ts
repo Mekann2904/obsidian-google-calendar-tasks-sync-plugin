@@ -39,8 +39,8 @@ export class GCalApiService {
             showDeleted: trySyncToken ? true : false, // 増分時は true（仕様順守）。フル取得時は false。
             maxResults: 2500, // ページング削減（上限 2500）
             singleEvents: false,
-            // ペイロード削減（必要最小限のフィールド）+ originalStartTime 追加
-            fields: 'items(id,etag,status,updated,extendedProperties,recurringEventId,originalStartTime),nextPageToken,nextSyncToken',
+            // ペイロード削減（必要最小限のフィールド）+ originalStartTime 追加（識別用に summary も含む）
+            fields: 'items(id,summary,etag,status,updated,extendedProperties,recurringEventId,originalStartTime),nextPageToken,nextSyncToken',
         };
 
         // [自己監査] syncToken 条件固定: 初回フル取得のフィルタ署名を保存し、増分時に比較（差異があれば警告）。
@@ -64,6 +64,11 @@ export class GCalApiService {
             if (!same) {
                 console.warn('syncToken 使用時のクエリ条件が初回と一致しません。将来の無効化(410)の原因になり得ます。', { savedSig, current: sig });
             }
+        } else if (trySyncToken && !savedSig) {
+            // アップグレード導入等で signature 不在のケースを救済
+            console.warn('listFilterSignature が存在しません。現在の条件をバックフィル保存します。', sig);
+            (this.plugin as any).settings.listFilterSignature = sig;
+            try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
         }
 
         if (trySyncToken) {
@@ -158,11 +163,15 @@ export class GCalApiService {
             } catch (e: any) {
                 lastError = e;
                 const status = isGaxiosError(e) ? (e.response?.status ?? 0) : 0;
-                if (status === 429 || status >= 500) {
+                const reason = isGaxiosError(e) ? (e.response?.data?.error?.errors?.[0]?.reason ?? '') : '';
+                const code   = (e as any)?.code || '';
+                const transient = !status || /ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN/i.test(String(code));
+                const shouldRetry403 = status === 403 && /rateLimitExceeded|userRateLimitExceeded/i.test(String(reason));
+                if (transient || status === 429 || status >= 500 || shouldRetry403) {
                     const base = Math.min(800 * (2 ** i), 4000);
                     const jitter = Math.floor(Math.random() * 200);
                     const delay = base + jitter;
-                    console.warn(`events.list ${status}. retry in ${delay}ms...`);
+                    console.warn(`events.list ${status}${reason ? ` (${reason})` : ''}. retry in ${delay}ms...`);
                     await new Promise(r => setTimeout(r, delay));
                     continue;
                 }
@@ -257,16 +266,38 @@ export class GCalApiService {
         const fetchWithRetry = async (): Promise<RequestUrlResponse> => {
             const max = 4;
             for (let i = 0; i < max; i++) {
-                const res = await requestUrl(requestParams);
-                if (res.status === 429 || res.status >= 500) {
-                    const base = Math.min(1600 * (2 ** i), 8000);
-                    const jitter = Math.floor(Math.random() * 400);
-                    const delay = base + jitter;
-                    console.warn(`Batch top-level ${res.status}. retry in ${delay}ms...`);
-                    await new Promise(r => setTimeout(r, delay));
-                    continue;
+                try {
+                    const res = await requestUrl(requestParams);
+                    const ct = res.headers['content-type'] || res.headers['Content-Type'] || '';
+                    let reason = '';
+                    if (/json/i.test(String(ct))) {
+                        try { reason = (JSON.parse(res.text))?.error?.errors?.[0]?.reason ?? ''; } catch {}
+                    }
+                    const shouldRetry = (
+                        res.status === 429 || res.status >= 500 || (res.status === 403 && /rateLimitExceeded|userRateLimitExceeded/i.test(reason))
+                    );
+                    if (shouldRetry) {
+                        const base = Math.min(1600 * (2 ** i), 8000);
+                        const jitter = Math.floor(Math.random() * 400);
+                        const delay = base + jitter;
+                        console.warn(`Batch top-level ${res.status}${reason ? ` (${reason})` : ''}. retry in ${delay}ms...`);
+                        await new Promise(r => setTimeout(r, delay));
+                        continue;
+                    }
+                    return res;
+                } catch (e: any) {
+                    const code = (e?.cause?.code || e?.code || '').toString();
+                    const transient = /ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN/i.test(code) || !code;
+                    if (transient) {
+                        const base = Math.min(1600 * (2 ** i), 8000);
+                        const jitter = Math.floor(Math.random() * 400);
+                        const delay = base + jitter;
+                        console.warn(`Batch request transient error ${code || 'UNKNOWN'}. retry in ${delay}ms...`);
+                        await new Promise(r => setTimeout(r, delay));
+                        continue;
+                    }
+                    throw e;
                 }
-                return res;
             }
             return await requestUrl(requestParams);
         };
@@ -343,10 +374,9 @@ export class GCalApiService {
 
         const delimiter = `--${boundary}`;
         const endDelimiter = `--${boundary}--`;
-        let raw = responseText;
 
         // 前後のプリンブル/エピローグを考慮し、delimiter で分解
-        const parts = raw
+        const parts = responseText
             .split(delimiter)
             .map(p => p.trim())
             .filter(p => p && p !== '--' && p !== endDelimiter);
