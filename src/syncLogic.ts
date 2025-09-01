@@ -101,9 +101,11 @@ export class SyncLogic {
             // 将来の挙動変化に備えて最終フィルタを適用。
             // 削除（cancelled）は extendedProperties 欠落の可能性があるため常に通す。
             try {
+                const mapped = new Set<string>(Object.values(taskMap).filter((v): v is string => !!v));
                 existingEvents = existingEvents.filter(ev => {
-                    if (ev.status === 'cancelled') return true;
-                    return ev.extendedProperties?.private?.['isGcalSync'] === 'true';
+                    const managed = ev.extendedProperties?.private?.['isGcalSync'] === 'true';
+                    if (ev.status === 'cancelled') return managed || (!!ev.id && mapped.has(ev.id));
+                    return managed;
                 });
             } catch (e) {
                 console.warn('取得イベントの仕分けで警告:', e);
@@ -235,13 +237,14 @@ export class SyncLogic {
                         const isRate403 = status === 403 && /(rateLimitExceeded|userRateLimitExceeded)/i.test(reason);
                         const isResExhausted = /RESOURCE_EXHAUSTED/i.test(reason);
                         const isTransient = status === 412 || status === 429 || status >= 500 || isRate403 || isResExhausted;
+                        const message = typeof res.body?.error?.message === 'string' ? (res.body.error.message as string).slice(0, 200) : undefined;
                         const entry: ErrorLog = {
                             errorType: isTransient ? 'transient' : 'permanent',
                             operation: operation as any,
                             taskId: req.obsidianTaskId || 'unknown',
                             gcalId: req.originalGcalId,
                             retryCount: this.retryCount,
-                            errorDetails: { status }
+                            errorDetails: { status, reason, message }
                         };
                         this.errorLogs.push(entry);
                         // 412 (If-Match 不一致) はローカル優先で上書き再送
@@ -358,9 +361,13 @@ export class SyncLogic {
             if (event.status === 'cancelled') return;
 
             if (obsId && gcalId) {
-                const existingMapping = googleEventMap.get(obsId);
-                if (!existingMapping || (event.updated && existingMapping.updated && DateUtils.parseDate(event.updated).isAfter(DateUtils.parseDate(existingMapping.updated)))) {
+                const prev = googleEventMap.get(obsId);
+                if (!prev) {
                     googleEventMap.set(obsId, event);
+                } else {
+                    const a = prev.updated ? DateUtils.parseDate(prev.updated) : DateUtils.parseDate('1970-01-01');
+                    const b = event.updated ? DateUtils.parseDate(event.updated) : DateUtils.parseDate('1970-01-01');
+                    if (b.isAfter(a)) googleEventMap.set(obsId, event);
                 }
                 if (!taskMap[obsId] || taskMap[obsId] !== gcalId) {
                     taskMap[obsId] = gcalId;
@@ -679,6 +686,9 @@ export class SyncLogic {
             if (gid) gIdsInUseByCurrent.add(gid);
         }
 
+        const byId = new Map<string, calendar_v3.Schema$Event>();
+        existingGCalEvents.forEach(e => { if (e.id) byId.set(e.id, e); });
+
         Object.entries(taskMap).forEach(([obsId, gId]) => {
             if (!gId) return;
             if (!currentObsidianTaskIds.has(obsId)) {
@@ -692,7 +702,7 @@ export class SyncLogic {
                     return;
                 }
                 if (!processed.has(gId)) {
-                    const ev = existingGCalEvents.find(e => e.id === gId);
+                    const ev = byId.get(gId);
                     const headers: Record<string, string> = {};
                     if (ev?.etag) headers['If-Match'] = ev.etag;
                     batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(gId)}`, headers, obsidianTaskId: obsId, operationType: 'delete', originalGcalId: gId });
