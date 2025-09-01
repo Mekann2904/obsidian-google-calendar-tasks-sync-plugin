@@ -593,13 +593,19 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
                 mode = '未保存（safeStorage利用可。保存時は自動暗号化）';
             }
 
-            new Setting(containerEl)
-                .setName('暗号化状態')
-                .setDesc(mode)
-                .addExtraButton(b => {
-                    b.setIcon(safeAvail ? 'shield' : 'alert-circle')
-                     .setTooltip(safeAvail ? 'safeStorage 利用可能' : 'safeStorage 利用不可');
-                });
+			new Setting(containerEl)
+				.setName('保存方式')
+				.setDesc(mode)
+				.addExtraButton(b => {
+					b.setIcon(safeAvail ? 'shield' : 'alert-circle')
+					 .setTooltip(safeAvail ? 'safeStorage 利用可能' : 'safeStorage 利用不可');
+				});
+
+			// 現在の動作モード（より明確な表示）
+			const currentMode = (this.plugin as any).getEncryptionModeLabel ? (this.plugin as any).getEncryptionModeLabel() : mode;
+			new Setting(containerEl)
+				.setName('現在の動作')
+				.setDesc(currentMode);
 
             // safeStorage へ移行ボタン（利用可能かつ未使用時）
             if (safeAvail && (!hasEnc || isPassEnc)) {
