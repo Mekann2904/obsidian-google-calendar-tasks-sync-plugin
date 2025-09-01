@@ -231,8 +231,12 @@ export class SyncLogic {
                         }
 
                         const operation = req.operationType || 'unknown';
+                        const reason = (res.body?.error?.errors?.[0]?.reason) || (res.body?.error?.status) || '';
+                        const isRate403 = status === 403 && /(rateLimitExceeded|userRateLimitExceeded)/i.test(reason);
+                        const isResExhausted = /RESOURCE_EXHAUSTED/i.test(reason);
+                        const isTransient = status === 412 || status === 429 || status >= 500 || isRate403 || isResExhausted;
                         const entry: ErrorLog = {
-                            errorType: (status >= 500 || status === 429) ? 'transient' : 'permanent',
+                            errorType: isTransient ? 'transient' : 'permanent',
                             operation: operation as any,
                             taskId: req.obsidianTaskId || 'unknown',
                             gcalId: req.originalGcalId,
@@ -303,6 +307,13 @@ export class SyncLogic {
                     deletedCount += fb3.deleted;
                     errorCount += fb3.errors;
                     skippedCount += fb3.skipped;
+                    // 成功した delete は taskMap を掃除
+                    fb3.results.forEach((res, idx) => {
+                        const req = fallbackDeleteNoIfMatch[idx];
+                        if (res.status >= 200 && res.status < 300 && req?.obsidianTaskId) {
+                            delete taskMap[req.obsidianTaskId];
+                        }
+                    });
                 }
             } else if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
                 new Notice('変更なし。', 2000);
