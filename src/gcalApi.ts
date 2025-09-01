@@ -53,6 +53,17 @@ export class GCalApiService {
             quotaUser: (requestParams as any).quotaUser || '',
         };
         const savedSig = (this.plugin as any).settings?.listFilterSignature as typeof sig | undefined;
+        // 先に calendarId 変更を検出してクリーンリセット（冪等）
+        const prevSig = savedSig;
+        if (prevSig && prevSig.calendarId !== sig.calendarId) {
+            console.warn('calendarId が変更されました。syncToken と署名をリセットします。', { before: prevSig.calendarId, after: sig.calendarId });
+            (this.plugin as any).settings.syncToken = undefined;
+            (this.plugin as any).settings.listFilterSignature = sig;
+            try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
+            delete (requestParams as any).syncToken;
+            requestParams.showDeleted = false;
+        }
+
         if (!trySyncToken && !savedSig) {
             (this.plugin as any).settings.listFilterSignature = sig;
             try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
@@ -65,12 +76,17 @@ export class GCalApiService {
                 JSON.stringify(savedSig.privateExtendedProperty) === JSON.stringify(sig.privateExtendedProperty)
             );
             if (!same) {
-                console.warn('syncToken 使用時のクエリ条件が初回と一致しません。将来の無効化(410)の原因になり得ます。', { savedSig, current: sig });
+                console.warn('syncToken 条件ミスマッチ→フル切替', {
+                    savedSig,
+                    current: sig,
+                    before: { hasSync: !!(this.plugin as any).settings?.syncToken, showDeleted: requestParams.showDeleted },
+                });
                 // 即時にフル取得へ切替（410待ちを回避）
                 (this.plugin as any).settings.syncToken = undefined;
                 try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
                 delete (requestParams as any).syncToken;
                 requestParams.showDeleted = false;
+                console.warn('切替後状態', { after: { hasSync: false, showDeleted: requestParams.showDeleted } });
             }
         } else if (trySyncToken && !savedSig) {
             // アップグレード導入等で signature 不在のケースを救済
@@ -78,21 +94,14 @@ export class GCalApiService {
             (this.plugin as any).settings.listFilterSignature = sig;
             try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
         }
-        // 追加: calendarId が変更された場合はクリーンリセット
-        const prevSig = savedSig;
-        if (prevSig && prevSig.calendarId !== sig.calendarId) {
-            console.warn('calendarId が変更されました。syncToken と署名をリセットします。', { before: prevSig.calendarId, after: sig.calendarId });
-            (this.plugin as any).settings.syncToken = undefined;
-            (this.plugin as any).settings.listFilterSignature = sig;
-            try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
-            delete (requestParams as any).syncToken;
-            requestParams.showDeleted = false;
-        }
-
-        if (trySyncToken) {
+        // 署名/リセット処理を踏まえて増分可否を再評価
+        const useSync = !!settings.useSyncToken && !!(this.plugin as any).settings?.syncToken;
+        requestParams.showDeleted = useSync;
+        if (useSync) {
             requestParams.syncToken = (this.plugin as any).settings.syncToken;
             console.log(`syncToken による増分取得を試行します。`);
         } else {
+            delete (requestParams as any).syncToken;
             console.log(`管理対象イベントを全件取得します（updatedMin/time 窓は使用しません）。`);
         }
 
@@ -192,7 +201,8 @@ export class GCalApiService {
                     const base = Math.min(800 * (2 ** i), 4000);
                     const jitter = Math.floor(Math.random() * 200);
                     const delay = base + jitter;
-                    console.warn(`events.list ${status}${reason ? ` (${reason})` : ''}${isResourceExhausted ? ' (RESOURCE_EXHAUSTED)' : ''}. retry in ${delay}ms...`);
+                    const msg = (respErr as any)?.message || '';
+                    console.warn(`events.list ${status}${reason ? ` (${reason})` : ''}${isResourceExhausted ? ' (RESOURCE_EXHAUSTED)' : ''}${msg ? `: ${msg}` : ''}. retry in ${delay}ms...`);
                     await new Promise(r => setTimeout(r, delay));
                     continue;
                 }
