@@ -50,6 +50,7 @@ export class GCalApiService {
             privateExtendedProperty: (requestParams.privateExtendedProperty || []).slice().sort(),
             singleEvents: !!requestParams.singleEvents,
             fields: requestParams.fields || '',
+            quotaUser: (requestParams as any).quotaUser || '',
         };
         const savedSig = (this.plugin as any).settings?.listFilterSignature as typeof sig | undefined;
         if (!trySyncToken && !savedSig) {
@@ -60,16 +61,32 @@ export class GCalApiService {
                 savedSig.calendarId === sig.calendarId &&
                 savedSig.singleEvents === sig.singleEvents &&
                 savedSig.fields === sig.fields &&
+                (savedSig as any).quotaUser === sig.quotaUser &&
                 JSON.stringify(savedSig.privateExtendedProperty) === JSON.stringify(sig.privateExtendedProperty)
             );
             if (!same) {
                 console.warn('syncToken 使用時のクエリ条件が初回と一致しません。将来の無効化(410)の原因になり得ます。', { savedSig, current: sig });
+                // 即時にフル取得へ切替（410待ちを回避）
+                (this.plugin as any).settings.syncToken = undefined;
+                try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
+                delete (requestParams as any).syncToken;
+                requestParams.showDeleted = false;
             }
         } else if (trySyncToken && !savedSig) {
             // アップグレード導入等で signature 不在のケースを救済
             console.warn('listFilterSignature が存在しません。現在の条件をバックフィル保存します。', sig);
             (this.plugin as any).settings.listFilterSignature = sig;
             try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
+        }
+        // 追加: calendarId が変更された場合はクリーンリセット
+        const prevSig = savedSig;
+        if (prevSig && prevSig.calendarId !== sig.calendarId) {
+            console.warn('calendarId が変更されました。syncToken と署名をリセットします。', { before: prevSig.calendarId, after: sig.calendarId });
+            (this.plugin as any).settings.syncToken = undefined;
+            (this.plugin as any).settings.listFilterSignature = sig;
+            try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
+            delete (requestParams as any).syncToken;
+            requestParams.showDeleted = false;
         }
 
         if (trySyncToken) {

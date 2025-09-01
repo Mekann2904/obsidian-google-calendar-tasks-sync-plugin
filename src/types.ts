@@ -83,6 +83,7 @@ export interface GoogleCalendarTasksSyncSettings {
 		privateExtendedProperty: string[];
 		singleEvents: boolean;
 		fields: string;
+		quotaUser?: string;
 	};
 }
 
