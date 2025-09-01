@@ -433,7 +433,7 @@ export class SyncLogic {
                         const headers: Record<string, string> = {};
                         if (existingEvent.etag) headers['If-Match'] = existingEvent.etag;
                         const patchBody = this.buildPatchBody(existingEvent, eventPayload);
-                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, headers, body: patchBody, fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: gcalId });
+                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, headers, body: patchBody, fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'patch', originalGcalId: gcalId });
                     }
                 } else {
                     skippedCount++;
@@ -454,7 +454,7 @@ export class SyncLogic {
                         bodies.forEach(body => batchRequests.push({ method: 'POST', path: calendarPath, body, obsidianTaskId: obsId, operationType: 'insert' }));
                     } else {
                         const headers: Record<string, string> = {};
-                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(mappedId)}`, headers, body: eventPayload, fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: mappedId });
+                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(mappedId)}`, headers, body: eventPayload, fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'patch', originalGcalId: mappedId });
                     }
                 } else {
                     // 重複防止: 同一性キーで既存イベントを検索
@@ -467,7 +467,7 @@ export class SyncLogic {
                         if (this.needsUpdateIgnoringOwner(dup, eventPayload)) {
                             const headers: Record<string, string> = {};
                             if (dup.etag) headers['If-Match'] = dup.etag;
-                            batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(dup.id)}`, headers, body: this.buildPatchBodyIgnoringOwner(dup, eventPayload), fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: dup.id });
+                            batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(dup.id)}`, headers, body: this.buildPatchBodyIgnoringOwner(dup, eventPayload), fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'patch', originalGcalId: dup.id });
                         } else {
                             skippedCount++;
                         }
@@ -717,7 +717,7 @@ export class SyncLogic {
 
         const treatAsSkipped = (req: BatchRequestItem, status: number) => {
             if (req.operationType === 'insert' && status === 409) return true; // 既存IDでの重複作成
-            if ((req.operationType === 'delete' || req.operationType === 'update' || req.operationType === 'patch') && (status === 404 || status === 410 || status === 412)) return true; // 412: ETag競合
+            if ((req.operationType === 'delete' || req.operationType === 'update' || req.operationType === 'patch') && (status === 404 || status === 410)) return true;
             return false;
         };
 
@@ -730,7 +730,7 @@ export class SyncLogic {
             this.retryCount = attempt - 1;
             metrics.attempts = attempt; // 最終回数で更新
 
-            const subBatchSize = Math.min(this.plugin.settings.batchSize ?? 100, 1000);
+            const subBatchSize = Math.max(1, Math.min(this.plugin.settings.batchSize ?? 100, 1000));
             // 公式上限は1000。各パートは個別リクエストとしてカウントされ、順序保証はない。
             for (let i = 0; i < pending.length; i += subBatchSize) {
                 const windowIdx = pending.slice(i, i + subBatchSize);
@@ -747,6 +747,9 @@ export class SyncLogic {
 
                 subRes.forEach((res, k) => {
                     const mappedIdx = res.contentId ? cidToOrig.get(res.contentId) : undefined;
+                    if (res.contentId && mappedIdx === undefined) {
+                        console.warn('Unknown Content-ID in batch response:', res.contentId);
+                    }
                     const origIdx = mappedIdx !== undefined ? mappedIdx : windowIdx[k];
                     const req = batchRequests[origIdx];
 
@@ -774,6 +777,12 @@ export class SyncLogic {
                     const shouldRetry = this.shouldRetry(res.status, String(reason));
                     if (shouldRetry && attempt <= this.MAX_RETRIES) {
                         // 次のラウンドで再送（finalResults は未確定のまま）
+                        return;
+                    }
+
+                    // 412: 後続の If-Match 無し再送で処理するため、ここではエラー/スキップにカウントしない
+                    if (res.status === 412) {
+                        finalResults[origIdx] = res;
                         return;
                     }
 

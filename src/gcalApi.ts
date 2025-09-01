@@ -40,8 +40,8 @@ export class GCalApiService {
             showDeleted: trySyncToken ? true : false, // 増分時は true（仕様順守）。フル取得時は false。
             maxResults: 2500, // ページング削減（上限 2500）
             singleEvents: false,
-            // ペイロード削減（必要最小限のフィールド）+ originalStartTime 追加（識別用に summary も含む）
-            fields: 'items(id,summary,etag,status,updated,extendedProperties,recurringEventId,originalStartTime),nextPageToken,nextSyncToken',
+            // 差分判定・重複判定に必要なフィールドを取得
+            fields: 'items(id,summary,description,etag,status,updated,start,end,recurrence,reminders,extendedProperties,recurringEventId,originalStartTime),nextPageToken,nextSyncToken',
         };
 
         // [自己監査] syncToken 条件固定: 初回フル取得のフィルタ署名を保存し、増分時に比較（差異があれば警告）。
