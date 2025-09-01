@@ -1,4 +1,5 @@
 import { App, PluginSettingTab, Setting, Notice, TextComponent, ExtraButtonComponent } from 'obsidian';
+import { isEncryptionAvailable } from './security';
 import moment from 'moment';
 import { GoogleCalendarTasksSyncSettings } from './types';
 import GoogleCalendarTasksSyncPlugin from './main'; // main.ts からインポート
@@ -563,8 +564,8 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
                     });
             });
 
-        new Setting(containerEl)
-            .setName('パスフレーズを保存（安全性低下）')
+		new Setting(containerEl)
+			.setName('パスフレーズを保存（安全性低下）')
             .setDesc('ONにするとパスフレーズを設定ファイルに保存し、再起動後も入力不要になる（機密性は低下）。')
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.rememberPassphrase || false)
@@ -575,6 +576,41 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
                     }
                     await this.plugin.saveData(this.plugin.settings);
                     this.display();
-                }));
+				}));
+
+		// --- セキュリティ/保存方式 ステータス ---
+		containerEl.createEl('h4', { text: 'セキュリティ/保存方式' });
+		{
+			const safeAvail = isEncryptionAvailable();
+			const enc = this.plugin.settings.tokensEncrypted || '';
+			const hasEnc = !!enc;
+			const isPassEnc = hasEnc && enc.startsWith('aesgcm:');
+			const remember = !!this.plugin.settings.rememberPassphrase;
+			let mode = '未保存（メモリのみ）';
+			if (hasEnc) {
+				mode = isPassEnc ? `パスフレーズAES-GCM（${remember ? 'パス保存あり' : '一時パス'}）` : 'OS safeStorage';
+			} else if (safeAvail) {
+				mode = '未保存（safeStorage利用可。保存時は自動暗号化）';
+			}
+
+			new Setting(containerEl)
+				.setName('暗号化状態')
+				.setDesc(mode)
+				.addExtraButton(b => {
+					b.setIcon(safeAvail ? 'shield' : 'alert-circle')
+					 .setTooltip(safeAvail ? 'safeStorage 利用可能' : 'safeStorage 利用不可');
+				});
+
+			const detail = document.createElement('div');
+			detail.className = 'setting-item-description';
+			detail.style.whiteSpace = 'pre-wrap';
+			detail.textContent = [
+				'- 判定: safeStorage.isEncryptionAvailable() が true なら自動で safeStorage 暗号化/復号。',
+				'- 優先順位: safeStorage →（不可時）パスフレーズAES-GCM →（どちらも不可）メモリのみ。',
+				'- 例外/不可条件: Obsidian Mobile、Linuxで秘密ストア未設定、OS資格情報ストアのロック等。',
+				'- データ移行性: safeStorage の暗号データは端末専用。別PCでは復号不可。移行したい場合はパスフレーズ方式に切替えて保存すること。'
+			].join('\n');
+			containerEl.appendChild(detail);
+		}
 	}
 }

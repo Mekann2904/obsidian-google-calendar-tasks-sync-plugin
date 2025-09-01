@@ -29,6 +29,7 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 	gcalApi: GCalApiService;
 	syncLogic: SyncLogic;
 	private passphraseCache: string | null = null;
+	private encryptionMode: 'safeStorage' | 'passphrase' | 'memory' = 'memory';
 	private isSyncing: boolean = false;
 
 	constructor(app: App, manifest: any) {
