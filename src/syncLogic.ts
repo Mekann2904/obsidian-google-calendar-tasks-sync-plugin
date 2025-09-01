@@ -134,6 +134,18 @@ export class SyncLogic {
             skippedCount += skipped;
             console.timeEnd("Sync: Prepare Batch Requests");
 
+            // 追加: taskMap 経由の更新・削除に If-Match を可能な限り付与して 412 を低減
+            try {
+                for (const r of batchRequests) {
+                    if (!r || !r.originalGcalId) continue;
+                    if (!r.headers) r.headers = {};
+                    if (!('If-Match' in r.headers)) {
+                        const ev = eventById.get(r.originalGcalId);
+                        if (ev?.etag) r.headers['If-Match'] = ev.etag;
+                    }
+                }
+            } catch {}
+
             // 4. 削除準備
             console.time("Sync: Prepare Deletions");
             this.prepareDeletionRequests(taskMap, currentObsidianTaskIds, existingEvents, existingGIdSet, batchRequests, settings, force);
@@ -718,10 +730,10 @@ export class SyncLogic {
             this.retryCount = attempt - 1;
             metrics.attempts = attempt; // 最終回数で更新
 
-            const batchSize = Math.min(this.plugin.settings.batchSize ?? 100, 1000);
+            const subBatchSize = Math.min(this.plugin.settings.batchSize ?? 100, 1000);
             // 公式上限は1000。各パートは個別リクエストとしてカウントされ、順序保証はない。
-            for (let i = 0; i < pending.length; i += batchSize) {
-                const windowIdx = pending.slice(i, i + 50);
+            for (let i = 0; i < pending.length; i += subBatchSize) {
+                const windowIdx = pending.slice(i, i + subBatchSize);
                 const subReq = windowIdx.map(idx => batchRequests[idx]);
                 const start = performance.now();
                 const subRes = await this.plugin.gcalApi.executeBatchRequest(subReq);
@@ -729,8 +741,13 @@ export class SyncLogic {
                 metrics.sentSubBatches++;
                 metrics.batchLatenciesMs.push(end - start);
 
+                // Content-ID での対応づけ（順序入れ替わりに強く）
+                const cidToOrig = new Map<string, number>();
+                windowIdx.forEach((orig, j) => cidToOrig.set(`item-${j + 1}`, orig));
+
                 subRes.forEach((res, k) => {
-                    const origIdx = windowIdx[k];
+                    const mappedIdx = res.contentId ? cidToOrig.get(res.contentId) : undefined;
+                    const origIdx = mappedIdx !== undefined ? mappedIdx : windowIdx[k];
                     const req = batchRequests[origIdx];
 
                     metrics.statusCounts[res.status] = (metrics.statusCounts[res.status] || 0) + 1;
@@ -766,7 +783,7 @@ export class SyncLogic {
                 });
 
                 // レート制限回避のためのインターバッチ遅延
-                if (i + batchSize < pending.length && (this.plugin.settings.interBatchDelay ?? 0) > 0) {
+                if (i + subBatchSize < pending.length && (this.plugin.settings.interBatchDelay ?? 0) > 0) {
                     const base = this.plugin.settings.interBatchDelay;
                     const jittered = Math.floor(base * (Math.random() * 0.5 + 0.75)); // ±25% ジッタ
                     metrics.totalWaitMs += jittered;
@@ -802,6 +819,7 @@ export class SyncLogic {
     private shouldRetry(status: number, reason: string): boolean {
         if (status === 429) return true;
         if (status === 403 && /(rateLimitExceeded|userRateLimitExceeded)/i.test(reason)) return true;
+        if (/(RESOURCE_EXHAUSTED)/i.test(reason)) return true;
         if (status === 500 || status === 502 || status === 503 || status === 504) return true;
         return false;
     }
