@@ -78,54 +78,17 @@ export class SyncLogic {
         const batchRequests: BatchRequestItem[] = [];
         // FIX: taskMap は settings スナップショットから取得
         const taskMap = force ? {} : { ...settings.taskMap };
-        let existingEvents: calendar_v3.Schema$Event[] = [];
-        let googleEventMap = new Map<string, calendar_v3.Schema$Event>();
 
         try {
-            // 1. Obsidian タスク取得
-            if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
-                new Notice('Obsidian タスクを取得中...', 2000);
-            }
-            console.time("Sync: Fetch Obsidian Tasks");
-            const obsidianTasks = await this.plugin.taskParser.getObsidianTasks();
-            console.timeEnd("Sync: Fetch Obsidian Tasks");
+            const obsidianTasks = await this.fetchObsidianTasks(isManualSync, settings);
+            const {
+                existingEvents,
+                googleEventMap,
+                dedupeIndex,
+                existingGIdSet,
+                eventById,
+            } = await this.fetchGoogleEvents(settings, force, taskMap, isManualSync);
 
-            // 2. Google Calendar イベント取得
-            if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
-                new Notice('GCal イベントを取得中...', 2000);
-            }
-            console.time("Sync: Fetch GCal Events");
-            // FIX: gcalApi に settings を渡す (将来の拡張性のため)
-            existingEvents = await this.plugin.gcalApi.fetchGoogleCalendarEvents(settings);
-            // サーバ側は privateExtendedProperty で同期対象集合を固定している前提だが、
-            // 将来の挙動変化に備えて最終フィルタを適用。
-            // 削除（cancelled）は extendedProperties 欠落の可能性があるため常に通す。
-            try {
-                const mapped = new Set<string>(Object.values(taskMap).filter((v): v is string => !!v));
-                existingEvents = existingEvents.filter(ev => {
-                    const managed = ev.extendedProperties?.private?.['isGcalSync'] === 'true';
-                    if (ev.status === 'cancelled') return managed || (!!ev.id && mapped.has(ev.id));
-                    return managed;
-                });
-            } catch (e) {
-                console.warn('取得イベントの仕分けで警告:', e);
-            }
-            if (!force) {
-                googleEventMap = this.mapGoogleEvents(existingEvents, taskMap);
-            }
-            // 重複検出用インデックス
-            const dedupeIndex = this.buildDedupeIndex(existingEvents);
-            console.timeEnd("Sync: Fetch GCal Events");
-
-            const existingGIdSet = new Set<string>(
-                existingEvents.map(e => e.id).filter((v): v is string => !!v)
-            );
-            
-            // ID → Event の逆引きマップ（ETag 参照用）
-            const eventById = new Map<string, calendar_v3.Schema$Event>();
-            existingEvents.forEach(ev => { if (ev.id) eventById.set(ev.id, ev); });
-
-            // 3. 作成/更新/キャンセル準備
             if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
                 new Notice(`${obsidianTasks.length} 件のタスクを処理中...`, 3000);
             }
@@ -136,191 +99,16 @@ export class SyncLogic {
             skippedCount += skipped;
             console.timeEnd("Sync: Prepare Batch Requests");
 
-            // 追加: taskMap 経由の更新・削除に If-Match を可能な限り付与して 412 を低減
-            try {
-                for (const r of batchRequests) {
-                    if (!r || !r.originalGcalId) continue;
-                    if (!r.headers) r.headers = {};
-                    if (!('If-Match' in r.headers)) {
-                        const ev = eventById.get(r.originalGcalId);
-                        if (ev?.etag) r.headers['If-Match'] = ev.etag;
-                    }
-                }
-            } catch {}
+            this.prepareDeletions(taskMap, currentObsidianTaskIds, existingEvents, existingGIdSet, batchRequests, settings, force);
 
-            // 4. 削除準備
-            console.time("Sync: Prepare Deletions");
-            this.prepareDeletionRequests(taskMap, currentObsidianTaskIds, existingEvents, existingGIdSet, batchRequests, settings, force);
-            console.timeEnd("Sync: Prepare Deletions");
-
-            // 5. バッチ実行
-            if (batchRequests.length > 0) {
-                const { results, created, updated, deleted, errors, skipped: batchSkipped, metrics } =
-                    await this.executeBatchesWithRetry(batchRequests, batchProcessor);
-                
-                createdCount += created;
-                updatedCount += updated;
-                deletedCount += deleted;
-                errorCount += errors;
-                skippedCount += batchSkipped;
-
-                // メトリクスの要約を出力
-                if (metrics) this.logMetricsSummary('Main Batch', metrics);
-
-                const calendarPath = `/calendar/v3/calendars/${encodeURIComponent(settings.calendarId)}/events`;
-                const fallbackInserts: BatchRequestItem[] = [];
-                const fallbackNoIfMatch: BatchRequestItem[] = [];
-                const fallbackDeleteNoIfMatch: BatchRequestItem[] = [];
-
-                results.forEach((res: BatchResponseItem, i: number) => {
-                    const req = batchRequests[i];
-                    // FIX: クラッシュ回避のため、応答に対応するリクエストが存在することを確認
-                    if (!req) {
-                        console.warn(`応答に対応するリクエストが見つかりません (index: ${i})。リトライ処理中の不整合の可能性があります。`, res);
-                        errorCount++;
-                        return;
-                    }
-
-                    if (res.status >= 200 && res.status < 300) {
-                        const newGcalId = res.body?.id;
-                        if (req.operationType === 'insert' && newGcalId && req.obsidianTaskId) {
-                            taskMap[req.obsidianTaskId] = newGcalId;
-                        } else if ((req.operationType === 'update' || req.operationType === 'patch') && newGcalId && req.obsidianTaskId) {
-                            taskMap[req.obsidianTaskId] = newGcalId;
-                        } else if (req.operationType === 'delete' && req.obsidianTaskId) {
-                            delete taskMap[req.obsidianTaskId];
-                        }
-                    } else {
-                        const status = res.status;
-                        if (req.operationType === 'delete') {
-                            this.handleDeleteError(req, status);
-                            if (status === 410 || status === 404) {
-                                if (req.obsidianTaskId) delete taskMap[req.obsidianTaskId];
-                            } else if (status === 412) {
-                                const retryDel: BatchRequestItem = {
-                                    method: 'DELETE',
-                                    path: req.path,
-                                    obsidianTaskId: req.obsidianTaskId,
-                                    operationType: 'delete',
-                                    originalGcalId: req.originalGcalId
-                                };
-                                fallbackDeleteNoIfMatch.push(retryDel);
-                            }
-                            return;
-                        }
-
-                        if ((req.operationType === 'update' || req.operationType === 'patch') && (status === 404 || status === 410)) {
-                            if (req.obsidianTaskId) {
-                                if (taskMap[req.obsidianTaskId]) {
-                                    delete taskMap[req.obsidianTaskId];
-                                }
-                                fallbackInserts.push({
-                                    method: 'POST',
-                                    path: calendarPath,
-                                    body: { ...(req.fullBody || req.body || {}) },
-                                    obsidianTaskId: req.obsidianTaskId,
-                                    operationType: 'insert'
-                                });
-                            }
-                            return;
-                        }
-
-                        // insert の 409 (既存ID) は通常 body.id 指定時の衝突。現状は安全にスキップのみ。
-                        if (req.operationType === 'insert' && status === 409 && req.obsidianTaskId) {
-                            console.warn('Insert 409 detected for', req.obsidianTaskId, '— skipping without mapping.');
-                            skippedCount++;
-                            return;
-                        }
-
-                        const operation = req.operationType || 'unknown';
-                        const reason = (res.body?.error?.errors?.[0]?.reason) || (res.body?.error?.status) || '';
-                        const isRate403 = status === 403 && /(rateLimitExceeded|userRateLimitExceeded)/i.test(reason);
-                        const isResExhausted = /RESOURCE_EXHAUSTED/i.test(reason);
-                        const isTransient = status === 412 || status === 429 || status >= 500 || isRate403 || isResExhausted;
-                        const message = typeof res.body?.error?.message === 'string' ? (res.body.error.message as string).slice(0, 200) : undefined;
-                        const entry: ErrorLog = {
-                            errorType: isTransient ? 'transient' : 'permanent',
-                            operation: operation as any,
-                            taskId: req.obsidianTaskId || 'unknown',
-                            gcalId: req.originalGcalId,
-                            retryCount: this.retryCount,
-                            errorDetails: { status, reason, message }
-                        };
-                        this.errorLogs.push(entry);
-                        // 412 (If-Match 不一致) はローカル優先で上書き再送
-                        if ((req.operationType === 'update' || req.operationType === 'patch') && status === 412) {
-                            const retry: BatchRequestItem = {
-                                method: req.method,
-                                path: req.path,
-                                body: req.body || req.fullBody,
-                                obsidianTaskId: req.obsidianTaskId,
-                                operationType: req.operationType,
-                                originalGcalId: req.originalGcalId
-                            };
-                            fallbackNoIfMatch.push(retry);
-                            return;
-                        }
-                        if (status === 400) {
-                            try {
-                                console.error('400 body:', JSON.stringify(res.body).slice(0, 500));
-                                console.error('400 req:', JSON.stringify(req.body || req.fullBody).slice(0, 500));
-                            } catch {}
-                        }
-                        // 診断用に recentErrors を更新（上限 50 件）
-                        const maxSamples = 50;
-                        const arr = this.plugin.settings.recentErrors ?? [];
-                        arr.unshift(entry);
-                        while (arr.length > maxSamples) arr.pop();
-                        this.plugin.settings.recentErrors = arr;
-                    }
-                });
-
-                if (fallbackInserts.length > 0) {
-                    console.log(`再作成フォールバック: ${fallbackInserts.length} 件をPOST`);
-                    const fb = await this.executeBatchesWithRetry(fallbackInserts, batchProcessor);
-                    createdCount += fb.created;
-                    updatedCount += fb.updated;
-                    deletedCount += fb.deleted;
-                    errorCount += fb.errors;
-                    skippedCount += fb.skipped;
-                    if (fb.metrics) this.logMetricsSummary('Fallback Inserts', fb.metrics);
-                    fb.results.forEach((res, idx) => {
-                        const req = fallbackInserts[idx];
-                        if (res.status >= 200 && res.status < 300 && res.body?.id && req.obsidianTaskId) {
-                            taskMap[req.obsidianTaskId] = res.body.id;
-                        }
-                    });
-                }
-
-                if (fallbackNoIfMatch.length > 0) {
-                    console.log(`412再試行(If-Match無): ${fallbackNoIfMatch.length} 件を再送`);
-                    const fb2 = await this.executeBatchesWithRetry(fallbackNoIfMatch, batchProcessor);
-                    createdCount += fb2.created;
-                    updatedCount += fb2.updated;
-                    deletedCount += fb2.deleted;
-                    errorCount += fb2.errors;
-                    skippedCount += fb2.skipped;
-                }
-
-                if (fallbackDeleteNoIfMatch.length > 0) {
-                    console.log(`412削除再試行(If-Match無): ${fallbackDeleteNoIfMatch.length} 件を再送`);
-                    const fb3 = await this.executeBatchesWithRetry(fallbackDeleteNoIfMatch, batchProcessor);
-                    createdCount += fb3.created;
-                    updatedCount += fb3.updated;
-                    deletedCount += fb3.deleted;
-                    errorCount += fb3.errors;
-                    skippedCount += fb3.skipped;
-                    // 成功した delete は taskMap を掃除
-                    fb3.results.forEach((res, idx) => {
-                        const req = fallbackDeleteNoIfMatch[idx];
-                        if (res.status >= 200 && res.status < 300 && req?.obsidianTaskId) {
-                            delete taskMap[req.obsidianTaskId];
-                        }
-                    });
-                }
-            } else if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
-                new Notice('変更なし。', 2000);
-            }
+            const counts = await this.processBatchRequests(
+                batchRequests, batchProcessor, taskMap, eventById, settings, isManualSync
+            );
+            createdCount += counts.createdCount;
+            updatedCount += counts.updatedCount;
+            deletedCount += counts.deletedCount;
+            skippedCount += counts.skippedCount;
+            errorCount += counts.errorCount;
 
             // 7. 設定保存・サマリー (FIX: Live Settings に結果を反映)
             const syncEndTime = new Date();
@@ -347,6 +135,259 @@ export class SyncLogic {
             try { await this.plugin.saveData(this.plugin.settings); } catch {}
             this.plugin.refreshSettingsTab();
         }
+    }
+
+    private async fetchObsidianTasks(isManualSync: boolean, settings: GoogleCalendarTasksSyncSettings): Promise<ObsidianTask[]> {
+        if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
+            new Notice('Obsidian タスクを取得中...', 2000);
+        }
+        console.time('Sync: Fetch Obsidian Tasks');
+        const tasks = await this.plugin.taskParser.getObsidianTasks();
+        console.timeEnd('Sync: Fetch Obsidian Tasks');
+        return tasks;
+    }
+
+    private async fetchGoogleEvents(
+        settings: GoogleCalendarTasksSyncSettings,
+        force: boolean,
+        taskMap: { [obsidianTaskId: string]: string },
+        isManualSync: boolean
+    ): Promise<{
+        existingEvents: calendar_v3.Schema$Event[];
+        googleEventMap: Map<string, calendar_v3.Schema$Event>;
+        dedupeIndex: Map<string, calendar_v3.Schema$Event>;
+        existingGIdSet: Set<string>;
+        eventById: Map<string, calendar_v3.Schema$Event>;
+    }> {
+        if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
+            new Notice('GCal イベントを取得中...', 2000);
+        }
+        console.time('Sync: Fetch GCal Events');
+        let existingEvents = await this.plugin.gcalApi.fetchGoogleCalendarEvents(settings);
+        try {
+            const mapped = new Set<string>(Object.values(taskMap).filter((v): v is string => !!v));
+            existingEvents = existingEvents.filter(ev => {
+                const managed = ev.extendedProperties?.private?.['isGcalSync'] === 'true';
+                if (ev.status === 'cancelled') return managed || (!!ev.id && mapped.has(ev.id));
+                return managed;
+            });
+        } catch (e) {
+            console.warn('取得イベントの仕分けで警告:', e);
+        }
+        let googleEventMap = new Map<string, calendar_v3.Schema$Event>();
+        if (!force) {
+            googleEventMap = this.mapGoogleEvents(existingEvents, taskMap);
+        }
+        const dedupeIndex = this.buildDedupeIndex(existingEvents);
+        console.timeEnd('Sync: Fetch GCal Events');
+
+        const existingGIdSet = new Set<string>(
+            existingEvents.map(e => e.id).filter((v): v is string => !!v)
+        );
+        const eventById = new Map<string, calendar_v3.Schema$Event>();
+        existingEvents.forEach(ev => { if (ev.id) eventById.set(ev.id, ev); });
+        return { existingEvents, googleEventMap, dedupeIndex, existingGIdSet, eventById };
+    }
+
+    private prepareDeletions(
+        taskMap: { [obsidianTaskId: string]: string },
+        currentObsidianTaskIds: Set<string>,
+        existingEvents: calendar_v3.Schema$Event[],
+        existingGIdSet: Set<string>,
+        batchRequests: BatchRequestItem[],
+        settings: GoogleCalendarTasksSyncSettings,
+        force: boolean
+    ): void {
+        console.time('Sync: Prepare Deletions');
+        this.prepareDeletionRequests(taskMap, currentObsidianTaskIds, existingEvents, existingGIdSet, batchRequests, settings, force);
+        console.timeEnd('Sync: Prepare Deletions');
+    }
+
+    private async processBatchRequests(
+        batchRequests: BatchRequestItem[],
+        batchProcessor: BatchProcessor,
+        taskMap: { [obsidianTaskId: string]: string },
+        eventById: Map<string, calendar_v3.Schema$Event>,
+        settings: GoogleCalendarTasksSyncSettings,
+        isManualSync: boolean
+    ): Promise<{ createdCount: number; updatedCount: number; deletedCount: number; skippedCount: number; errorCount: number }> {
+        let createdCount = 0, updatedCount = 0, deletedCount = 0, skippedCount = 0, errorCount = 0;
+
+        // 追加: taskMap 経由の更新・削除に If-Match を可能な限り付与して 412 を低減
+        try {
+            for (const r of batchRequests) {
+                if (!r || !r.originalGcalId) continue;
+                if (!r.headers) r.headers = {};
+                if (!('If-Match' in r.headers)) {
+                    const ev = eventById.get(r.originalGcalId);
+                    if (ev?.etag) r.headers['If-Match'] = ev.etag;
+                }
+            }
+        } catch {}
+
+        if (batchRequests.length > 0) {
+            const { results, created, updated, deleted, errors, skipped, metrics } =
+                await this.executeBatchesWithRetry(batchRequests, batchProcessor);
+
+            createdCount += created;
+            updatedCount += updated;
+            deletedCount += deleted;
+            errorCount += errors;
+            skippedCount += skipped;
+
+            if (metrics) this.logMetricsSummary('Main Batch', metrics);
+
+            const calendarPath = `/calendar/v3/calendars/${encodeURIComponent(settings.calendarId)}/events`;
+            const fallbackInserts: BatchRequestItem[] = [];
+            const fallbackNoIfMatch: BatchRequestItem[] = [];
+            const fallbackDeleteNoIfMatch: BatchRequestItem[] = [];
+
+            results.forEach((res: BatchResponseItem, i: number) => {
+                const req = batchRequests[i];
+                if (!req) {
+                    console.warn(`応答に対応するリクエストが見つかりません (index: ${i})。リトライ処理中の不整合の可能性があります。`, res);
+                    errorCount++;
+                    return;
+                }
+
+                if (res.status >= 200 && res.status < 300) {
+                    const newGcalId = res.body?.id;
+                    if (req.operationType === 'insert' && newGcalId && req.obsidianTaskId) {
+                        taskMap[req.obsidianTaskId] = newGcalId;
+                    } else if ((req.operationType === 'update' || req.operationType === 'patch') && newGcalId && req.obsidianTaskId) {
+                        taskMap[req.obsidianTaskId] = newGcalId;
+                    } else if (req.operationType === 'delete' && req.obsidianTaskId) {
+                        delete taskMap[req.obsidianTaskId];
+                    }
+                } else {
+                    const status = res.status;
+                    if (req.operationType === 'delete') {
+                        this.handleDeleteError(req, status);
+                        if (status === 410 || status === 404) {
+                            if (req.obsidianTaskId) delete taskMap[req.obsidianTaskId];
+                        } else if (status === 412) {
+                            const retryDel: BatchRequestItem = {
+                                method: 'DELETE',
+                                path: req.path,
+                                obsidianTaskId: req.obsidianTaskId,
+                                operationType: 'delete',
+                                originalGcalId: req.originalGcalId,
+                            };
+                            fallbackDeleteNoIfMatch.push(retryDel);
+                        }
+                        return;
+                    }
+
+                    if ((req.operationType === 'update' || req.operationType === 'patch') && (status === 404 || status === 410)) {
+                        if (req.obsidianTaskId) {
+                            if (taskMap[req.obsidianTaskId]) {
+                                delete taskMap[req.obsidianTaskId];
+                            }
+                            fallbackInserts.push({
+                                method: 'POST',
+                                path: calendarPath,
+                                body: { ...(req.fullBody || req.body || {}) },
+                                obsidianTaskId: req.obsidianTaskId,
+                                operationType: 'insert',
+                            });
+                        }
+                        return;
+                    }
+
+                    if (req.operationType === 'insert' && status === 409 && req.obsidianTaskId) {
+                        console.warn('Insert 409 detected for', req.obsidianTaskId, '— skipping without mapping.');
+                        skippedCount++;
+                        return;
+                    }
+
+                    const operation = req.operationType || 'unknown';
+                    const reason = (res.body?.error?.errors?.[0]?.reason) || (res.body?.error?.status) || '';
+                    const isRate403 = status === 403 && /(rateLimitExceeded|userRateLimitExceeded)/i.test(reason);
+                    const isResExhausted = /RESOURCE_EXHAUSTED/i.test(reason);
+                    const isTransient = status === 412 || status === 429 || status >= 500 || isRate403 || isResExhausted;
+                    const message = typeof res.body?.error?.message === 'string' ? (res.body.error.message as string).slice(0, 200) : undefined;
+                    const entry: ErrorLog = {
+                        errorType: isTransient ? 'transient' : 'permanent',
+                        operation: operation as any,
+                        taskId: req.obsidianTaskId || 'unknown',
+                        gcalId: req.originalGcalId,
+                        retryCount: this.retryCount,
+                        errorDetails: { status, reason, message },
+                    };
+                    this.errorLogs.push(entry);
+                    if ((req.operationType === 'update' || req.operationType === 'patch') && status === 412) {
+                        const retry: BatchRequestItem = {
+                            method: req.method,
+                            path: req.path,
+                            body: req.body || req.fullBody,
+                            obsidianTaskId: req.obsidianTaskId,
+                            operationType: req.operationType,
+                            originalGcalId: req.originalGcalId,
+                        };
+                        fallbackNoIfMatch.push(retry);
+                        return;
+                    }
+                    if (status === 400) {
+                        try {
+                            console.error('400 body:', JSON.stringify(res.body).slice(0, 500));
+                            console.error('400 req:', JSON.stringify(req.body || req.fullBody).slice(0, 500));
+                        } catch {}
+                    }
+                    const maxSamples = 50;
+                    const arr = this.plugin.settings.recentErrors ?? [];
+                    arr.unshift(entry);
+                    while (arr.length > maxSamples) arr.pop();
+                    this.plugin.settings.recentErrors = arr;
+                }
+            });
+
+            if (fallbackInserts.length > 0) {
+                console.log(`再作成フォールバック: ${fallbackInserts.length} 件をPOST`);
+                const fb = await this.executeBatchesWithRetry(fallbackInserts, batchProcessor);
+                createdCount += fb.created;
+                updatedCount += fb.updated;
+                deletedCount += fb.deleted;
+                errorCount += fb.errors;
+                skippedCount += fb.skipped;
+                if (fb.metrics) this.logMetricsSummary('Fallback Inserts', fb.metrics);
+                fb.results.forEach((res, idx) => {
+                    const req = fallbackInserts[idx];
+                    if (res.status >= 200 && res.status < 300 && res.body?.id && req.obsidianTaskId) {
+                        taskMap[req.obsidianTaskId] = res.body.id;
+                    }
+                });
+            }
+
+            if (fallbackNoIfMatch.length > 0) {
+                console.log(`412再試行(If-Match無): ${fallbackNoIfMatch.length} 件を再送`);
+                const fb2 = await this.executeBatchesWithRetry(fallbackNoIfMatch, batchProcessor);
+                createdCount += fb2.created;
+                updatedCount += fb2.updated;
+                deletedCount += fb2.deleted;
+                errorCount += fb2.errors;
+                skippedCount += fb2.skipped;
+            }
+
+            if (fallbackDeleteNoIfMatch.length > 0) {
+                console.log(`412削除再試行(If-Match無): ${fallbackDeleteNoIfMatch.length} 件を再送`);
+                const fb3 = await this.executeBatchesWithRetry(fallbackDeleteNoIfMatch, batchProcessor);
+                createdCount += fb3.created;
+                updatedCount += fb3.updated;
+                deletedCount += fb3.deleted;
+                errorCount += fb3.errors;
+                skippedCount += fb3.skipped;
+                fb3.results.forEach((res, idx) => {
+                    const req = fallbackDeleteNoIfMatch[idx];
+                    if (res.status >= 200 && res.status < 300 && req?.obsidianTaskId) {
+                        delete taskMap[req.obsidianTaskId];
+                    }
+                });
+            }
+        } else if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
+            new Notice('変更なし。', 2000);
+        }
+
+        return { createdCount, updatedCount, deletedCount, skippedCount, errorCount };
     }
 
     private mapGoogleEvents(
