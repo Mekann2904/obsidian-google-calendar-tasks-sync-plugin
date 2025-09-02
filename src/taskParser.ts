@@ -1,18 +1,13 @@
 import { App } from 'obsidian';
+import { createHash } from 'crypto';
 import moment from 'moment';
 import { RRule, RRuleSet, rrulestr, Frequency, Options as RRuleOptions, Weekday } from 'rrule';
 import { ObsidianTask } from './types';
 
 export class TaskParser {
     private app: App;
-    private hash32(input: string): number {
-        let hash = 0;
-        for (let i = 0; i < input.length; i++) {
-            const chr = input.charCodeAt(i);
-            hash = ((hash << 5) - hash) + chr;
-            hash |= 0; // 32bit int
-        }
-        return hash >>> 0; // 非負に正規化
+    private generateId(input: string): string {
+        return createHash('sha1').update(input).digest('hex').slice(0, 8);
     }
 
     constructor(app: App) {
@@ -245,7 +240,7 @@ export class TaskParser {
         const idBasis = blockLink
             ? `${filePath}:${blockLink}`
             : `${filePath}:${(summary || '')}:${startDate ?? ''}:${dueDate ?? ''}:${timeWindowStart ?? ''}-${timeWindowEnd ?? ''}`;
-        const taskId = `obsidian-${this.hash32(idBasis)}`;
+        const taskId = `obsidian-${this.generateId(idBasis)}`;
 
         return {
             id: taskId,
