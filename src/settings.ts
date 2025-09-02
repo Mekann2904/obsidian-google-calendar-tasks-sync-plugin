@@ -4,6 +4,19 @@ import moment from 'moment';
 import { GoogleCalendarTasksSyncSettings } from './types';
 import GoogleCalendarTasksSyncPlugin from './main'; // main.ts からインポート
 
+// Vitest 等の非 Obsidian 実行環境では PluginSettingTab が undefined になるためのフォールバック
+const PluginSettingTabBase: any = (PluginSettingTab as any) || class {
+	app: App;
+	plugin: any;
+	containerEl: any;
+	constructor(app: App, plugin: any) {
+		this.app = app;
+		this.plugin = plugin;
+		this.containerEl = { empty: () => {}, createEl: () => ({}), createDiv: () => ({}) };
+	}
+	display(): void {}
+};
+
 export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 	clientId: '',
 	clientSecret: '',
@@ -49,7 +62,7 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 };
 
 
-export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
+export class GoogleCalendarSyncSettingTab extends (PluginSettingTabBase as any) {
 	plugin: GoogleCalendarTasksSyncPlugin; // 型をメインプラグインクラスに指定
 
 	constructor(app: App, plugin: GoogleCalendarTasksSyncPlugin) { // 型をメインプラグインクラスに指定
