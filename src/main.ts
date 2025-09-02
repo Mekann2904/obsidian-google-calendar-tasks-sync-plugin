@@ -282,6 +282,16 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
     authenticate(): void { this.authService.authenticate(); }
     isTokenValid(checkRefresh: boolean = false): boolean { return this.authService.isTokenValid(checkRefresh); }
 
+    /** ポート変更の適用（保存・再起動・UI更新を一括） */
+    async applyPortChange(port: number) {
+        this.settings.loopbackPort = port;
+        await this.saveData(this.settings);
+        try { await this.httpServerManager?.stopServer(); } catch {}
+        this.httpServerManager?.startServer();
+        this.authService.reconfigureOAuthClient();
+        this.refreshSettingsTab();
+    }
+
     /** 手動同期をトリガー */
     async triggerSync(): Promise<void> {
         if (!this.settings.tokens || (!this.isTokenValid(false) && !this.isTokenValid(true))) {

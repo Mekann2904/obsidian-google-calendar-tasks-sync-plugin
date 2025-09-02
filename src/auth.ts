@@ -8,6 +8,7 @@ import GoogleCalendarTasksSyncPlugin from './main'; // main.ts からインポ�
 import { DEFAULT_SETTINGS } from './settings'; // DEFAULT_SETTINGS をインポート
 
 export class AuthService {
+    private static readonly SCOPES = ['https://www.googleapis.com/auth/calendar.events'];
     private plugin: GoogleCalendarTasksSyncPlugin;
     private activeOAuthState: string | null = null;
     private activePkceVerifier: string | null = null;
@@ -128,6 +129,10 @@ export class AuthService {
      * ブラウザウィンドウを開き、ユーザーに承認を求めます。
      */
     authenticate(): void {
+        if (this.activeOAuthState) {
+            new Notice('認証処理が進行中です。ブラウザで承認を完了してください。', 6000);
+            return;
+        }
         // クライアントIDのみ必須（デスクトップ/ループバックでは secret 省略可）
         if (!this.plugin.settings.clientId) {
             new Notice('認証失敗: クライアント ID を設定する必要があります。', 7000);
@@ -149,7 +154,9 @@ export class AuthService {
         }
 
         // ユーザーにリダイレクトURIをGoogle Cloud Consoleに追加するよう促す
-        new Notice(`このリダイレクト URI を Google Cloud Console に追加してください:\n${currentRedirectUri}`, 15000);
+        if ((this.plugin.settings as any).requireRedirectUriRegistration ?? true) {
+            new Notice(`このリダイレクト URI を Google Cloud Console に追加してください:\n${currentRedirectUri}`, 15000);
+        }
 
         try {
             // CSRF対策のためのランダムなstate値を生成
@@ -168,7 +175,7 @@ export class AuthService {
                 access_type: 'offline',
                 include_granted_scopes: true,
                 prompt: needsRefreshToken ? 'consent' : undefined,
-                scope: ['https://www.googleapis.com/auth/calendar.events'],
+                scope: AuthService.SCOPES,
                 state: this.activeOAuthState!,
                 redirect_uri: currentRedirectUri,
                 code_challenge_method: 'S256' as any,
@@ -219,6 +226,11 @@ export class AuthService {
         }
         console.log("OAuth state の検証に成功しました。");
         this.activeOAuthState = null; this.activeOAuthStateIssuedAt = null; // 検証成功後にクリア
+
+        // PKCE verifier が存在するかを確認
+        if (!this.activePkceVerifier) {
+            throw new Error('PKCE 検証情報が見つかりません。もう一度認証を開始してください。');
+        }
 
         // 2. Google からのエラーを確認
         if (error) {
@@ -364,7 +376,12 @@ export class AuthService {
         // クレデンシャルを適用し、getAccessToken() で更新をトリガー
         try {
             if (this.plugin.settings.tokens) client.setCredentials(this.plugin.settings.tokens);
+            const before = client.credentials.access_token;
             await client.getAccessToken(); // 期限切れなら自動リフレッシュ
+            const after = client.credentials.access_token;
+            if (after && after !== before) {
+                await this.plugin.persistTokens(client.credentials as Credentials);
+            }
             return true;
         } catch (error: any) {
             console.error("アクセストークン取得/更新に失敗:", error);
@@ -385,10 +402,10 @@ export class AuthService {
     /** 完全サインアウト: トークン取り消しとクリア */
     async revokeAndClear(): Promise<void> {
         try {
-            const token = this.plugin.oauth2Client?.credentials?.access_token || this.plugin.settings.tokens?.access_token;
-            if (token && this.plugin.oauth2Client) {
-                await this.plugin.oauth2Client.revokeToken(token);
-            }
+            const rt = this.plugin.settings.tokens?.refresh_token;
+            const at = this.plugin.oauth2Client?.credentials?.access_token || this.plugin.settings.tokens?.access_token;
+            if (rt && this.plugin.oauth2Client) await this.plugin.oauth2Client.revokeToken(rt);
+            else if (at && this.plugin.oauth2Client) await this.plugin.oauth2Client.revokeToken(at);
         } catch (e) {
             console.warn('トークン取り消しに失敗:', e);
         } finally {

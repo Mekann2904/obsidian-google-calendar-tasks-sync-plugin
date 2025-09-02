@@ -479,10 +479,17 @@ export class SyncLogic {
                     const identity = this.buildIdentityKeyFromPayload(eventPayload);
                     const dup = dedupeIndex?.get(identity);
                     if (dup && dup.id) {
-                        // 既存イベントを再利用し、マッピングだけ張る
+                        // 既存イベントを再利用（誤アンカー対策: 必要なら展開・置換）
                         taskMap[obsId] = dup.id;
-                        // 内容差分があれば PATCH（extendedProperties の obsidianTaskId 差異は無視）
-                        if (this.needsUpdateIgnoringOwner(dup, eventPayload)) {
+
+                        const expandedBodies = this.expandEventForInsertion(eventPayload, task);
+                        if (expandedBodies.length > 1) {
+                            // 単発→繰り返し（daily等）に切替時は UI 側の誤アンカーを避けるため削除→複数挿入
+                            const headers: Record<string, string> = {};
+                            if (dup.etag) headers['If-Match'] = dup.etag;
+                            batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(dup.id)}`, headers, obsidianTaskId: obsId, operationType: 'delete', originalGcalId: dup.id });
+                            expandedBodies.forEach(body => batchRequests.push({ method: 'POST', path: calendarPath, body, obsidianTaskId: obsId, operationType: 'insert' }));
+                        } else if (this.needsUpdateIgnoringOwner(dup, eventPayload)) {
                             const headers: Record<string, string> = {};
                             if (dup.etag) headers['If-Match'] = dup.etag;
                             batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(dup.id)}`, headers, body: this.buildPatchBodyIgnoringOwner(dup, eventPayload), fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'patch', originalGcalId: dup.id });
@@ -507,7 +514,112 @@ export class SyncLogic {
         const ruleStr = (eventPayload.recurrence || [])[0] || '';
         const hasRecurrence = !!ruleStr;
 
-        // 0) 汎用: RRULE があり、🛫/📅 がある場合は rrule で期間内の実発生日を列挙して個別イベント化
+        // 1) DAILY（COUNT 有無）を優先して個別イベントに展開
+        const mDaily = ruleStr.match(/FREQ=DAILY(?:;COUNT=(\d+))?/);
+        if (mDaily) {
+            let count = Number(mDaily[1] || '');
+            if (!count || isNaN(count)) {
+                // COUNT が無い場合は🛫〜📅の日数で補完
+                if (task.startDate && task.dueDate) {
+                    const s = moment(task.startDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
+                    const e = moment(task.dueDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
+                    const days = e.diff(s, 'days') + 1;
+                    count = days > 0 ? days : 1;
+                } else {
+                    count = 1;
+                }
+            }
+            const base = eventPayload.start?.dateTime ? moment.parseZone(eventPayload.start.dateTime) : null;
+            if (base && count > 0) {
+                // 時間帯はタスクの timeWindow または payload の時刻から推定
+                const twStart = task.timeWindowStart || moment(base).format('HH:mm');
+                const twEnd = task.timeWindowEnd || (eventPayload.end?.dateTime ? moment.parseZone(eventPayload.end.dateTime).format('HH:mm') : '24:00');
+                for (let i = 0; i < count; i++) {
+                    const sDay = base.clone().add(i, 'day');
+                    const [sh, sm] = twStart.split(':').map(Number);
+                    const s = sDay.clone().hour(sh).minute(sm).second(0).millisecond(0);
+                    let e: moment.Moment;
+                    if (twEnd === '24:00') {
+                        e = sDay.clone().add(1, 'day').startOf('day');
+                    } else {
+                        const [eh, em] = twEnd.split(':').map(Number);
+                        e = sDay.clone().hour(eh).minute(em).second(0).millisecond(0);
+                    }
+                    if (!s.isValid()) { console.warn('skip invalid start (daily expand):', sDay.toString()); continue; }
+                    if (!e.isValid() || !e.isAfter(s)) {
+                        e = s.clone().add(this.plugin.settings.defaultEventDurationMinutes, 'minute');
+                    }
+                    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                    const ev = clone(eventPayload);
+                    // テスト期待に合わせ、offset なしのフォーマットを使用
+                    ev.start = { dateTime: s.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any;
+                    ev.end = { dateTime: e.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any;
+                    ev.recurrence = undefined;
+                    if ((ev.start as any).date) delete (ev.start as any).date;
+                    if ((ev.end as any).date) delete (ev.end as any).date;
+                    out.push(ev);
+                }
+                return out;
+            }
+        }
+
+        // 1.5) WEEKLY（BYDAY）: 期間内の該当曜日のみ個別に展開
+        const mWeekly = ruleStr.match(/FREQ=WEEKLY(?:;BYDAY=([A-Z,]+))?/);
+        if (mWeekly && task.startDate && task.dueDate) {
+            const bydayStr = mWeekly[1] || '';
+            const dayTokens = bydayStr ? bydayStr.split(',') : [];
+            const mapDOW: Record<string, number> = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
+            const targetDows = dayTokens.map(t => mapDOW[t]).filter((n) => typeof n === 'number');
+            if (targetDows.length > 0) {
+                const baseStart = eventPayload.start?.dateTime ? moment.parseZone(eventPayload.start.dateTime) : null;
+                const baseEnd = eventPayload.end?.dateTime ? moment.parseZone(eventPayload.end.dateTime) : null;
+                const twStart = task.timeWindowStart || (baseStart ? baseStart.format('HH:mm') : undefined);
+                const twEnd = task.timeWindowEnd || (baseEnd ? baseEnd.format('HH:mm') : undefined);
+                const cursor = moment(task.startDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
+                const end = moment(task.dueDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).endOf('day');
+                const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                let d = cursor.clone();
+                while (d.isSameOrBefore(end, 'day')) {
+                    if (targetDows.includes(d.day())) {
+                        let s: moment.Moment;
+                        let e: moment.Moment;
+                        if (twStart && twEnd) {
+                            const [sh, sm] = twStart.split(':').map(Number);
+                            s = d.clone().hour(sh).minute(sm).second(0).millisecond(0);
+                            if (twEnd === '24:00') e = d.clone().add(1,'day').startOf('day');
+                            else {
+                                const [eh, em] = twEnd.split(':').map(Number);
+                                e = d.clone().hour(eh).minute(em).second(0).millisecond(0);
+                            }
+                        } else if (baseStart && baseEnd) {
+                            s = d.clone().hour(baseStart.hour()).minute(baseStart.minute()).second(0).millisecond(0);
+                            e = d.clone().hour(baseEnd.hour()).minute(baseEnd.minute()).second(0).millisecond(0);
+                        } else {
+                            // 終日フォールバック
+                            out.push({ ...clone(eventPayload), start: { date: d.format('YYYY-MM-DD') }, end: { date: d.clone().add(1,'day').format('YYYY-MM-DD') }, recurrence: undefined });
+                            d = d.add(1, 'day');
+                            continue;
+                        }
+                        if (!s.isValid()) { console.warn('skip invalid start (weekly expand):', d.toString()); d = d.add(1, 'day'); continue; }
+                        if (!e.isValid() || !e.isAfter(s)) {
+                            e = s.clone().add(this.plugin.settings.defaultEventDurationMinutes, 'minute');
+                        }
+                        const ev = clone(eventPayload);
+                        // テスト期待に合わせ、offset なしのフォーマットを使用
+                        ev.start = { dateTime: s.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any;
+                        ev.end = { dateTime: e.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any;
+                        ev.recurrence = undefined;
+                        if ((ev.start as any).date) delete (ev.start as any).date;
+                        if ((ev.end as any).date) delete (ev.end as any).date;
+                        out.push(ev);
+                    }
+                    d = d.add(1, 'day');
+                }
+                if (out.length > 0) return out;
+            }
+        }
+
+        // 2) 汎用: RRULE があり、🛫/📅 がある場合は rrule で期間内の実発生日を列挙して個別イベント化
         if (hasRecurrence && task.startDate && task.dueDate) {
             try {
                 const dtstart = eventPayload.start?.dateTime ? new Date(eventPayload.start.dateTime) : new Date(task.startDate);
@@ -551,8 +663,9 @@ export class SyncLogic {
                             e = e.isValid() ? (e.isAfter(s) ? e : minEnd) : minEnd;
                         }
                         const ev = clone(eventPayload);
-                        ev.start = { dateTime: s.format('YYYY-MM-DDTHH:mm:ssZ'), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone } as any;
-                        ev.end = { dateTime: e.format('YYYY-MM-DDTHH:mm:ssZ'), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone } as any;
+                        // テスト期待に合わせ、offset なしのフォーマットを使用
+                        ev.start = { dateTime: s.format('YYYY-MM-DDTHH:mm:ss'), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone } as any;
+                        ev.end = { dateTime: e.format('YYYY-MM-DDTHH:mm:ss'), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone } as any;
                         ev.recurrence = undefined;
                         if ((ev.start as any).date) delete (ev.start as any).date;
                         if ((ev.end as any).date) delete (ev.end as any).date;
@@ -565,55 +678,7 @@ export class SyncLogic {
             }
         }
 
-        // 1) daily + COUNT の場合は個別イベントに展開
-        const mDaily = ruleStr.match(/FREQ=DAILY(?:;COUNT=(\d+))?/);
-        if (mDaily) {
-            let count = Number(mDaily[1] || '');
-            if (!count || isNaN(count)) {
-                // COUNT が無い場合は🛫〜📅の日数で補完
-                if (task.startDate && task.dueDate) {
-                    const s = moment(task.startDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
-                    const e = moment(task.dueDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
-                    const days = e.diff(s, 'days') + 1;
-                    count = days > 0 ? days : 1;
-                } else {
-                    count = 1;
-                }
-            }
-            const base = eventPayload.start?.dateTime ? moment.parseZone(eventPayload.start.dateTime) : null;
-            if (base && count > 0) {
-                // 時間帯はタスクの timeWindow または payload の時刻から推定
-                const twStart = task.timeWindowStart || moment(base).format('HH:mm');
-                const twEnd = task.timeWindowEnd || (eventPayload.end?.dateTime ? moment.parseZone(eventPayload.end.dateTime).format('HH:mm') : '24:00');
-                for (let i = 0; i < count; i++) {
-                    const sDay = base.clone().add(i, 'day');
-                    const [sh, sm] = twStart.split(':').map(Number);
-                    const [eh, em] = twEnd.split(':').map(x => x === '24:00' ? NaN : Number(x));
-                    const s = sDay.clone().hour(sh).minute(sm).second(0).millisecond(0);
-                    let e: moment.Moment;
-                    if (twEnd === '24:00') {
-                        e = sDay.clone().add(1, 'day').startOf('day');
-                    } else {
-                        e = sDay.clone().hour(eh!).minute(em!).second(0).millisecond(0);
-                    }
-                    if (!s.isValid()) { console.warn('skip invalid start (daily expand):', sDay.toString()); continue; }
-                    if (!e.isValid() || !e.isAfter(s)) {
-                        e = s.clone().add(this.plugin.settings.defaultEventDurationMinutes, 'minute');
-                    }
-                    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-                    const ev = clone(eventPayload);
-                    ev.start = { dateTime: s.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any;
-                    ev.end = { dateTime: e.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any;
-                    ev.recurrence = undefined;
-                    if ((ev.start as any).date) delete (ev.start as any).date;
-                    if ((ev.end as any).date) delete (ev.end as any).date;
-                    out.push(ev);
-                }
-                return out;
-            }
-        }
-
-        // 2) 単一イベントが日付を跨ぐ場合は日次スライス
+        // 3) 単一イベントが日付を跨ぐ場合は日次スライス
         const sdt = eventPayload.start?.dateTime ? moment.parseZone(eventPayload.start.dateTime) : null;
         const edt = eventPayload.end?.dateTime ? moment.parseZone(eventPayload.end.dateTime) : null;
         if (sdt && edt && !sdt.isSame(edt, 'day')) {
@@ -646,7 +711,7 @@ export class SyncLogic {
             return out;
         }
 
-        // 3) それ以外はそのまま単一
+        // 4) それ以外はそのまま単一
         out.push(eventPayload);
         return out;
     }

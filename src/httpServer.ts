@@ -168,6 +168,14 @@ export class HttpServerManager {
             return;
         }
 
+        // Host ヘッダの厳密チェック（ローカル以外は拒否）
+        const hostHdr = (req.headers.host || '').toLowerCase();
+        if (!/^127\.0\.0\.1:\d+$/.test(hostHdr)) {
+            res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('Bad Request: Host not allowed');
+            return;
+        }
+
         const serverAddress = this.server.address();
         const host = serverAddress && typeof serverAddress === 'object' ? `127.0.0.1:${serverAddress.port}` : `127.0.0.1:${this.plugin.settings.loopbackPort}`;
 

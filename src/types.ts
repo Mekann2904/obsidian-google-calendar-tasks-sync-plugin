@@ -17,6 +17,8 @@ export interface ObsidianTask {
 	// 🔁 拡張: 時間ウィンドウ (例: 15:00~24:00)
 	timeWindowStart?: string | null; // 'HH:mm'
 	timeWindowEnd?: string | null;   // 'HH:mm' または '24:00'
+	/** インデントされた継続行からの自由記述（説明欄へ） */
+	extraDetail?: string | null;
 	tags: string[]; // タグ (例: #tag1)
 	blockLink: string | null; // ブロックリンク (例: ^abcdef)
 	sourcePath: string; // タスクが存在するファイルのパス
@@ -63,6 +65,7 @@ export interface GoogleCalendarTasksSyncSettings {
 	defaultEventDurationMinutes: number; // 開始時刻と終了時刻が指定されているが、終了が開始より前の場合に使用するデフォルトのイベント時間 (分)
 	useLoopbackServer: boolean; // 認証にローカルループバックサーバーを使用するか (現在はこの方法のみサポート)
     loopbackPort: number; // ローカルループバックサーバーが使用するポート番号
+    requireRedirectUriRegistration?: boolean; // Webクライアント利用時にのみリダイレクトURI登録を促す
     showNotices: boolean; // 全通知のマスタースイッチ
     autoStopOnSuccess?: boolean; // OAuth 成功時にサーバーを自動停止
 	syncNoticeSettings: {

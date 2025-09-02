@@ -28,6 +28,7 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 	defaultEventDurationMinutes: 60,
 	useLoopbackServer: true, // 常に true
 	loopbackPort: 3000, // デフォルトポート
+	requireRedirectUriRegistration: true,
 	autoStopOnSuccess: false,
 	showNotices: true, // 通知を表示するかどうか
 	syncNoticeSettings: {
@@ -92,9 +93,7 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 
 		// --- 認証リダイレクト (ローカルサーバー) セクション ---
 		containerEl.createEl('h4', { text: '認証リダイレクト (ローカルサーバー)' });
-		containerEl.createDiv('setting-item-description').append(
-			'認証には、Google からの認証コードを受け取るためローカルウェブサーバーを使用します。',
-		);
+		containerEl.createDiv({ cls: 'setting-item-description', text: '認証には、Google からの認証コードを受け取るためローカルウェブサーバーを使用します。' });
 
 		// ポート設定 (常に表示)
 		new Setting(containerEl)
@@ -107,19 +106,21 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 				text.setPlaceholder(DEFAULT_SETTINGS.loopbackPort.toString())
 					.setValue(this.plugin.settings.loopbackPort.toString())
 					.onChange(async (value) => {
-						const portNum = parseInt(value, 10);
 						const currentPortSetting = this.plugin.settings.loopbackPort;
-						if (!isNaN(portNum) && portNum >= 1024 && portNum <= 65535) {
-							if (currentPortSetting !== portNum) {
+						const n = parseInt(value, 10);
+						const portNum = isNaN(n) ? currentPortSetting : Math.max(1024, Math.min(65535, n));
+						if (currentPortSetting !== portNum) {
+							// 反映と再起動を確実化
+							// @ts-ignore
+							if (typeof (this.plugin as any).applyPortChange === 'function') {
+								await (this.plugin as any).applyPortChange(portNum);
+							} else {
 								this.plugin.settings.loopbackPort = portNum;
-								await this.plugin.saveSettings(); // ここでは saveSettings を呼び出して再設定をトリガー
-								this.display(); // 設定UIを再描画
-								new Notice(`ポート設定が ${portNum} に変更されました。サーバーが再起動されます。`, 5000);
+								await this.plugin.saveSettings();
 							}
-						} else if (value !== currentPortSetting.toString()) {
-							new Notice('無効なポート番号です (1024-65535)。', 5000);
-							text.setValue(currentPortSetting.toString()); // 無効な値は元に戻す
+							new Notice(`ポート設定が ${portNum} に変更されました。サーバーが再起動されます。`, 5000);
 						}
+						text.setValue(portNum.toString());
 					});
 			});
 		// バッチ間遅延
@@ -134,22 +135,13 @@ export class GoogleCalendarSyncSettingTab extends PluginSettingTab {
 				text.setValue(current.toString())
 					.setPlaceholder(DEFAULT_SETTINGS.interBatchDelay.toString())
 					.onChange(async (value) => {
-						const delay = parseInt(value, 10);
-						let newDelay = current;
-						if (isNaN(delay) || delay < 0) {
-							newDelay = 0;
-						} else if (delay > 5000) {
-							newDelay = 5000;
-						} else {
-							newDelay = delay;
-						}
+						const n = parseInt(value, 10);
+						const newDelay = isNaN(n) ? current : Math.max(0, Math.min(5000, n));
 						if (current !== newDelay) {
 							this.plugin.settings.interBatchDelay = newDelay;
 							await this.plugin.saveData(this.plugin.settings);
-							text.setValue(newDelay.toString());
-						} else if (value !== newDelay.toString()){
-							text.setValue(newDelay.toString());
 						}
+						text.setValue(newDelay.toString());
 					});
 			});
 
@@ -164,20 +156,30 @@ new Setting(containerEl)
 				text.setValue(effectiveRedirectUri);
 				text.setDisabled(true);
 
+				const copy = async () => {
+					try {
+						await navigator.clipboard.writeText(effectiveRedirectUri);
+						new Notice('リダイレクト URI がコピーされました！', 2000);
+					} catch {
+						try {
+							// eslint-disable-next-line @typescript-eslint/no-var-requires
+							const { clipboard } = require('electron');
+							clipboard.writeText(effectiveRedirectUri);
+							new Notice('リダイレクト URI がコピーされました！', 2000);
+						} catch {
+							new Notice('コピーに失敗しました。', 3000);
+						}
+					}
+				};
 				const copyButton = new ExtraButtonComponent(text.inputEl.parentElement!)
 					.setIcon('copy')
 					.setTooltip('URI をコピー')
-					.onClick(() => {
-						navigator.clipboard.writeText(effectiveRedirectUri).then(
-							() => new Notice('リダイレクト URI がコピーされました！', 2000),
-							() => new Notice('コピーに失敗しました。', 3000)
-						);
-					});
+					.onClick(copy);
 				copyButton.extraSettingsEl.addClass('clickable-icon');
 			});
 
 		// 認証ステータス表示
-			const hasTokens = !!this.plugin.settings.tokens;
+			const hasTokens = !!(this.plugin.settings.tokens || this.plugin.settings.tokensEncrypted);
 			const hasAccessToken = !!this.plugin.oauth2Client?.credentials?.access_token;
 			const isTokenCurrentlyValid = this.plugin.isTokenValid(false);
 			const canRefreshToken = this.plugin.isTokenValid(true);
@@ -262,19 +264,14 @@ new Setting(containerEl)
 					text.setValue(this.plugin.settings.syncIntervalMinutes.toString())
 						.setPlaceholder(DEFAULT_SETTINGS.syncIntervalMinutes.toString())
 						.onChange(async (value) => {
-							let minutes = parseInt(value, 10);
 							const current = this.plugin.settings.syncIntervalMinutes;
-							if (isNaN(minutes) || minutes < 1) {
-								minutes = 1;
-							}
+							const n = parseInt(value, 10);
+							const minutes = isNaN(n) || n < 1 ? 1 : n;
 							if (current !== minutes) {
 								this.plugin.settings.syncIntervalMinutes = minutes;
 								await this.plugin.saveSettings(); // タイマー再設定のため saveSettings
-								text.setValue(minutes.toString()); // 画面表示を更新
-							} else if (value !== minutes.toString()){
-								// 入力が数値に変換しても変わらないが、文字列としては異なる場合 (例: "05" vs "5")
-								text.setValue(minutes.toString()); // 表示を正規化
 							}
+							text.setValue(minutes.toString()); // 表示を正規化
 						});
 				});
 		}
@@ -306,10 +303,8 @@ new Setting(containerEl)
 						if (current !== newDur) {
 							this.plugin.settings.defaultEventDurationMinutes = newDur;
 							await this.plugin.saveData(this.plugin.settings); // saveData で十分
-							text.setValue(newDur.toString()); // 画面表示を更新
-						} else if(value !== newDur.toString()){
-							text.setValue(newDur.toString()); // 表示を正規化
 						}
+						text.setValue(newDur.toString()); // 画面表示を更新/正規化
 					});
 			});
 
@@ -631,27 +626,6 @@ new Setting(containerEl)
 					});
 			});
 
-        // パスフレーズ（安全保存フォールバック用）
-        new Setting(containerEl)
-            .setName('暗号化パスフレーズ')
-            .setDesc('safeStorage が使えない環境で refresh_token を暗号化保存する鍵。保存オプションOFF時はメモリのみ（再起動で消える）。')
-            .addText(text => {
-                text.inputEl.type = 'password';
-                text.setPlaceholder('未設定（任意）')
-                    .setValue(this.plugin.settings.rememberPassphrase ? (this.plugin.settings.encryptionPassphrase || '') : '')
-                    .onChange(async (value) => {
-                        // rememberPassphrase に応じて保存 or 一時適用
-                        if (this.plugin.settings.rememberPassphrase) {
-                            this.plugin.settings.encryptionPassphrase = value || null;
-                            await this.plugin.saveData(this.plugin.settings);
-                        } else {
-                            // @ts-ignore
-                            this.plugin.passphraseCache = value || null;
-                        }
-                        new Notice('パスフレーズを適用しました。', 2000);
-                    });
-            });
-
 		// --- セキュリティ ---
 		containerEl.createEl('h3', { text: 'セキュリティ' });
 			const mode = (this.plugin as any).getEncryptionModeLabel ? (this.plugin as any).getEncryptionModeLabel() : '難読化 + 永続保存（既定）';
@@ -659,9 +633,10 @@ new Setting(containerEl)
 			.setName('保存方式')
 			.setDesc(mode);
 
+		// パスフレーズ（統合）
 		new Setting(containerEl)
-			.setName('AESパスフレーズ（任意）')
-			.setDesc('設定すると既定の難読化に加えて AES-GCM で二重に保護する。未設定でも動作。')
+			.setName('AES-GCM パスフレーズ（任意）')
+			.setDesc('設定すると refresh_token を AES-GCM で暗号化保存します。「パスフレーズを保存」OFF の場合はメモリのみで保持（再起動で消えます）。')
 			.addText(text => {
 				text.inputEl.type = 'password';
 				text.setPlaceholder('未設定（任意）')
@@ -688,8 +663,6 @@ new Setting(containerEl)
 					await this.plugin.saveData(this.plugin.settings);
 				}));
 
-
-
 		// --- デバッグ ---
 		containerEl.createEl('h3', { text: 'デバッグ' });
 		new Setting(containerEl)
@@ -702,5 +675,5 @@ new Setting(containerEl)
 					await this.plugin.saveData(this.plugin.settings);
 					try { const { setDevLogging } = await import('./logger'); setDevLogging(!!v); } catch {}
 				}));
-}
+	}
 }

@@ -6,6 +6,17 @@ import { GoogleCalendarTasksSyncSettings, BatchRequestItem, BatchResponseItem } 
 import { isGaxiosError } from './utils';
 import { GaxiosResponse } from 'gaxios';
 
+function normalizeResponseContentId(cid?: string): string | undefined {
+    if (!cid) return cid;
+    // <response-item-3> → item-3
+    let m = cid.match(/(?:^|<)response-(item-\d+)(?:>|$)/i);
+    if (m) return m[1];
+    // <item-3> or item-3 → item-3
+    m = cid.match(/(?:^|<)(item-\d+)(?:>|$)/i);
+    if (m) return m[1];
+    return cid; // それ以外はそのまま返す（順序フォールバックが効く）
+}
+
 export class GCalApiService {
     private plugin: GoogleCalendarTasksSyncPlugin;
 
@@ -260,7 +271,8 @@ export class GCalApiService {
         batchRequests.forEach((req, idx) => {
             body += `--${boundary}\r\n`;
             body += `Content-Type: application/http\r\n`;
-            body += `Content-ID: <item-${idx + 1}>\r\n\r\n`;
+            body += `Content-ID: <item-${idx + 1}>\r\n`;
+            body += `Content-Transfer-Encoding: binary\r\n\r\n`;
             // FIX: HTTP/1.1 を明示し、必ずヘッダ終端の空行を入れる
             body += `${req.method} ${normalizePath(req.path)} HTTP/1.1\r\n`;
 
@@ -448,11 +460,12 @@ export class GCalApiService {
 
         // 念のため Content-ID の item-N に従って昇順に整列
         results.sort((a, b) => {
-            const ai = a.contentId?.match(/item-(\d+)/i)?.[1];
-            const bi = b.contentId?.match(/item-(\d+)/i)?.[1];
-            const an = ai ? parseInt(ai, 10) : Number.MAX_SAFE_INTEGER;
-            const bn = bi ? parseInt(bi, 10) : Number.MAX_SAFE_INTEGER;
-            return an - bn;
+            const getNum = (cid?: string) => {
+                if (!cid) return Number.MAX_SAFE_INTEGER;
+                const m = cid.match(/(?:^|<)?(?:response-)?item-(\d+)(?:>|$)/i);
+                return m ? parseInt(m[1], 10) : Number.MAX_SAFE_INTEGER;
+            };
+            return getNum(a.contentId) - getNum(b.contentId);
         });
 
         console.log(`${results.length} 件のバッチ応答アイテムを抽出しました。`);
@@ -502,6 +515,9 @@ export class GCalApiService {
             const m = /^Content-ID:\s*<([^>]+)>/i.exec(l);
             if (m) { contentId = m[1]; break; }
         }
+
+        // ★ 正規化を追加 ★
+        contentId = normalizeResponseContentId(contentId);
 
         // HTTP ヘッダ終端（空行）を探す（statusLine 以降）
         let headerEndIdx = lines.findIndex((l, idx) => idx > statusLineIdx && l.trim() === "");
