@@ -62,13 +62,25 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 };
 
 
+
 export class GoogleCalendarSyncSettingTab extends (PluginSettingTabBase as any) {
 	plugin: GoogleCalendarTasksSyncPlugin; // 型をメインプラグインクラスに指定
 
-	constructor(app: App, plugin: GoogleCalendarTasksSyncPlugin) { // 型をメインプラグインクラスに指定
-		super(app, plugin);
-		this.plugin = plugin;
-	}
+// Vitest などで `obsidian` モジュールをモックする際、`PluginSettingTab` が
+// undefined になるとクラス継承で TypeError が発生する。ランタイムでの
+// import 時に例外が出ないよう、`PluginSettingTab` が存在しない場合は空の
+// クラスを継承元として使用する。
+// eslint-disable-next-line @typescript-eslint/ban-types
+const SafePluginSettingTab: typeof PluginSettingTab = (PluginSettingTab ?? (class {} as any));
+
+
+export class GoogleCalendarSyncSettingTab extends SafePluginSettingTab {
+        plugin: GoogleCalendarTasksSyncPlugin; // 型をメインプラグインクラスに指定
+
+        constructor(app: App, plugin: GoogleCalendarTasksSyncPlugin) { // 型をメインプラグインクラスに指定
+                super(app, plugin);
+                this.plugin = plugin;
+        }
 
 	display(): void {
 		const { containerEl } = this;
