@@ -35,27 +35,62 @@ export class GCalApiService {
             }
         }
 
-        const existingEvents: calendar_v3.Schema$Event[] = [];
-        let nextPageToken: string | undefined;
-        let nextSyncToken: string | undefined;
-
         // 重要: デフォルトは全件取得。一方で設定が有効でsyncTokenがある場合は増分取得を試行（失敗時は全件へフォールバック）。
         const trySyncToken = !!settings.useSyncToken && !!(this.plugin as any).settings?.syncToken;
-
-        // [重要] 同一条件原則: 初回フル取得と同一の検索条件を維持する。
-        // 但し、syncToken 使用時は showDeleted を有効化し、削除（cancelled）イベントを確実に取得する。
         const requestParams: calendar_v3.Params$Resource$Events$List & { quotaUser?: string } = {
             calendarId: settings.calendarId,
             ...(settings as any).quotaUser ? { quotaUser: (settings as any).quotaUser } : {},
-            privateExtendedProperty: ["isGcalSync=true", "appId=obsidian-gcal-tasks"], // 初回と増分で同一条件を維持（自プラグイン生成に限定）
-            showDeleted: trySyncToken ? true : false, // 増分時は true（仕様順守）。フル取得時は false。
-            maxResults: 2500, // ページング削減（上限 2500）
+            privateExtendedProperty: ["isGcalSync=true", "appId=obsidian-gcal-tasks"],
+            showDeleted: trySyncToken ? true : false,
+            maxResults: 2500,
             singleEvents: false,
-            // 差分判定・重複判定に必要なフィールドを取得
             fields: 'items(id,summary,description,etag,status,updated,start,end,recurrence,reminders,extendedProperties,recurringEventId,originalStartTime),nextPageToken,nextSyncToken',
         };
 
-        // [自己監査] syncToken 条件固定: 初回フル取得のフィルタ署名を保存し、増分時に比較（差異があれば警告）。
+        const useSync = await this.validateSignature(requestParams, settings);
+        if (useSync) {
+            requestParams.syncToken = (this.plugin as any).settings.syncToken;
+            console.log(`syncToken による増分取得を試行します。`);
+        } else {
+            delete (requestParams as any).syncToken;
+            console.log(`管理対象イベントを全件取得します（updatedMin/time 窓は使用しません）。`);
+        }
+
+        try {
+            const { events, nextSyncToken } = await this.iteratePages(requestParams);
+            console.log(`合計 ${events.length} 件の GCal イベントを取得しました。`);
+            if (nextSyncToken && settings.useSyncToken) {
+                (this.plugin as any).settings.syncToken = nextSyncToken;
+                await (this.plugin as any).saveData((this.plugin as any).settings);
+                console.log(`syncToken を保存しました。`);
+            }
+            return events;
+        } catch (e: any) {
+            const errorMsg = isGaxiosError(e)
+                ? e.response?.data?.error?.message || e.message
+                : String(e);
+            if (/Sync token is no longer valid/i.test(errorMsg) || /410/.test(String(e?.response?.status))) {
+                console.warn(`syncToken が無効のため、フル取得へフォールバックします。`);
+                try {
+                    return await this.fallbackFullFetch(requestParams, settings);
+                } catch (e2) {
+                    const msg = `syncToken フォールバック取得も失敗: ${String((e2 as any)?.message || e2)}`;
+                    console.error(msg);
+                    throw new Error(`${errorMsg} / ${msg}`);
+                }
+            }
+            console.error("GCal イベントの取得中に致命的なエラー:", e);
+            new Notice(`GCal イベントの取得エラー: ${errorMsg}。同期を中止しました。`, 10_000);
+            throw new Error(`GCal イベントの取得に失敗しました: ${errorMsg}`);
+        }
+    }
+
+    // syncToken 条件の自己監査とリセット
+    private async validateSignature(
+        requestParams: calendar_v3.Params$Resource$Events$List & { quotaUser?: string },
+        settings: GoogleCalendarTasksSyncSettings,
+    ): Promise<boolean> {
+        const trySyncToken = !!settings.useSyncToken && !!(this.plugin as any).settings?.syncToken;
         const sig = {
             calendarId: requestParams.calendarId!,
             privateExtendedProperty: (requestParams.privateExtendedProperty || []).slice().sort(),
@@ -65,7 +100,6 @@ export class GCalApiService {
         };
         const savedSig = (this.plugin as any).settings?.listFilterSignature as typeof sig | undefined;
         let signatureReset = false;
-        // 先に calendarId 変更を検出してクリーンリセット（冪等）
         const prevSig = savedSig;
         if (prevSig && prevSig.calendarId !== sig.calendarId) {
             console.warn('calendarId が変更されました。syncToken と署名をリセットします。', { before: prevSig.calendarId, after: sig.calendarId });
@@ -94,7 +128,6 @@ export class GCalApiService {
                     current: sig,
                     before: { hasSync: !!(this.plugin as any).settings?.syncToken, showDeleted: requestParams.showDeleted },
                 });
-                // 即時にフル取得へ切替（410待ちを回避）
                 (this.plugin as any).settings.syncToken = undefined;
                 try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
                 delete (requestParams as any).syncToken;
@@ -102,94 +135,56 @@ export class GCalApiService {
                 console.warn('切替後状態', { after: { hasSync: false, showDeleted: requestParams.showDeleted } });
             }
         } else if (!signatureReset && trySyncToken && !savedSig) {
-            // アップグレード導入等で signature 不在のケースを救済
             console.warn('listFilterSignature が存在しません。現在の条件をバックフィル保存します。', sig);
             (this.plugin as any).settings.listFilterSignature = sig;
             try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
         }
-        // 署名/リセット処理を踏まえて増分可否を再評価
+
         const useSync = !!settings.useSyncToken && !!(this.plugin as any).settings?.syncToken;
         requestParams.showDeleted = useSync;
-        if (useSync) {
-            requestParams.syncToken = (this.plugin as any).settings.syncToken;
-            console.log(`syncToken による増分取得を試行します。`);
-        } else {
-            delete (requestParams as any).syncToken;
-            console.log(`管理対象イベントを全件取得します（updatedMin/time 窓は使用しません）。`);
+        return useSync;
+    }
+
+    // ページング取得を共通化
+    private async iteratePages(
+        params: calendar_v3.Params$Resource$Events$List,
+        label = '',
+    ): Promise<{ events: calendar_v3.Schema$Event[]; nextSyncToken?: string }> {
+        const events: calendar_v3.Schema$Event[] = [];
+        let nextPageToken: string | undefined = undefined;
+        let nextSyncToken: string | undefined = undefined;
+        let page = 1;
+        do {
+            console.log(`GCal イベントページ ${page} を取得中...${label}`);
+            params.pageToken = nextPageToken;
+            const response: GaxiosResponse<calendar_v3.Schema$Events> = await this.eventsListWithRetry(params);
+            if (response.data.items) events.push(...response.data.items);
+            if (response.data.nextSyncToken) nextSyncToken = response.data.nextSyncToken;
+            nextPageToken = response.data.nextPageToken ?? undefined;
+            page++;
+        } while (nextPageToken);
+        return { events, nextSyncToken };
+    }
+
+    // syncToken 無効時のフル取得フォールバック
+    private async fallbackFullFetch(
+        requestParams: calendar_v3.Params$Resource$Events$List & { quotaUser?: string },
+        settings: GoogleCalendarTasksSyncSettings,
+    ): Promise<calendar_v3.Schema$Event[]> {
+        delete requestParams.syncToken;
+        requestParams.showDeleted = false;
+        requestParams.pageToken = undefined;
+        (this.plugin as any).settings.syncToken = undefined;
+        await (this.plugin as any).saveData((this.plugin as any).settings);
+
+        const { events, nextSyncToken } = await this.iteratePages(requestParams, '(fallback)');
+        console.log(`フォールバックで合計 ${events.length} 件を取得しました。`);
+        if (nextSyncToken && settings.useSyncToken) {
+            (this.plugin as any).settings.syncToken = nextSyncToken;
+            await (this.plugin as any).saveData((this.plugin as any).settings);
+            console.log(`syncToken を保存しました。(fallback)`);
         }
-
-        try {
-            let page = 1;
-            do {
-                console.log(`GCal イベントページ ${page} を取得中...`);
-                requestParams.pageToken = nextPageToken;
-                const response: GaxiosResponse<calendar_v3.Schema$Events> = await this.eventsListWithRetry(requestParams);
-
-                if (response.data.items) {
-                    existingEvents.push(...response.data.items);
-                }
-                if (response.data.nextSyncToken) nextSyncToken = response.data.nextSyncToken;
-                nextPageToken = response.data.nextPageToken ?? undefined;
-                page++;
-            } while (nextPageToken);
-
-            console.log(`合計 ${existingEvents.length} 件の GCal イベントを取得しました。`);
-            // syncToken 保存（増分が有効な場合）
-            if (nextSyncToken && settings.useSyncToken) {
-                (this.plugin as any).settings.syncToken = nextSyncToken;
-                await (this.plugin as any).saveData((this.plugin as any).settings);
-                console.log(`syncToken を保存しました。`);
-            }
-            return existingEvents;
-        } catch (e: any) {
-            const errorMsg = isGaxiosError(e)
-                ? e.response?.data?.error?.message || e.message
-                : String(e);
-            // syncToken が無効化された場合はフル取得へフォールバック
-            if (/Sync token is no longer valid/i.test(errorMsg) || /410/.test(String(e?.response?.status))) {
-                console.warn(`syncToken が無効のため、フル取得へフォールバックします。`);
-                try {
-                    // フォールバック前に状態を完全クリア
-                    existingEvents.length = 0;
-                    nextPageToken = undefined;
-                    nextSyncToken = undefined;
-
-                    // パラメータ／保存トークンのクリア
-                    delete requestParams.syncToken;
-                    requestParams.showDeleted = false; // フル取得では削除ノイズを避ける
-                    requestParams.pageToken = undefined;
-                    (this.plugin as any).settings.syncToken = undefined;
-                    await (this.plugin as any).saveData((this.plugin as any).settings);
-
-                    // 全件再取得
-                    let page = 1;
-                    do {
-                        console.log(`GCal イベントページ ${page} を取得中...(fallback)`);
-                        requestParams.pageToken = nextPageToken;
-                        const response: GaxiosResponse<calendar_v3.Schema$Events> = await this.eventsListWithRetry(requestParams);
-                    if (response.data.items) existingEvents.push(...response.data.items);
-                        if (response.data.nextSyncToken) nextSyncToken = response.data.nextSyncToken;
-                        nextPageToken = response.data.nextPageToken ?? undefined;
-                        page++;
-                    } while (nextPageToken);
-                    console.log(`フォールバックで合計 ${existingEvents.length} 件を取得しました。`);
-                    // フォールバックでも nextSyncToken を保存して次回から増分に戻す
-                    if (nextSyncToken && settings.useSyncToken) {
-                        (this.plugin as any).settings.syncToken = nextSyncToken;
-                        await (this.plugin as any).saveData((this.plugin as any).settings);
-                        console.log(`syncToken を保存しました。(fallback)`);
-                    }
-                    return existingEvents;
-                } catch (e2) {
-                    const msg = `syncToken フォールバック取得も失敗: ${String((e2 as any)?.message || e2)}`;
-                    console.error(msg);
-                    throw new Error(`${errorMsg} / ${msg}`);
-                }
-            }
-            console.error("GCal イベントの取得中に致命的なエラー:", e);
-            new Notice(`GCal イベントの取得エラー: ${errorMsg}。同期を中止しました。`, 10_000);
-            throw new Error(`GCal イベントの取得に失敗しました: ${errorMsg}`);
-        }
+        return events;
     }
 
     // 軽リトライ付きの events.list 呼び出し（429/5xx 対応）
