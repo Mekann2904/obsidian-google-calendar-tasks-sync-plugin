@@ -83,14 +83,15 @@ export interface GoogleCalendarTasksSyncSettings {
     rateErrorCooldownMs?: number;    // レート/一時障害後のクールダウン（既定1000ms）
     minDesiredBatchSize?: number;    // AIMD の最小単位（既定5, hardCap 以下にクランプ）
 
-	recentErrors?: ErrorLog[]; // 最近のエラーサンプル（診断用）
-	useSyncToken?: boolean; // 可能な場合、syncToken による増分取得を使用
-	quotaUser?: string; // 任意: quota を論理分離するための識別子（Google グローバルパラメータ）
-	/**
-	 * 初回フル取得時の events.list フィルタ署名（syncToken 条件固定の自己監査用）
-	 */
-	listFilterSignature?: {
-		calendarId: string;
+        recentErrors?: ErrorLog[]; // 最近のエラーサンプル（診断用）
+        useSyncToken?: boolean; // 可能な場合、syncToken による増分取得を使用
+        syncToken?: string; // 増分取得に利用する syncToken
+        quotaUser?: string; // 任意: quota を論理分離するための識別子（Google グローバルパラメータ）
+        /**
+         * 初回フル取得時の events.list フィルタ署名（syncToken 条件固定の自己監査用）
+         */
+        listFilterSignature?: {
+                calendarId: string;
 		privateExtendedProperty: string[];
 		singleEvents: boolean;
 		fields: string;
