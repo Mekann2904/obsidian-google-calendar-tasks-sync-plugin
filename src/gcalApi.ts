@@ -36,7 +36,7 @@ export class GCalApiService {
         }
 
         // 重要: デフォルトは全件取得。一方で設定が有効でsyncTokenがある場合は増分取得を試行（失敗時は全件へフォールバック）。
-        const trySyncToken = !!settings.useSyncToken && !!(this.plugin as any).settings?.syncToken;
+        const trySyncToken = !!settings.useSyncToken && !!this.plugin.settings?.syncToken;
         const requestParams: calendar_v3.Params$Resource$Events$List & { quotaUser?: string } = {
             calendarId: settings.calendarId,
             ...(settings as any).quotaUser ? { quotaUser: (settings as any).quotaUser } : {},
@@ -49,7 +49,7 @@ export class GCalApiService {
 
         const useSync = await this.validateSignature(requestParams, settings);
         if (useSync) {
-            requestParams.syncToken = (this.plugin as any).settings.syncToken;
+            requestParams.syncToken = this.plugin.settings.syncToken;
             console.log(`syncToken による増分取得を試行します。`);
         } else {
             delete (requestParams as any).syncToken;
@@ -60,8 +60,8 @@ export class GCalApiService {
             const { events, nextSyncToken } = await this.iteratePages(requestParams);
             console.log(`合計 ${events.length} 件の GCal イベントを取得しました。`);
             if (nextSyncToken && settings.useSyncToken) {
-                (this.plugin as any).settings.syncToken = nextSyncToken;
-                await (this.plugin as any).saveData((this.plugin as any).settings);
+                this.plugin.settings.syncToken = nextSyncToken;
+                await this.plugin.saveData(this.plugin.settings);
                 console.log(`syncToken を保存しました。`);
             }
             return events;
@@ -90,7 +90,7 @@ export class GCalApiService {
         requestParams: calendar_v3.Params$Resource$Events$List & { quotaUser?: string },
         settings: GoogleCalendarTasksSyncSettings,
     ): Promise<boolean> {
-        const trySyncToken = !!settings.useSyncToken && !!(this.plugin as any).settings?.syncToken;
+        const trySyncToken = !!settings.useSyncToken && !!this.plugin.settings?.syncToken;
         const sig = {
             calendarId: requestParams.calendarId!,
             privateExtendedProperty: (requestParams.privateExtendedProperty || []).slice().sort(),
@@ -98,22 +98,22 @@ export class GCalApiService {
             fields: requestParams.fields || '',
             quotaUser: (requestParams as any).quotaUser || '',
         };
-        const savedSig = (this.plugin as any).settings?.listFilterSignature as typeof sig | undefined;
+        const savedSig = this.plugin.settings?.listFilterSignature as typeof sig | undefined;
         let signatureReset = false;
         const prevSig = savedSig;
         if (prevSig && prevSig.calendarId !== sig.calendarId) {
             console.warn('calendarId が変更されました。syncToken と署名をリセットします。', { before: prevSig.calendarId, after: sig.calendarId });
-            (this.plugin as any).settings.syncToken = undefined;
-            (this.plugin as any).settings.listFilterSignature = sig;
-            try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
+            this.plugin.settings.syncToken = undefined;
+            this.plugin.settings.listFilterSignature = sig;
+            try { await this.plugin.saveData(this.plugin.settings); } catch {}
             delete (requestParams as any).syncToken;
             requestParams.showDeleted = false;
             signatureReset = true;
         }
 
         if (!trySyncToken && !savedSig) {
-            (this.plugin as any).settings.listFilterSignature = sig;
-            try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
+            this.plugin.settings.listFilterSignature = sig;
+            try { await this.plugin.saveData(this.plugin.settings); } catch {}
         } else if (!signatureReset && trySyncToken && savedSig) {
             const same = (
                 savedSig.calendarId === sig.calendarId &&
@@ -126,21 +126,21 @@ export class GCalApiService {
                 console.warn('syncToken 条件ミスマッチ→フル切替', {
                     savedSig,
                     current: sig,
-                    before: { hasSync: !!(this.plugin as any).settings?.syncToken, showDeleted: requestParams.showDeleted },
+                    before: { hasSync: !!this.plugin.settings?.syncToken, showDeleted: requestParams.showDeleted },
                 });
-                (this.plugin as any).settings.syncToken = undefined;
-                try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
+                this.plugin.settings.syncToken = undefined;
+                try { await this.plugin.saveData(this.plugin.settings); } catch {}
                 delete (requestParams as any).syncToken;
                 requestParams.showDeleted = false;
                 console.warn('切替後状態', { after: { hasSync: false, showDeleted: requestParams.showDeleted } });
             }
         } else if (!signatureReset && trySyncToken && !savedSig) {
             console.warn('listFilterSignature が存在しません。現在の条件をバックフィル保存します。', sig);
-            (this.plugin as any).settings.listFilterSignature = sig;
-            try { await (this.plugin as any).saveData((this.plugin as any).settings); } catch {}
+            this.plugin.settings.listFilterSignature = sig;
+            try { await this.plugin.saveData(this.plugin.settings); } catch {}
         }
 
-        const useSync = !!settings.useSyncToken && !!(this.plugin as any).settings?.syncToken;
+        const useSync = !!settings.useSyncToken && !!this.plugin.settings?.syncToken;
         requestParams.showDeleted = useSync;
         return useSync;
     }
@@ -174,14 +174,14 @@ export class GCalApiService {
         delete requestParams.syncToken;
         requestParams.showDeleted = false;
         requestParams.pageToken = undefined;
-        (this.plugin as any).settings.syncToken = undefined;
-        await (this.plugin as any).saveData((this.plugin as any).settings);
+        this.plugin.settings.syncToken = undefined;
+        await this.plugin.saveData(this.plugin.settings);
 
         const { events, nextSyncToken } = await this.iteratePages(requestParams, '(fallback)');
         console.log(`フォールバックで合計 ${events.length} 件を取得しました。`);
         if (nextSyncToken && settings.useSyncToken) {
-            (this.plugin as any).settings.syncToken = nextSyncToken;
-            await (this.plugin as any).saveData((this.plugin as any).settings);
+            this.plugin.settings.syncToken = nextSyncToken;
+            await this.plugin.saveData(this.plugin.settings);
             console.log(`syncToken を保存しました。(fallback)`);
         }
         return events;
