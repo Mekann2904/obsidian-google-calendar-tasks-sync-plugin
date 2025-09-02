@@ -54,9 +54,10 @@ describe('GCalApiService.eventsListWithRetry', () => {
       .mockResolvedValueOnce({ data: { items: [] } } as any);
 
     vi.useFakeTimers();
-    const promise = (service as any).eventsListWithRetry({ calendarId: 'c' } as calendar_v3.Params$Resource$Events$List);
+    const call = (service as any).eventsListWithRetry({ calendarId: 'c' } as calendar_v3.Params$Resource$Events$List);
+    const resPromise = call.then(res => res);
     await vi.runAllTimersAsync();
-    const res = await promise;
+    const res = await resPromise;
     vi.useRealTimers();
 
     expect(res.data.items).toEqual([]);
@@ -69,9 +70,10 @@ describe('GCalApiService.eventsListWithRetry', () => {
     plugin.calendar.events.list.mockRejectedValue(err);
 
     vi.useFakeTimers();
-    const promise = (service as any).eventsListWithRetry({ calendarId: 'c' } as calendar_v3.Params$Resource$Events$List);
+    const call = (service as any).eventsListWithRetry({ calendarId: 'c' } as calendar_v3.Params$Resource$Events$List);
+    const expectation = expect(call).rejects.toThrow(/events.list failed/);
     await vi.runAllTimersAsync();
-    await expect(promise).rejects.toThrow(/events.list failed/);
+    await expectation;
     vi.useRealTimers();
 
     expect(plugin.calendar.events.list).toHaveBeenCalledTimes(3);
