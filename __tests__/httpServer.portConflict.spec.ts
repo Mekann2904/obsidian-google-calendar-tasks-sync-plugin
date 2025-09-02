@@ -39,7 +39,11 @@ describe('HttpServerManager', () => {
     const serverHandles = (process as any)
       ._getActiveHandles()
       .filter((h: any) => h instanceof net.Server);
-    expect(serverHandles.length).toBe(2);
+    // The HttpServerManager unrefs its server instance, so only the blocking
+    // test server remains referenced in the active handle list. This ensures
+    // that the failed server was cleaned up properly and no additional
+    // references are left behind.
+    expect(serverHandles.length).toBe(1);
 
     expect(logSpy).toHaveBeenCalledWith(
       `サーバーをクリーンアップしました: ポート ${occupiedPort}`
