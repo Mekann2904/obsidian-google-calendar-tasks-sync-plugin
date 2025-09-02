@@ -1,12 +1,11 @@
-import { App, Notice, Plugin, TFile } from 'obsidian';
+import { App, Notice, Plugin } from 'obsidian';
 import moment from 'moment';
 import { OAuth2Client } from 'google-auth-library';
 import { calendar_v3 } from 'googleapis';
-import * as http from 'http';
 import * as net from 'net';
 
 // モジュール化されたコンポーネントをインポート
-import { ObsidianTask, GoogleCalendarTasksSyncSettings } from './types';
+import { GoogleCalendarTasksSyncSettings } from './types';
 import { DEFAULT_SETTINGS, GoogleCalendarSyncSettingTab } from './settings';
 import { AuthService } from './auth';
 import { HttpServerManager } from './httpServer';
@@ -15,6 +14,8 @@ import { GCalMapper } from './gcalMapper';
 import { GCalApiService } from './gcalApi';
 import { SyncLogic } from './syncLogic';
 import { validateMoment } from './utils'; // ユーティリティ関数をインポート
+import { encryptWithPassphrase, decryptWithPassphrase, obfuscateToBase64, deobfuscateFromBase64, deobfuscateLegacyFromBase64 } from './security';
+import { setDevLogging } from './logger';
 
 export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 	settings: GoogleCalendarTasksSyncSettings;
@@ -27,6 +28,7 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 	gcalMapper: GCalMapper;
 	gcalApi: GCalApiService;
 	syncLogic: SyncLogic;
+	private passphraseCache: string | null = null;
 	private isSyncing: boolean = false;
 
 	constructor(app: App, manifest: any) {
@@ -41,70 +43,74 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
     }
 
 
-	async onload() {
-		console.log('Google Calendar Sync プラグインをロード中');
-		await this.loadSettings();
+        async onload() {
+                console.log('Google Calendar Sync プラグインをロード中');
+                await this.loadSettings();
+                setDevLogging(!!this.settings.devLogging);
 
-        // 設定がロードされた後に、設定に依存するクラスをインスタンス化
-        this.syncLogic = new SyncLogic(this);
+                // 設定がロードされた後に、設定に依存するクラスをインスタンス化
+                this.syncLogic = new SyncLogic(this);
 
-		// useLoopbackServer の強制 (現在は不要だが念のため)
-		if (!this.settings.useLoopbackServer) {
-			console.log("'useLoopbackServer' を true に強制します (唯一のサポート方法)。");
-			this.settings.useLoopbackServer = true;
-		}
+                this.initializeOAuth();
+                await this.startHttpServer();
+                this.registerCommands();
+                this.addSettingTab(new GoogleCalendarSyncSettingTab(this.app, this));
+                this.setupAutoSync();
 
-		// OAuth クライアントと API クライアントの初期化
-		this.authService.reconfigureOAuthClient();
-		this.authService.initializeCalendarApi();
+                console.log('Google Calendar Sync プラグインがロードされました。');
+        }
 
-		// HTTP サーバーの起動
-		await this.httpServerManager.stopServer(); // 念のため既存を停止
-		this.httpServerManager.startServer();
+        private initializeOAuth(): void {
+                // useLoopbackServer の強制 (現在は不要だが念のため)
+                if (!this.settings.useLoopbackServer) {
+                        console.log("'useLoopbackServer' を true に強制します (唯一のサポート方法)。");
+                        this.settings.useLoopbackServer = true;
+                }
+                // OAuth クライアントと API クライアントの初期化
+                this.authService.reconfigureOAuthClient();
+                this.authService.initializeCalendarApi();
+        }
 
-		// コマンド登録
-		this.addCommand({
-			id: 'authenticate-with-google',
-			name: 'Google で認証する',
-			callback: () => this.authService.authenticate(),
-		});
+        private async startHttpServer(): Promise<void> {
+                await this.httpServerManager.stopServer(); // 念のため既存を停止
+                this.httpServerManager.startServer();
+        }
 
-		this.addCommand({
-			id: 'sync-tasks-now',
-			name: 'Google Calendar と今すぐタスクを同期する',
-			callback: async () => this.triggerSync(),
-		});
+        private registerCommands(): void {
+                this.addCommand({
+                        id: 'authenticate-with-google',
+                        name: 'Google で認証する',
+                        callback: () => this.authService.authenticate(),
+                });
 
-		// 重複整理（ドライラン）
-		this.addCommand({
-			id: 'dedupe-cleanup-dry-run',
-			name: '重複イベントを整理（ドライラン）',
-			callback: async () => {
-				if (this.isCurrentlySyncing()) { new Notice('処理中のため実行できない。'); return; }
-				await this.syncLogic.runDedupeCleanup(true);
-			}
-		});
+                this.addCommand({
+                        id: 'sync-tasks-now',
+                        name: 'Google Calendar と今すぐタスクを同期する',
+                        callback: async () => this.triggerSync(),
+                });
 
-		// 重複整理（実行）
-		this.addCommand({
-			id: 'dedupe-cleanup-exec',
-			name: '重複イベントを整理（実行）',
-			callback: async () => {
-				if (this.isCurrentlySyncing()) { new Notice('処理中のため実行できない。'); return; }
-				const ok = confirm('重複イベントの削除を実行しますか？ この操作は元に戻せません。');
-				if (!ok) return;
-				await this.syncLogic.runDedupeCleanup(false);
-			}
-		});
+                // 重複整理（ドライラン）
+                this.addCommand({
+                        id: 'dedupe-cleanup-dry-run',
+                        name: '重複イベントを整理（ドライラン）',
+                        callback: async () => {
+                                if (this.isCurrentlySyncing()) { new Notice('処理中のため実行できない。'); return; }
+                                await this.syncLogic.runDedupeCleanup(true);
+                        }
+                });
 
-		// 設定タブの追加
-		this.addSettingTab(new GoogleCalendarSyncSettingTab(this.app, this));
-
-		// 自動同期のセットアップ
-		this.setupAutoSync();
-
-		console.log('Google Calendar Sync プラグインがロードされました。');
-	}
+                // 重複整理（実行）
+                this.addCommand({
+                        id: 'dedupe-cleanup-exec',
+                        name: '重複イベントを整理（実行）',
+                        callback: async () => {
+                                if (this.isCurrentlySyncing()) { new Notice('処理中のため実行できない。'); return; }
+                                const ok = confirm('重複イベントの削除を実行しますか？ この操作は元に戻せません。');
+                                if (!ok) return;
+                                await this.syncLogic.runDedupeCleanup(false);
+                        }
+                });
+        }
 
 	async onunload() {
 		console.log('Google Calendar Sync プラグインをアンロード中');
@@ -137,8 +143,90 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
 			this.settings.lastSyncTime = undefined;
         }
 
+        // 暗号化/難読化トークン（refresh_tokenのみ）の復号
+        try {
+            if (this.settings.tokensEncrypted && !this.settings.tokens?.refresh_token) {
+                let json: string | null = null;
+                if (this.settings.tokensEncrypted.startsWith('aesgcm:')) {
+                    const pass = this.passphraseCache || this.settings.encryptionPassphrase || null;
+                    if (pass) {
+                        const inner = await decryptWithPassphrase(this.settings.tokensEncrypted, pass);
+                        json = deobfuscateFromBase64(inner, this.settings.obfuscationSalt!);
+                    } else {
+                        console.warn('暗号化トークンが存在しますが、パスフレーズが未設定のため復号できません。');
+                        new Notice('暗号化されたトークンを復号できません。設定でパスフレーズを入力し、再試行してください。', 10000);
+                    }
+                } else if (this.settings.tokensEncrypted.startsWith('obf1:')) {
+                    json = deobfuscateFromBase64(this.settings.tokensEncrypted, this.settings.obfuscationSalt!);
+                } else if (this.settings.tokensEncrypted.startsWith('obf:')) {
+                    // レガシー形式: 旧XORで復号 → 新形式へ再保存
+                    json = deobfuscateLegacyFromBase64(this.settings.tokensEncrypted, this.settings.obfuscationSalt || '');
+                    try { const { refresh_token } = JSON.parse(json); if (refresh_token) await this.persistTokens({ refresh_token }); } catch {}
+                }
+                if (json) {
+                    const { refresh_token } = JSON.parse(json);
+                    if (refresh_token) this.settings.tokens = { refresh_token } as any;
+                }
+            }
+        } catch (e) {
+            console.error('暗号化トークンの復号に失敗:', e);
+        }
+
         // syncLogic はコンストラクタで plugin インスタンスを受け取るだけなので再インスタンス化不要
 	}
+
+	// saveData をオーバーライドし、平文トークンをディスクに書き込まない
+	async saveData(data: any): Promise<void> {
+		const clone = JSON.parse(JSON.stringify(data ?? {}));
+		if (clone && 'tokens' in clone) clone.tokens = null; // 平文は保存しない
+		return await super.saveData(clone);
+	}
+
+    // トークンを難読化で保存（既定）。パスフレーズがあればAES-GCMで二重ラップ。
+    async persistTokens(tokens: any | null): Promise<void> {
+        this.settings.tokens = tokens && tokens.refresh_token ? ({ refresh_token: tokens.refresh_token } as any) : null;
+        if (tokens && tokens.refresh_token) {
+            // obfuscationSalt の確保（初回や移行直後などで未設定の場合に生成）
+            if (!this.settings.obfuscationSalt) {
+                try {
+                    const r = (typeof window !== 'undefined' && window.crypto && window.crypto.getRandomValues)
+                        ? (()=>{ const a=new Uint8Array(16); window.crypto.getRandomValues(a); return Buffer.from(a); })()
+                        : Buffer.from(require('crypto').randomBytes(16));
+                    this.settings.obfuscationSalt = r.toString('base64');
+                    await super.saveData({ ...this.settings, tokens: null });
+                } catch {}
+            }
+            const json = JSON.stringify({ refresh_token: tokens.refresh_token });
+            const obf = obfuscateToBase64(json, this.settings.obfuscationSalt || '');
+            const pass = this.passphraseCache || this.settings.encryptionPassphrase || null;
+            if (pass && pass.length > 0) {
+                try {
+                    this.settings.tokensEncrypted = await encryptWithPassphrase(obf, pass);
+                    await super.saveData({ ...this.settings, tokens: null });
+                } catch (e) {
+                    console.error('AES二重ラップに失敗:', e);
+                    new Notice('パスフレーズ暗号化に失敗しました。パスフレーズを見直してください。', 8000);
+                    this.settings.tokensEncrypted = obf;
+                    await super.saveData({ ...this.settings, tokens: null });
+                }
+            } else {
+                this.settings.tokensEncrypted = obf;
+                await super.saveData({ ...this.settings, tokens: null });
+            }
+        } else {
+            this.settings.tokensEncrypted = null;
+            await super.saveData({ ...this.settings, tokens: null });
+        }
+    }
+
+
+    // 現在の暗号化/保存モードを文字列で返す
+    getEncryptionModeLabel(): string {
+        const enc = this.settings.tokensEncrypted || '';
+        if (enc.startsWith('aesgcm:')) return `AES-GCM（二重ラップ） — ${this.settings.rememberPassphrase ? 'パス保存あり' : '一時パス'}`;
+        if (enc.startsWith('obf1:') || enc.startsWith('obf:')) return '難読化 + 永続保存（既定）';
+        return '未保存（メモリのみ）';
+    }
 
 	async saveSettings() {
 		await this.saveData(this.settings);
@@ -197,6 +285,16 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
     authenticate(): void { this.authService.authenticate(); }
     isTokenValid(checkRefresh: boolean = false): boolean { return this.authService.isTokenValid(checkRefresh); }
 
+    /** ポート変更の適用（保存・再起動・UI更新を一括） */
+    async applyPortChange(port: number) {
+        this.settings.loopbackPort = port;
+        await this.saveData(this.settings);
+        try { await this.httpServerManager?.stopServer(); } catch {}
+        this.httpServerManager?.startServer();
+        this.authService.reconfigureOAuthClient();
+        this.refreshSettingsTab();
+    }
+
     /** 手動同期をトリガー */
     async triggerSync(): Promise<void> {
         if (!this.settings.tokens || (!this.isTokenValid(false) && !this.isTokenValid(true))) {
@@ -227,8 +325,8 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
         await this.syncLogic.runSync(JSON.parse(JSON.stringify(this.settings)), { force: true });
     }
 
-	/** 自動同期を設定 */
-	setupAutoSync() {
+        /** 自動同期を設定 */
+        setupAutoSync() {
 		this.clearAutoSync();
 		if (this.settings.autoSync && this.settings.syncIntervalMinutes >= 1) {
 			const intervalMillis = this.settings.syncIntervalMinutes * 60 * 1000;
@@ -263,8 +361,8 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
         }
 	}
 
-	/** 自動同期を停止 */
-	clearAutoSync() {
+        /** 自動同期を停止 */
+        clearAutoSync() {
 		if (this.syncIntervalId !== null) {
 			window.clearInterval(this.syncIntervalId);
 			this.syncIntervalId = null;

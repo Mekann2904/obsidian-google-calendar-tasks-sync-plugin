@@ -1,10 +1,14 @@
 import { App } from 'obsidian';
+import { createHash } from 'crypto';
 import moment from 'moment';
 import { RRule, RRuleSet, rrulestr, Frequency, Options as RRuleOptions, Weekday } from 'rrule';
 import { ObsidianTask } from './types';
 
 export class TaskParser {
     private app: App;
+    private generateId(input: string): string {
+        return createHash('sha1').update(input).digest('hex').slice(0, 8);
+    }
 
     constructor(app: App) {
         this.app = app;
@@ -20,50 +24,79 @@ export class TaskParser {
         const tasks: ObsidianTask[] = [];
         const mdFiles = this.app.vault.getMarkdownFiles();
 
-        const filePromises = mdFiles.map(async (file) => {
-            if (file.path.toLowerCase().includes('templates/')) {
-                return [];
-            }
-            try {
-                const content = await this.app.vault.read(file);
-                const lines = content.split('\n');
-                const fileTasks: ObsidianTask[] = [];
-                // フェンスドコードブロック (``` や ~~~) 内は同期対象外
-                let inFence = false;
-                let fenceChar: '`' | '~' | '' = '';
-                let fenceLen = 0;
-                const fenceOpenRe = /^\s*(`{3,}|~{3,})/;
-                lines.forEach((line, index) => {
-                    const open = line.match(fenceOpenRe);
-                    if (open) {
-                        const marker = open[1];
-                        const ch = marker[0] as '`' | '~';
-                        const len = marker.length;
-                        if (!inFence) {
-                            inFence = true; fenceChar = ch; fenceLen = len; return; // フェンス開始行はスキップ
+        // 読み込み負荷のスロットリング（同時 16 本）
+        const CONCURRENCY = 16;
+        const chunks: typeof mdFiles[] = Array.from({ length: Math.ceil(mdFiles.length / CONCURRENCY) }, (_, i) => mdFiles.slice(i * CONCURRENCY, (i + 1) * CONCURRENCY));
+        for (const group of chunks) {
+            const results = await Promise.all(group.map(async (file) => {
+                const normalized = file.path.replace(/\\/g, '/').toLowerCase();
+                if (normalized.startsWith('templates/')) {
+                    return [] as ObsidianTask[];
+                }
+                try {
+                    const content = await this.app.vault.read(file);
+                    const lines = content.split('\n');
+                    const fileTasks: ObsidianTask[] = [];
+                    // フェンスドコードブロック (``` や ~~~) 内は同期対象外
+                    let inFence = false;
+                    let fenceChar: '`' | '~' | '' = '';
+                    let fenceLen = 0;
+                    const fenceOpenRe = /^\s*(`{3,}|~{3,})/;
+                    lines.forEach((line, index) => {
+                        const open = line.match(fenceOpenRe);
+                        if (open) {
+                            const marker = open[1];
+                            const ch = marker[0] as '`' | '~';
+                            const len = marker.length;
+                            if (!inFence) { inFence = true; fenceChar = ch; fenceLen = len; return; }
+                            if (inFence && fenceChar === ch && len >= fenceLen) { inFence = false; fenceChar = ''; fenceLen = 0; return; }
                         }
-                        // 既にフェンス中の場合でも、同種マーカーが来れば終了とみなす
-                        if (inFence && fenceChar === ch) {
-                            inFence = false; fenceChar = ''; fenceLen = 0; return; // 終了行もスキップ
+
+                        if (inFence) return; // コードブロック内は無視
+
+                        // 継続行（連続するインデント行）を結合（時間帯/🔁/終日は結合、その他は自由記述として収集）
+                        let combined = line;
+                        let extraDetailFromNext: string | null = null;
+                        const details: string[] = [];
+                        const SUBTASK_RE = /^\s*-\s*\[[ xX]\]/; // ネストしたタスク
+                        const CONTROL_RE = /(?:\d{1,2}:\d{2})\s*(?:-|–|—|~|〜|～|to)\s*(?:\d{1,2}:\d{2}|24:00)|🔁|(?:終日|全日|all[-\s]?day)/iu;
+                        let k = index + 1;
+                        while (k < lines.length && /^\s+/.test(lines[k])) {
+                            const raw = lines[k];
+                            const trimmed = raw.trim();
+                            if (trimmed.length === 0) { k++; continue; }
+                            if (SUBTASK_RE.test(trimmed)) break; // サブタスク開始で親の連結は終わり
+                            if (CONTROL_RE.test(trimmed)) {
+                                combined = `${combined} ${trimmed}`;
+                            } else {
+                                details.push(trimmed);
+                            }
+                            k++;
                         }
-                    }
+                        if (details.length > 0) extraDetailFromNext = details.join('\n');
 
-                    if (inFence) return; // コードブロック内は無視
-
-                    const task = this.parseObsidianTask(line, file.path, index);
-                    if (task) {
-                        fileTasks.push(task);
-                    }
-                });
-                return fileTasks;
-            } catch (e) {
-                console.warn(`ファイル "${file.path}" の読み込み/解析ができませんでした`, e);
-                return [];
-            }
-        });
-
-        const results = await Promise.all(filePromises);
-        results.forEach(fileTasks => tasks.push(...fileTasks));
+                        const task = this.parseObsidianTask(combined, file.path, index);
+                        if (task) {
+                            if (extraDetailFromNext && !task.extraDetail) task.extraDetail = extraDetailFromNext;
+                            // インデント側の #tag を反映
+                            if (extraDetailFromNext) {
+                                const extraTags = extraDetailFromNext.match(/#[^\s#]+/g) || [];
+                                if (extraTags.length) {
+                                    const merged = new Set([...(task.tags || []), ...extraTags.map(t => t.slice(1))]);
+                                    task.tags = Array.from(merged);
+                                }
+                            }
+                            fileTasks.push(task);
+                        }
+                    });
+                    return fileTasks;
+                } catch (e) {
+                    console.warn(`ファイル "${file.path}" の読み込み/解析ができませんでした`, e);
+                    return [] as ObsidianTask[];
+                }
+            }));
+            results.forEach(fileTasks => tasks.push(...fileTasks));
+        }
 
         console.timeEnd("getObsidianTasks");
         console.log(`Vault 内で ${tasks.length} 個のタスクが見つかりました。`);
@@ -84,20 +117,27 @@ export class TaskParser {
 
         const checkbox = match[1].trim();
         let taskContent = match[2].trim();
-        const isCompleted = checkbox !== ' ' && checkbox !== '';
+        const isCompleted = /^(x|X|✓)$/.test(checkbox);
 
         // FIX: ISO拡張の余計な空白を除去し、秒・小数秒・タイムゾーンを正しくオプショナルに
         // 拡張: 'YYYY-MM-DD HH:mm' 形式も許容（T または空白区切り）
         const isoOrSimpleDateRegex = `\\d{4}-\\d{2}-\\d{2}(?:[T\\s]\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?(?:Z|[+-]\\d{2}:\\d{2})?)?`;
         const simpleDateRegexOnly = `\\d{4}-\\d{2}-\\d{2}`;
 
-        // メタデータの抽出関数
-        const extractMetadata = (content: string, pattern: RegExp): { value: string | null, remainingContent: string } => {
-            const m = content.match(pattern);
-            if (m && m[1]) {
-                const fullMatch = m[0]; // マッチした全体 (e.g., "📅 2023-12-25")
-                const value = m[1]; // キャプチャグループの値 (e.g., "2023-12-25")
-                return { value, remainingContent: content.replace(fullMatch, '').trim() };
+        // メタデータの抽出（最後の出現を採用）
+        const extractLast = (content: string, pattern: RegExp): { value: string | null, remainingContent: string } => {
+            let flags = pattern.flags;
+            if (!flags.includes('g')) flags += 'g';
+            if (!flags.includes('u')) flags += 'u';
+            const re = new RegExp(pattern.source, flags);
+            let m: RegExpExecArray | null;
+            let last: RegExpExecArray | null = null;
+            while ((m = re.exec(content))) last = m;
+            if (last && last[1]) {
+                const value = last[1];
+                const before = content.slice(0, last.index);
+                const after = content.slice(last.index + last[0].length);
+                return { value, remainingContent: (before + after).trim() };
             }
             return { value: null, remainingContent: content };
         };
@@ -114,15 +154,15 @@ export class TaskParser {
         let timeWindowEnd: string | null = null;
         let blockLink: string | null = null;
 
-        // 日付を抽出
-        ({ value: dueDate, remainingContent } = extractMetadata(remainingContent, new RegExp(`(?:📅|due:)\\s*(${isoOrSimpleDateRegex})`)));
-        ({ value: startDate, remainingContent } = extractMetadata(remainingContent, new RegExp(`(?:🛫|start:)\\s*(${isoOrSimpleDateRegex})`)));
-        ({ value: scheduledDate, remainingContent } = extractMetadata(remainingContent, new RegExp(`(?:⏳|scheduled:)\\s*(${isoOrSimpleDateRegex})`)));
-        ({ value: createdDate, remainingContent } = extractMetadata(remainingContent, new RegExp(`(?:➕|created:)\\s*(${simpleDateRegexOnly})`)));
-        ({ value: completionDate, remainingContent } = extractMetadata(remainingContent, new RegExp(`(?:✅|done:)\\s*(${simpleDateRegexOnly})`)));
+        // 日付を抽出（Unicode フラグを追加して絵文字を正しく処理）
+        ({ value: dueDate, remainingContent } = extractLast(remainingContent, new RegExp(`(?:📅|due:)\\s*(${isoOrSimpleDateRegex})`, 'u')));
+        ({ value: startDate, remainingContent } = extractLast(remainingContent, new RegExp(`(?:🛫|start:)\\s*(${isoOrSimpleDateRegex})`, 'u')));
+        ({ value: scheduledDate, remainingContent } = extractLast(remainingContent, new RegExp(`(?:⏳|scheduled:)\\s*(${isoOrSimpleDateRegex})`, 'u')));
+        ({ value: createdDate, remainingContent } = extractLast(remainingContent, new RegExp(`(?:➕|created:)\\s*(${simpleDateRegexOnly})`, 'u')));
+        ({ value: completionDate, remainingContent } = extractLast(remainingContent, new RegExp(`(?:✅|done:)\\s*(${simpleDateRegexOnly})`, 'u')));
 
-        // 優先度を抽出
-        const priorityMatch = remainingContent.match(/(?:🔺|⏫|🔼|🔽|⏬)/);
+        // 優先度を抽出（Unicode フラグを追加）
+        const priorityMatch = remainingContent.match(/(?:🔺|⏫|🔼|🔽|⏬)/u);
         const priorityEmoji = priorityMatch ? priorityMatch[0] : null;
         if (priorityEmoji) {
             switch (priorityEmoji) {
@@ -136,15 +176,32 @@ export class TaskParser {
         }
 
         // 繰り返しルールを抽出
-        ({ value: recurrenceRuleText, remainingContent } = extractMetadata(remainingContent, /(?:🔁|repeat:|recur:)\s*([^📅🛫⏳➕✅🔺⏫🔼🔽⏬⏰#^]+)/u));
+        ({ value: recurrenceRuleText, remainingContent } = extractLast(remainingContent, /(?:🔁|repeat:|recur:)\s*([^📅🛫⏳➕✅🔺⏫🔼🔽⏬⏰#^]+)/ug));
         // 🔁 拡張: "hh:mm~hh:mm" を抽出（例: "every day 15:00~24:00" または "15:00~24:00"）
         if (recurrenceRuleText) {
-            const m = recurrenceRuleText.match(/(\d{1,2}:\d{2})\s*~\s*(\d{1,2}:\d{2}|24:00)/);
+            const m = recurrenceRuleText.match(/(\d{1,2}:\d{2})\s*(?:-|–|—|~|〜|～|to)\s*(\d{1,2}:\d{2}|24:00)/iu);
             if (m) {
                 timeWindowStart = m[1];
                 timeWindowEnd = m[2];
                 recurrenceRuleText = recurrenceRuleText.replace(m[0], '').trim();
                 if (recurrenceRuleText.length === 0) recurrenceRuleText = null;
+            }
+        }
+
+        // 独立した時間帯記法（⏰ 任意）を抽出（未設定時のみ）
+        if (!timeWindowStart || !timeWindowEnd) {
+            const tw = remainingContent.match(/(?:⏰\s*)?(\d{1,2}:\d{2})\s*(?:-|–|—|~|〜|～|to)\s*(\d{1,2}:\d{2}|24:00)/iu);
+            if (tw) {
+                timeWindowStart = tw[1];
+                timeWindowEnd = tw[2];
+                remainingContent = remainingContent.replace(tw[0], '').trim();
+            } else {
+                // フォールバック: 元のタスクコンテンツ全体からも探索
+                const tw2 = taskContent.match(/(?:⏰\s*)?(\d{1,2}:\d{2})\s*(?:-|–|—|~|〜|～|to)\s*(\d{1,2}:\d{2}|24:00)/iu);
+                if (tw2) {
+                    timeWindowStart = tw2[1];
+                    timeWindowEnd = tw2[2];
+                }
             }
         }
 
@@ -158,14 +215,15 @@ export class TaskParser {
         // タグを抽出
         const tagsMatch = remainingContent.match(/#[^\s#]+/g);
         const tags = tagsMatch ? tagsMatch.map(t => t.substring(1)) : [];
-        if (tagsMatch) {
-            tagsMatch.forEach(tag => {
-                remainingContent = remainingContent.replace(tag, '');
-            });
-        }
+        remainingContent = remainingContent.replace(/#[^\s#]+/g, '');
 
-        // サマリー: 残った内容を整理
-        const summary = remainingContent.replace(/\s{2,}/g, ' ').trim();
+        // サマリー: 残った内容を整理（「終日/全日/all day」を強制除去）
+        let summary = remainingContent;
+        summary = summary.replace(/(?:終日|全日|all[-\s]?day)/gi, ' ');
+        summary = summary.replace(/\s{2,}/g, ' ').trim();
+
+        // extraDetail: 直前の継続行結合で summary から取り除かれた自由記述は、現状ではパース時点で取得できないため null（将来: 呼出側で行配列を渡すと良い）
+        let extraDetail: string | null = null;
 
         // 追加仕様: dueDate があり startDate がない場合、startDate を dueDate と同じにする
         if (dueDate && !startDate) {
@@ -174,18 +232,15 @@ export class TaskParser {
         }
 
         // 繰り返しルールを解析
-        const recurrenceRefDate = startDate || dueDate || scheduledDate;
+        // DTSTART の起点は startDate を優先。ない場合のみ due/scheduled を使用
+        const recurrenceRefDate = startDate ? startDate : (dueDate || scheduledDate);
         const recurrenceRule = recurrenceRuleText ? this.parseRecurrenceRule(recurrenceRuleText, recurrenceRefDate) : null;
 
-        // タスクID生成
-        const rawTextForHash = line.trim();
-        let hash = 0;
-        for (let i = 0; i < rawTextForHash.length; i++) {
-            const char = rawTextForHash.charCodeAt(i);
-            hash = ((hash << 5) - hash) + char;
-            hash |= 0;
-        }
-        const taskId = `obsidian-${filePath}-${lineNumber}-${hash}`;
+        // タスクID生成（ブロックリンク優先 + 安定ハッシュ）
+        const idBasis = blockLink
+            ? `${filePath}:${blockLink}`
+            : `${filePath}:${(summary || '')}:${startDate ?? ''}:${dueDate ?? ''}:${timeWindowStart ?? ''}-${timeWindowEnd ?? ''}`;
+        const taskId = `obsidian-${this.generateId(idBasis)}`;
 
         return {
             id: taskId,
@@ -201,6 +256,7 @@ export class TaskParser {
             recurrenceRule: recurrenceRule,
             timeWindowStart,
             timeWindowEnd,
+            extraDetail,
             tags: tags,
             blockLink: blockLink,
             sourcePath: filePath,
@@ -243,7 +299,7 @@ export class TaskParser {
                 // DTSTART の処理（既存に無ければ補完）
                 let dtstart: Date | undefined = baseRule.options.dtstart;
                 if (!dtstart && dtstartHint) {
-                    const pDate = moment(dtstartHint, [moment.ISO_8601, 'YYYY-MM-DD'], true).utc();
+                    const pDate = moment(dtstartHint, [moment.ISO_8601, 'YYYY-MM-DD'], true);
                     if (pDate.isValid()) {
                         dtstart = pDate.toDate();
                     } else {
@@ -339,6 +395,12 @@ export class TaskParser {
             if (wds.length > 0) options.byweekday = wds;
         }
 
+        // 追加: count/until の簡易対応
+        const countM = ruleText.match(/\bfor\s+(\d+)\s+(?:times|occurrences?)\b/);
+        if (countM) options.count = parseInt(countM[1], 10);
+        const untilM = ruleText.match(/\buntil\s+(\d{4}-\d{2}-\d{2})\b/);
+        if (untilM) options.until = moment(untilM[1], 'YYYY-MM-DD', true).endOf('day').toDate();
+
         if (freq !== null) {
             options.freq = freq;
             options.interval = interval > 0 ? interval : 1;
@@ -377,4 +439,58 @@ export class TaskParser {
         }
         return finalRruleString;
     }
+}
+
+// テスト用の薄いラッパ（Markdown文字列からタスクリストを作る）
+export function parseTasksFromMarkdown(markdown: string): ObsidianTask[] {
+    // 簡易: 1つの仮想ファイルに見立てて各行を流す
+    const parser = new TaskParser({} as any);
+    const lines = markdown.split(/\r?\n/);
+    const out: ObsidianTask[] = [];
+    let inFence = false; let fenceChar = ''; let fenceLen = 0;
+    lines.forEach((line, idx) => {
+        const open = line.match(/^\s*([`~]{3,})/);
+        if (open) {
+            const marker = open[1];
+            const ch = marker[0] as '`' | '~';
+            const len = marker.length;
+            if (!inFence) { inFence = true; fenceChar = ch; fenceLen = len; return; }
+            if (inFence && fenceChar === ch && len >= fenceLen) { inFence = false; fenceChar = ''; fenceLen = 0; return; }
+        }
+        if (inFence) return;
+        // 継続行（連続するインデント行）を解釈
+        let combined = line;
+        let extraDetailFromNext: string | null = null;
+        const details: string[] = [];
+        const SUBTASK_RE = /^\s*-\s*\[[ xX]\]/; // ネストしたタスク
+        const CONTROL_RE = /(?:\d{1,2}:\d{2})\s*(?:-|–|—|~|〜|～|to)\s*(?:\d{1,2}:\d{2}|24:00)|🔁|(?:終日|全日|all[-\s]?day)/iu;
+        let k = idx + 1;
+        while (k < lines.length && /^\s+/.test(lines[k])) {
+            const raw = lines[k];
+            const trimmed = raw.trim();
+            if (trimmed.length === 0) { k++; continue; }
+            if (SUBTASK_RE.test(trimmed)) break;
+            if (CONTROL_RE.test(trimmed)) combined = `${combined} ${trimmed}`;
+            else details.push(trimmed);
+            k++;
+        }
+        if (details.length > 0) extraDetailFromNext = details.join('\n');
+
+        const task = parser.parseObsidianTask(combined, 'inline.md', idx);
+        if (task) {
+            if (extraDetailFromNext && !(task as any).extraDetail) {
+                (task as any).extraDetail = extraDetailFromNext;
+            }
+            // インデント側の #tag を反映
+            if (extraDetailFromNext) {
+                const extraTags = extraDetailFromNext.match(/#[^\s#]+/g) || [];
+                if (extraTags.length) {
+                    const merged = new Set([...(task.tags || []), ...extraTags.map(t => t.slice(1))]);
+                    (task as any).tags = Array.from(merged);
+                }
+            }
+            out.push(task);
+        }
+    });
+    return out;
 }

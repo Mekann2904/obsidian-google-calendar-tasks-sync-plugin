@@ -1,10 +1,10 @@
+import { performance } from 'perf_hooks';
 import { Notice } from 'obsidian';
 import { ErrorHandler, DateUtils, FingerprintUtils } from './commonUtils';
 import { rrulestr } from 'rrule';
 import { calendar_v3 } from 'googleapis';
 import GoogleCalendarTasksSyncPlugin from './main';
 import { ObsidianTask, GoogleCalendarEventInput, BatchRequestItem, BatchResponseItem, BatchResult, ErrorLog, GoogleCalendarTasksSyncSettings, SyncMetrics } from './types';
-import { createHash } from 'crypto';
 import { BatchProcessor } from './batchProcessor';
 import moment from 'moment';
 import { GCalMapper } from './gcalMapper';
@@ -25,8 +25,8 @@ export class SyncLogic {
      */
     private errorLogs: ErrorLog[];
     private retryCount = 0;
-    private readonly MAX_RETRIES = 3;
-    private readonly RETRY_DELAY_MS = 1000;
+    private readonly MAX_RETRIES = 4; // 再試行上限（指数バックオフ＋ジッタ）
+    private readonly BASE_BACKOFF_MS = 400; // 初期バックオフ
 
     async runSync(settings: GoogleCalendarTasksSyncSettings, options: { force?: boolean } = {}): Promise<void> {
         const { force = false } = options;
@@ -42,7 +42,7 @@ export class SyncLogic {
 
         // --- FIX: ローカルインスタンスの生成 ---
         const gcalMapper = new GCalMapper(this.plugin.app, settings);
-        const batchProcessor = new BatchProcessor(settings.calendarId, settings);
+        const batchProcessor = new BatchProcessor(settings);
 
         // FIX: 強制同期の場合は lastSyncTime をクリアしてフル同期を実行
         if (force) {
@@ -79,41 +79,17 @@ export class SyncLogic {
         const batchRequests: BatchRequestItem[] = [];
         // FIX: taskMap は settings スナップショットから取得
         const taskMap = force ? {} : { ...settings.taskMap };
-        let existingEvents: calendar_v3.Schema$Event[] = [];
-        let googleEventMap = new Map<string, calendar_v3.Schema$Event>();
 
         try {
-            // 1. Obsidian タスク取得
-            if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
-                new Notice('Obsidian タスクを取得中...', 2000);
-            }
-            console.time("Sync: Fetch Obsidian Tasks");
-            const obsidianTasks = await this.plugin.taskParser.getObsidianTasks();
-            console.timeEnd("Sync: Fetch Obsidian Tasks");
+            const obsidianTasks = await this.fetchObsidianTasks(isManualSync, settings);
+            const {
+                existingEvents,
+                googleEventMap,
+                dedupeIndex,
+                existingGIdSet,
+                eventById,
+            } = await this.fetchGoogleEvents(settings, force, taskMap, isManualSync);
 
-            // 2. Google Calendar イベント取得
-            if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
-                new Notice('GCal イベントを取得中...', 2000);
-            }
-            console.time("Sync: Fetch GCal Events");
-            // FIX: gcalApi に settings を渡す (将来の拡張性のため)
-            existingEvents = await this.plugin.gcalApi.fetchGoogleCalendarEvents(settings);
-            if (!force) {
-                googleEventMap = this.mapGoogleEvents(existingEvents, taskMap);
-            }
-            // 重複検出用インデックス
-            const dedupeIndex = this.buildDedupeIndex(existingEvents);
-            console.timeEnd("Sync: Fetch GCal Events");
-
-            const existingGIdSet = new Set<string>(
-                existingEvents.map(e => e.id).filter((v): v is string => !!v)
-            );
-            
-            // ID → Event の逆引きマップ（ETag 参照用）
-            const eventById = new Map<string, calendar_v3.Schema$Event>();
-            existingEvents.forEach(ev => { if (ev.id) eventById.set(ev.id, ev); });
-
-            // 3. 作成/更新/キャンセル準備
             if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
                 new Notice(`${obsidianTasks.length} 件のタスクを処理中...`, 3000);
             }
@@ -124,167 +100,16 @@ export class SyncLogic {
             skippedCount += skipped;
             console.timeEnd("Sync: Prepare Batch Requests");
 
-            // 4. 削除準備
-            console.time("Sync: Prepare Deletions");
-            this.prepareDeletionRequests(taskMap, currentObsidianTaskIds, existingEvents, existingGIdSet, batchRequests, settings, force);
-            console.timeEnd("Sync: Prepare Deletions");
+            this.prepareDeletions(taskMap, currentObsidianTaskIds, existingEvents, existingGIdSet, batchRequests, settings, force);
 
-            // 5. バッチ実行
-            if (batchRequests.length > 0) {
-                const { results, created, updated, deleted, errors, skipped: batchSkipped, metrics } =
-                    await this.executeBatchesWithRetry(batchRequests, batchProcessor);
-                
-                createdCount += created;
-                updatedCount += updated;
-                deletedCount += deleted;
-                errorCount += errors;
-                skippedCount += batchSkipped;
-
-                // メトリクスの要約を出力
-                if (metrics) this.logMetricsSummary('Main Batch', metrics);
-
-                const calendarPath = `/calendar/v3/calendars/${encodeURIComponent(settings.calendarId)}/events`;
-                const fallbackInserts: BatchRequestItem[] = [];
-                const fallbackNoIfMatch: BatchRequestItem[] = [];
-                const fallbackDeleteNoIfMatch: BatchRequestItem[] = [];
-
-                results.forEach((res: BatchResponseItem, i: number) => {
-                    const req = batchRequests[i];
-                    // FIX: クラッシュ回避のため、応答に対応するリクエストが存在することを確認
-                    if (!req) {
-                        console.warn(`応答に対応するリクエストが見つかりません (index: ${i})。リトライ処理中の不整合の可能性があります。`, res);
-                        errorCount++;
-                        return;
-                    }
-
-                    if (res.status >= 200 && res.status < 300) {
-                        const newGcalId = res.body?.id;
-                        if (req.operationType === 'insert' && newGcalId && req.obsidianTaskId) {
-                            taskMap[req.obsidianTaskId] = newGcalId;
-                        } else if ((req.operationType === 'update' || req.operationType === 'patch') && newGcalId && req.obsidianTaskId) {
-                            taskMap[req.obsidianTaskId] = newGcalId;
-                        } else if (req.operationType === 'delete' && req.obsidianTaskId) {
-                            delete taskMap[req.obsidianTaskId];
-                        }
-                    } else {
-                        const status = res.status;
-                        if (req.operationType === 'delete') {
-                            this.handleDeleteError(req, status);
-                            if (status === 410 || status === 404) {
-                                if (req.obsidianTaskId) delete taskMap[req.obsidianTaskId];
-                            } else if (status === 412) {
-                                const retryDel: BatchRequestItem = {
-                                    method: 'DELETE',
-                                    path: req.path,
-                                    obsidianTaskId: req.obsidianTaskId,
-                                    operationType: 'delete',
-                                    originalGcalId: req.originalGcalId
-                                };
-                                fallbackDeleteNoIfMatch.push(retryDel);
-                            }
-                            return;
-                        }
-
-                        if ((req.operationType === 'update' || req.operationType === 'patch') && (status === 404 || status === 410)) {
-                            if (req.obsidianTaskId) {
-                                if (taskMap[req.obsidianTaskId]) {
-                                    delete taskMap[req.obsidianTaskId];
-                                }
-                                fallbackInserts.push({
-                                    method: 'POST',
-                                    path: calendarPath,
-                                    body: { ...(req.fullBody || req.body || {}) },
-                                    obsidianTaskId: req.obsidianTaskId,
-                                    operationType: 'insert'
-                                });
-                            }
-                            return;
-                        }
-
-                        // insert の 409 (既存ID) はスキップ扱いにし、taskMap を安定IDで更新
-                        if (req.operationType === 'insert' && status === 409 && req.obsidianTaskId) {
-                            taskMap[req.obsidianTaskId] = this.generateStableEventId(req.obsidianTaskId);
-                            skippedCount++;
-                            return;
-                        }
-
-                        const operation = req.operationType || 'unknown';
-                        const entry: ErrorLog = {
-                            errorType: (status >= 500 || status === 429) ? 'transient' : 'permanent',
-                            operation: operation as any,
-                            taskId: req.obsidianTaskId || 'unknown',
-                            gcalId: req.originalGcalId,
-                            retryCount: this.retryCount,
-                            errorDetails: { status }
-                        };
-                        this.errorLogs.push(entry);
-                        // 412 (If-Match 不一致) はローカル優先で上書き再送
-                        if ((req.operationType === 'update' || req.operationType === 'patch') && status === 412) {
-                            const retry: BatchRequestItem = {
-                                method: req.method,
-                                path: req.path,
-                                body: req.body || req.fullBody,
-                                obsidianTaskId: req.obsidianTaskId,
-                                operationType: req.operationType,
-                                originalGcalId: req.originalGcalId
-                            };
-                            fallbackNoIfMatch.push(retry);
-                            return;
-                        }
-                        if (status === 400) {
-                            try {
-                                console.error('400 body:', JSON.stringify(res.body).slice(0, 500));
-                                console.error('400 req:', JSON.stringify(req.body || req.fullBody).slice(0, 500));
-                            } catch {}
-                        }
-                        // 診断用に recentErrors を更新（上限 50 件）
-                        const maxSamples = 50;
-                        const arr = this.plugin.settings.recentErrors ?? [];
-                        arr.unshift(entry);
-                        while (arr.length > maxSamples) arr.pop();
-                        this.plugin.settings.recentErrors = arr;
-                    }
-                });
-
-                if (fallbackInserts.length > 0) {
-                    console.log(`再作成フォールバック: ${fallbackInserts.length} 件をPOST`);
-                    const fb = await this.executeBatchesWithRetry(fallbackInserts, batchProcessor);
-                    createdCount += fb.created;
-                    updatedCount += fb.updated;
-                    deletedCount += fb.deleted;
-                    errorCount += fb.errors;
-                    skippedCount += fb.skipped;
-                    if (fb.metrics) this.logMetricsSummary('Fallback Inserts', fb.metrics);
-                    fb.results.forEach((res, idx) => {
-                        const req = fallbackInserts[idx];
-                        if (res.status >= 200 && res.status < 300 && res.body?.id && req.obsidianTaskId) {
-                            taskMap[req.obsidianTaskId] = res.body.id;
-                        }
-                    });
-                }
-
-                if (fallbackNoIfMatch.length > 0) {
-                    console.log(`412再試行(If-Match無): ${fallbackNoIfMatch.length} 件を再送`);
-                    const fb2 = await this.executeBatchesWithRetry(fallbackNoIfMatch, batchProcessor);
-                    createdCount += fb2.created;
-                    updatedCount += fb2.updated;
-                    deletedCount += fb2.deleted;
-                    errorCount += fb2.errors;
-                    skippedCount += fb2.skipped;
-                }
-
-                if (fallbackDeleteNoIfMatch.length > 0) {
-                    console.log(`412削除再試行(If-Match無): ${fallbackDeleteNoIfMatch.length} 件を再送`);
-                    const fb3 = await this.executeBatchesWithRetry(fallbackDeleteNoIfMatch, batchProcessor);
-                    createdCount += fb3.created;
-                    updatedCount += fb3.updated;
-                    deletedCount += fb3.deleted;
-                    errorCount += fb3.errors;
-                    skippedCount += fb3.skipped;
-                }
-            } else if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
-                new Notice('変更なし。', 2000);
-            }
+            const counts = await this.processBatchRequests(
+                batchRequests, batchProcessor, taskMap, eventById, settings, isManualSync
+            );
+            createdCount += counts.createdCount;
+            updatedCount += counts.updatedCount;
+            deletedCount += counts.deletedCount;
+            skippedCount += counts.skippedCount;
+            errorCount += counts.errorCount;
 
             // 7. 設定保存・サマリー (FIX: Live Settings に結果を反映)
             const syncEndTime = new Date();
@@ -313,6 +138,259 @@ export class SyncLogic {
         }
     }
 
+    private async fetchObsidianTasks(isManualSync: boolean, settings: GoogleCalendarTasksSyncSettings): Promise<ObsidianTask[]> {
+        if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
+            new Notice('Obsidian タスクを取得中...', 2000);
+        }
+        console.time('Sync: Fetch Obsidian Tasks');
+        const tasks = await this.plugin.taskParser.getObsidianTasks();
+        console.timeEnd('Sync: Fetch Obsidian Tasks');
+        return tasks;
+    }
+
+    private async fetchGoogleEvents(
+        settings: GoogleCalendarTasksSyncSettings,
+        force: boolean,
+        taskMap: { [obsidianTaskId: string]: string },
+        isManualSync: boolean
+    ): Promise<{
+        existingEvents: calendar_v3.Schema$Event[];
+        googleEventMap: Map<string, calendar_v3.Schema$Event>;
+        dedupeIndex: Map<string, calendar_v3.Schema$Event>;
+        existingGIdSet: Set<string>;
+        eventById: Map<string, calendar_v3.Schema$Event>;
+    }> {
+        if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
+            new Notice('GCal イベントを取得中...', 2000);
+        }
+        console.time('Sync: Fetch GCal Events');
+        let existingEvents = await this.plugin.gcalApi.fetchGoogleCalendarEvents(settings);
+        try {
+            const mapped = new Set<string>(Object.values(taskMap).filter((v): v is string => !!v));
+            existingEvents = existingEvents.filter(ev => {
+                const managed = ev.extendedProperties?.private?.['isGcalSync'] === 'true';
+                if (ev.status === 'cancelled') return managed || (!!ev.id && mapped.has(ev.id));
+                return managed;
+            });
+        } catch (e) {
+            console.warn('取得イベントの仕分けで警告:', e);
+        }
+        let googleEventMap = new Map<string, calendar_v3.Schema$Event>();
+        if (!force) {
+            googleEventMap = this.mapGoogleEvents(existingEvents, taskMap);
+        }
+        const dedupeIndex = this.buildDedupeIndex(existingEvents);
+        console.timeEnd('Sync: Fetch GCal Events');
+
+        const existingGIdSet = new Set<string>(
+            existingEvents.map(e => e.id).filter((v): v is string => !!v)
+        );
+        const eventById = new Map<string, calendar_v3.Schema$Event>();
+        existingEvents.forEach(ev => { if (ev.id) eventById.set(ev.id, ev); });
+        return { existingEvents, googleEventMap, dedupeIndex, existingGIdSet, eventById };
+    }
+
+    private prepareDeletions(
+        taskMap: { [obsidianTaskId: string]: string },
+        currentObsidianTaskIds: Set<string>,
+        existingEvents: calendar_v3.Schema$Event[],
+        existingGIdSet: Set<string>,
+        batchRequests: BatchRequestItem[],
+        settings: GoogleCalendarTasksSyncSettings,
+        force: boolean
+    ): void {
+        console.time('Sync: Prepare Deletions');
+        this.prepareDeletionRequests(taskMap, currentObsidianTaskIds, existingEvents, existingGIdSet, batchRequests, settings, force);
+        console.timeEnd('Sync: Prepare Deletions');
+    }
+
+    private async processBatchRequests(
+        batchRequests: BatchRequestItem[],
+        batchProcessor: BatchProcessor,
+        taskMap: { [obsidianTaskId: string]: string },
+        eventById: Map<string, calendar_v3.Schema$Event>,
+        settings: GoogleCalendarTasksSyncSettings,
+        isManualSync: boolean
+    ): Promise<{ createdCount: number; updatedCount: number; deletedCount: number; skippedCount: number; errorCount: number }> {
+        let createdCount = 0, updatedCount = 0, deletedCount = 0, skippedCount = 0, errorCount = 0;
+
+        // 追加: taskMap 経由の更新・削除に If-Match を可能な限り付与して 412 を低減
+        try {
+            for (const r of batchRequests) {
+                if (!r || !r.originalGcalId) continue;
+                if (!r.headers) r.headers = {};
+                if (!('If-Match' in r.headers)) {
+                    const ev = eventById.get(r.originalGcalId);
+                    if (ev?.etag) r.headers['If-Match'] = ev.etag;
+                }
+            }
+        } catch {}
+
+        if (batchRequests.length > 0) {
+            const { results, created, updated, deleted, errors, skipped, metrics } =
+                await this.executeBatchesWithRetry(batchRequests, batchProcessor);
+
+            createdCount += created;
+            updatedCount += updated;
+            deletedCount += deleted;
+            errorCount += errors;
+            skippedCount += skipped;
+
+            if (metrics) this.logMetricsSummary('Main Batch', metrics);
+
+            const calendarPath = `/calendar/v3/calendars/${encodeURIComponent(settings.calendarId)}/events`;
+            const fallbackInserts: BatchRequestItem[] = [];
+            const fallbackNoIfMatch: BatchRequestItem[] = [];
+            const fallbackDeleteNoIfMatch: BatchRequestItem[] = [];
+
+            results.forEach((res: BatchResponseItem, i: number) => {
+                const req = batchRequests[i];
+                if (!req) {
+                    console.warn(`応答に対応するリクエストが見つかりません (index: ${i})。リトライ処理中の不整合の可能性があります。`, res);
+                    errorCount++;
+                    return;
+                }
+
+                if (res.status >= 200 && res.status < 300) {
+                    const newGcalId = res.body?.id;
+                    if (req.operationType === 'insert' && newGcalId && req.obsidianTaskId) {
+                        taskMap[req.obsidianTaskId] = newGcalId;
+                    } else if ((req.operationType === 'update' || req.operationType === 'patch') && newGcalId && req.obsidianTaskId) {
+                        taskMap[req.obsidianTaskId] = newGcalId;
+                    } else if (req.operationType === 'delete' && req.obsidianTaskId) {
+                        delete taskMap[req.obsidianTaskId];
+                    }
+                } else {
+                    const status = res.status;
+                    if (req.operationType === 'delete') {
+                        this.handleDeleteError(req, status);
+                        if (status === 410 || status === 404) {
+                            if (req.obsidianTaskId) delete taskMap[req.obsidianTaskId];
+                        } else if (status === 412) {
+                            const retryDel: BatchRequestItem = {
+                                method: 'DELETE',
+                                path: req.path,
+                                obsidianTaskId: req.obsidianTaskId,
+                                operationType: 'delete',
+                                originalGcalId: req.originalGcalId,
+                            };
+                            fallbackDeleteNoIfMatch.push(retryDel);
+                        }
+                        return;
+                    }
+
+                    if ((req.operationType === 'update' || req.operationType === 'patch') && (status === 404 || status === 410)) {
+                        if (req.obsidianTaskId) {
+                            if (taskMap[req.obsidianTaskId]) {
+                                delete taskMap[req.obsidianTaskId];
+                            }
+                            fallbackInserts.push({
+                                method: 'POST',
+                                path: calendarPath,
+                                body: { ...(req.fullBody || req.body || {}) },
+                                obsidianTaskId: req.obsidianTaskId,
+                                operationType: 'insert',
+                            });
+                        }
+                        return;
+                    }
+
+                    if (req.operationType === 'insert' && status === 409 && req.obsidianTaskId) {
+                        console.warn('Insert 409 detected for', req.obsidianTaskId, '— skipping without mapping.');
+                        skippedCount++;
+                        return;
+                    }
+
+                    const operation = req.operationType || 'unknown';
+                    const reason = (res.body?.error?.errors?.[0]?.reason) || (res.body?.error?.status) || '';
+                    const isRate403 = status === 403 && /(rateLimitExceeded|userRateLimitExceeded)/i.test(reason);
+                    const isResExhausted = /RESOURCE_EXHAUSTED/i.test(reason);
+                    const isTransient = status === 412 || status === 429 || status >= 500 || isRate403 || isResExhausted;
+                    const message = typeof res.body?.error?.message === 'string' ? (res.body.error.message as string).slice(0, 200) : undefined;
+                    const entry: ErrorLog = {
+                        errorType: isTransient ? 'transient' : 'permanent',
+                        operation: operation as any,
+                        taskId: req.obsidianTaskId || 'unknown',
+                        gcalId: req.originalGcalId,
+                        retryCount: this.retryCount,
+                        errorDetails: { status, reason, message },
+                    };
+                    this.errorLogs.push(entry);
+                    if ((req.operationType === 'update' || req.operationType === 'patch') && status === 412) {
+                        const retry: BatchRequestItem = {
+                            method: req.method,
+                            path: req.path,
+                            body: req.body || req.fullBody,
+                            obsidianTaskId: req.obsidianTaskId,
+                            operationType: req.operationType,
+                            originalGcalId: req.originalGcalId,
+                        };
+                        fallbackNoIfMatch.push(retry);
+                        return;
+                    }
+                    if (status === 400) {
+                        try {
+                            console.error('400 body:', JSON.stringify(res.body).slice(0, 500));
+                            console.error('400 req:', JSON.stringify(req.body || req.fullBody).slice(0, 500));
+                        } catch {}
+                    }
+                    const maxSamples = 50;
+                    const arr = this.plugin.settings.recentErrors ?? [];
+                    arr.unshift(entry);
+                    while (arr.length > maxSamples) arr.pop();
+                    this.plugin.settings.recentErrors = arr;
+                }
+            });
+
+            if (fallbackInserts.length > 0) {
+                console.log(`再作成フォールバック: ${fallbackInserts.length} 件をPOST`);
+                const fb = await this.executeBatchesWithRetry(fallbackInserts, batchProcessor);
+                createdCount += fb.created;
+                updatedCount += fb.updated;
+                deletedCount += fb.deleted;
+                errorCount += fb.errors;
+                skippedCount += fb.skipped;
+                if (fb.metrics) this.logMetricsSummary('Fallback Inserts', fb.metrics);
+                fb.results.forEach((res, idx) => {
+                    const req = fallbackInserts[idx];
+                    if (res.status >= 200 && res.status < 300 && res.body?.id && req.obsidianTaskId) {
+                        taskMap[req.obsidianTaskId] = res.body.id;
+                    }
+                });
+            }
+
+            if (fallbackNoIfMatch.length > 0) {
+                console.log(`412再試行(If-Match無): ${fallbackNoIfMatch.length} 件を再送`);
+                const fb2 = await this.executeBatchesWithRetry(fallbackNoIfMatch, batchProcessor);
+                createdCount += fb2.created;
+                updatedCount += fb2.updated;
+                deletedCount += fb2.deleted;
+                errorCount += fb2.errors;
+                skippedCount += fb2.skipped;
+            }
+
+            if (fallbackDeleteNoIfMatch.length > 0) {
+                console.log(`412削除再試行(If-Match無): ${fallbackDeleteNoIfMatch.length} 件を再送`);
+                const fb3 = await this.executeBatchesWithRetry(fallbackDeleteNoIfMatch, batchProcessor);
+                createdCount += fb3.created;
+                updatedCount += fb3.updated;
+                deletedCount += fb3.deleted;
+                errorCount += fb3.errors;
+                skippedCount += fb3.skipped;
+                fb3.results.forEach((res, idx) => {
+                    const req = fallbackDeleteNoIfMatch[idx];
+                    if (res.status >= 200 && res.status < 300 && req?.obsidianTaskId) {
+                        delete taskMap[req.obsidianTaskId];
+                    }
+                });
+            }
+        } else if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
+            new Notice('変更なし。', 2000);
+        }
+
+        return { createdCount, updatedCount, deletedCount, skippedCount, errorCount };
+    }
+
     private mapGoogleEvents(
         existingEvents: calendar_v3.Schema$Event[],
         taskMap: { [obsidianTaskId: string]: string }
@@ -325,9 +403,13 @@ export class SyncLogic {
             if (event.status === 'cancelled') return;
 
             if (obsId && gcalId) {
-                const existingMapping = googleEventMap.get(obsId);
-                if (!existingMapping || (event.updated && existingMapping.updated && DateUtils.parseDate(event.updated).isAfter(DateUtils.parseDate(existingMapping.updated)))) {
+                const prev = googleEventMap.get(obsId);
+                if (!prev) {
                     googleEventMap.set(obsId, event);
+                } else {
+                    const a = prev.updated ? DateUtils.parseDate(prev.updated) : DateUtils.parseDate('1970-01-01');
+                    const b = event.updated ? DateUtils.parseDate(event.updated) : DateUtils.parseDate('1970-01-01');
+                    if (b.isAfter(a)) googleEventMap.set(obsId, event);
                 }
                 if (!taskMap[obsId] || taskMap[obsId] !== gcalId) {
                     taskMap[obsId] = gcalId;
@@ -363,11 +445,14 @@ export class SyncLogic {
             if (task.isCompleted) {
                 if (!force) {
                     const existingEvent = googleEventMap.get(obsId);
-                    if (existingEvent && existingEvent.status !== 'cancelled') {
+                    if (existingEvent) {
                         const gcalId = existingEvent.id!;
                         const headers: Record<string, string> = {};
                         if (existingEvent.etag) headers['If-Match'] = existingEvent.etag;
-                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, headers, body: { status: 'cancelled' }, obsidianTaskId: obsId, operationType: 'patch', originalGcalId: gcalId });
+                        // 完了は status をキャンセルにせず、extendedProperties.private.isCompleted='true' を更新
+                        const payload = gcalMapper.mapObsidianTaskToGoogleEvent(task);
+                        const patchBody = this.buildPatchBody(existingEvent, payload);
+                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, headers, body: patchBody, obsidianTaskId: obsId, operationType: 'patch', originalGcalId: gcalId });
                     } else {
                         skippedCount++;
                     }
@@ -408,7 +493,7 @@ export class SyncLogic {
                         const headers: Record<string, string> = {};
                         if (existingEvent.etag) headers['If-Match'] = existingEvent.etag;
                         const patchBody = this.buildPatchBody(existingEvent, eventPayload);
-                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, headers, body: patchBody, fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: gcalId });
+                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(gcalId)}`, headers, body: patchBody, fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'patch', originalGcalId: gcalId });
                     }
                 } else {
                     skippedCount++;
@@ -429,20 +514,27 @@ export class SyncLogic {
                         bodies.forEach(body => batchRequests.push({ method: 'POST', path: calendarPath, body, obsidianTaskId: obsId, operationType: 'insert' }));
                     } else {
                         const headers: Record<string, string> = {};
-                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(mappedId)}`, headers, body: eventPayload, fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: mappedId });
+                        batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(mappedId)}`, headers, body: eventPayload, fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'patch', originalGcalId: mappedId });
                     }
                 } else {
                     // 重複防止: 同一性キーで既存イベントを検索
                     const identity = this.buildIdentityKeyFromPayload(eventPayload);
                     const dup = dedupeIndex?.get(identity);
                     if (dup && dup.id) {
-                        // 既存イベントを再利用し、マッピングだけ張る
+                        // 既存イベントを再利用（誤アンカー対策: 必要なら展開・置換）
                         taskMap[obsId] = dup.id;
-                        // 内容差分があれば PATCH（extendedProperties の obsidianTaskId 差異は無視）
-                        if (this.needsUpdateIgnoringOwner(dup, eventPayload)) {
+
+                        const expandedBodies = this.expandEventForInsertion(eventPayload, task);
+                        if (expandedBodies.length > 1) {
+                            // 単発→繰り返し（daily等）に切替時は UI 側の誤アンカーを避けるため削除→複数挿入
                             const headers: Record<string, string> = {};
                             if (dup.etag) headers['If-Match'] = dup.etag;
-                            batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(dup.id)}`, headers, body: this.buildPatchBodyIgnoringOwner(dup, eventPayload), fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'update', originalGcalId: dup.id });
+                            batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(dup.id)}`, headers, obsidianTaskId: obsId, operationType: 'delete', originalGcalId: dup.id });
+                            expandedBodies.forEach(body => batchRequests.push({ method: 'POST', path: calendarPath, body, obsidianTaskId: obsId, operationType: 'insert' }));
+                        } else if (this.needsUpdateIgnoringOwner(dup, eventPayload)) {
+                            const headers: Record<string, string> = {};
+                            if (dup.etag) headers['If-Match'] = dup.etag;
+                            batchRequests.push({ method: 'PATCH', path: `${calendarPath}/${encodeURIComponent(dup.id)}`, headers, body: this.buildPatchBodyIgnoringOwner(dup, eventPayload), fullBody: eventPayload, obsidianTaskId: obsId, operationType: 'patch', originalGcalId: dup.id });
                         } else {
                             skippedCount++;
                         }
@@ -460,11 +552,115 @@ export class SyncLogic {
     private expandEventForInsertion(eventPayload: GoogleCalendarEventInput, task: ObsidianTask): GoogleCalendarEventInput[] {
         const out: GoogleCalendarEventInput[] = [];
         const clone = (e: GoogleCalendarEventInput): GoogleCalendarEventInput => JSON.parse(JSON.stringify(e));
+        const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
         const ruleStr = (eventPayload.recurrence || [])[0] || '';
         const hasRecurrence = !!ruleStr;
 
-        // 0) 汎用: RRULE があり、🛫/📅 がある場合は rrule で期間内の実発生日を列挙して個別イベント化
+        // 1) DAILY（COUNT 有無）を優先して個別イベントに展開
+        const mDaily = ruleStr.match(/FREQ=DAILY(?:;COUNT=(\d+))?/);
+        if (mDaily) {
+            let count = Number(mDaily[1] || '');
+            if (!count || isNaN(count)) {
+                // COUNT が無い場合は🛫〜📅の日数で補完
+                if (task.startDate && task.dueDate) {
+                    const s = moment(task.startDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
+                    const e = moment(task.dueDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
+                    const days = e.diff(s, 'days') + 1;
+                    count = days > 0 ? days : 1;
+                } else {
+                    count = 1;
+                }
+            }
+            const base = eventPayload.start?.dateTime ? moment.parseZone(eventPayload.start.dateTime) : null;
+            if (base && count > 0) {
+                // 時間帯はタスクの timeWindow または payload の時刻から推定
+                const twStart = task.timeWindowStart || moment(base).format('HH:mm');
+                const twEnd = task.timeWindowEnd || (eventPayload.end?.dateTime ? moment.parseZone(eventPayload.end.dateTime).format('HH:mm') : '24:00');
+                for (let i = 0; i < count; i++) {
+                    const sDay = base.clone().add(i, 'day');
+                    const [sh, sm] = twStart.split(':').map(Number);
+                    const s = sDay.clone().hour(sh).minute(sm).second(0).millisecond(0);
+                    let e: moment.Moment;
+                    if (twEnd === '24:00') {
+                        e = sDay.clone().add(1, 'day').startOf('day');
+                    } else {
+                        const [eh, em] = twEnd.split(':').map(Number);
+                        e = sDay.clone().hour(eh).minute(em).second(0).millisecond(0);
+                    }
+                    if (!s.isValid()) { console.warn('skip invalid start (daily expand):', sDay.toString()); continue; }
+                    if (!e.isValid() || !e.isAfter(s)) {
+                        e = s.clone().add(this.plugin.settings.defaultEventDurationMinutes, 'minute');
+                    }
+                    const ev = clone(eventPayload);
+                    // テスト期待に合わせ、offset なしのフォーマットを使用
+                    ev.start = { dateTime: s.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any;
+                    ev.end = { dateTime: e.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any;
+                    ev.recurrence = undefined;
+                    if ((ev.start as any).date) delete (ev.start as any).date;
+                    if ((ev.end as any).date) delete (ev.end as any).date;
+                    out.push(ev);
+                }
+                return out;
+            }
+        }
+
+        // 1.5) WEEKLY（BYDAY）: 期間内の該当曜日のみ個別に展開
+        const mWeekly = ruleStr.match(/FREQ=WEEKLY(?:;BYDAY=([A-Z,]+))?/);
+        if (mWeekly && task.startDate && task.dueDate) {
+            const bydayStr = mWeekly[1] || '';
+            const dayTokens = bydayStr ? bydayStr.split(',') : [];
+            const mapDOW: Record<string, number> = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
+            const targetDows = dayTokens.map(t => mapDOW[t]).filter((n) => typeof n === 'number');
+            if (targetDows.length > 0) {
+                const baseStart = eventPayload.start?.dateTime ? moment.parseZone(eventPayload.start.dateTime) : null;
+                const baseEnd = eventPayload.end?.dateTime ? moment.parseZone(eventPayload.end.dateTime) : null;
+                const twStart = task.timeWindowStart || (baseStart ? baseStart.format('HH:mm') : undefined);
+                const twEnd = task.timeWindowEnd || (baseEnd ? baseEnd.format('HH:mm') : undefined);
+                const cursor = moment(task.startDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
+                const end = moment(task.dueDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).endOf('day');
+                let d = cursor.clone();
+                while (d.isSameOrBefore(end, 'day')) {
+                    if (targetDows.includes(d.day())) {
+                        let s: moment.Moment;
+                        let e: moment.Moment;
+                        if (twStart && twEnd) {
+                            const [sh, sm] = twStart.split(':').map(Number);
+                            s = d.clone().hour(sh).minute(sm).second(0).millisecond(0);
+                            if (twEnd === '24:00') e = d.clone().add(1,'day').startOf('day');
+                            else {
+                                const [eh, em] = twEnd.split(':').map(Number);
+                                e = d.clone().hour(eh).minute(em).second(0).millisecond(0);
+                            }
+                        } else if (baseStart && baseEnd) {
+                            s = d.clone().hour(baseStart.hour()).minute(baseStart.minute()).second(0).millisecond(0);
+                            e = d.clone().hour(baseEnd.hour()).minute(baseEnd.minute()).second(0).millisecond(0);
+                        } else {
+                            // 終日フォールバック
+                            out.push({ ...clone(eventPayload), start: { date: d.format('YYYY-MM-DD') }, end: { date: d.clone().add(1,'day').format('YYYY-MM-DD') }, recurrence: undefined });
+                            d = d.add(1, 'day');
+                            continue;
+                        }
+                        if (!s.isValid()) { console.warn('skip invalid start (weekly expand):', d.toString()); d = d.add(1, 'day'); continue; }
+                        if (!e.isValid() || !e.isAfter(s)) {
+                            e = s.clone().add(this.plugin.settings.defaultEventDurationMinutes, 'minute');
+                        }
+                        const ev = clone(eventPayload);
+                        // テスト期待に合わせ、offset なしのフォーマットを使用
+                        ev.start = { dateTime: s.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any;
+                        ev.end = { dateTime: e.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any;
+                        ev.recurrence = undefined;
+                        if ((ev.start as any).date) delete (ev.start as any).date;
+                        if ((ev.end as any).date) delete (ev.end as any).date;
+                        out.push(ev);
+                    }
+                    d = d.add(1, 'day');
+                }
+                if (out.length > 0) return out;
+            }
+        }
+
+        // 2) 汎用: RRULE があり、🛫/📅 がある場合は rrule で期間内の実発生日を列挙して個別イベント化
         if (hasRecurrence && task.startDate && task.dueDate) {
             try {
                 const dtstart = eventPayload.start?.dateTime ? new Date(eventPayload.start.dateTime) : new Date(task.startDate);
@@ -508,8 +704,9 @@ export class SyncLogic {
                             e = e.isValid() ? (e.isAfter(s) ? e : minEnd) : minEnd;
                         }
                         const ev = clone(eventPayload);
-                        ev.start = { dateTime: s.format('YYYY-MM-DDTHH:mm:ssZ'), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone } as any;
-                        ev.end = { dateTime: e.format('YYYY-MM-DDTHH:mm:ssZ'), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone } as any;
+                        // テスト期待に合わせ、offset なしのフォーマットを使用
+                        ev.start = { dateTime: s.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any;
+                        ev.end = { dateTime: e.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any;
                         ev.recurrence = undefined;
                         if ((ev.start as any).date) delete (ev.start as any).date;
                         if ((ev.end as any).date) delete (ev.end as any).date;
@@ -522,82 +719,37 @@ export class SyncLogic {
             }
         }
 
-        // 1) daily + COUNT の場合は個別イベントに展開
-        const mDaily = ruleStr.match(/FREQ=DAILY(?:;COUNT=(\d+))?/);
-        if (mDaily) {
-            let count = Number(mDaily[1] || '');
-            if (!count || isNaN(count)) {
-                // COUNT が無い場合は🛫〜📅の日数で補完
-                if (task.startDate && task.dueDate) {
-                    const s = moment(task.startDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
-                    const e = moment(task.dueDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
-                    const days = e.diff(s, 'days') + 1;
-                    count = days > 0 ? days : 1;
-                } else {
-                    count = 1;
-                }
-            }
-            const base = eventPayload.start?.dateTime ? moment.parseZone(eventPayload.start.dateTime) : null;
-            if (base && count > 0) {
-                // 時間帯はタスクの timeWindow または payload の時刻から推定
-                const twStart = task.timeWindowStart || moment(base).format('HH:mm');
-                const twEnd = task.timeWindowEnd || (eventPayload.end?.dateTime ? moment.parseZone(eventPayload.end.dateTime).format('HH:mm') : '24:00');
-                for (let i = 0; i < count; i++) {
-                    const sDay = base.clone().add(i, 'day');
-                    const [sh, sm] = twStart.split(':').map(Number);
-                    const [eh, em] = twEnd.split(':').map(x => x === '24:00' ? NaN : Number(x));
-                    const s = sDay.clone().hour(sh).minute(sm).second(0).millisecond(0);
-                    let e: moment.Moment;
-                    if (twEnd === '24:00') {
-                        e = sDay.clone().add(1, 'day').startOf('day');
-                    } else {
-                        e = sDay.clone().hour(eh!).minute(em!).second(0).millisecond(0);
-                    }
-                    if (!s.isValid()) { console.warn('skip invalid start (daily expand):', sDay.toString()); continue; }
-                    if (!e.isValid() || !e.isAfter(s)) {
-                        e = s.clone().add(this.plugin.settings.defaultEventDurationMinutes, 'minute');
-                    }
-                    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-                    const ev = clone(eventPayload);
-                    ev.start = { dateTime: s.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any;
-                    ev.end = { dateTime: e.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any;
-                    ev.recurrence = undefined;
-                    if ((ev.start as any).date) delete (ev.start as any).date;
-                    if ((ev.end as any).date) delete (ev.end as any).date;
-                    out.push(ev);
-                }
-                return out;
-            }
-        }
-
-        // 2) 単一イベントが日付を跨ぐ場合は日次スライス
+        // 3) 単一イベントが日付を跨ぐ場合は日次スライス
         const sdt = eventPayload.start?.dateTime ? moment.parseZone(eventPayload.start.dateTime) : null;
         const edt = eventPayload.end?.dateTime ? moment.parseZone(eventPayload.end.dateTime) : null;
         if (sdt && edt && !sdt.isSame(edt, 'day')) {
             let cursor = sdt.clone();
             // 先頭スライス: 開始〜24:00
             let endOfDay = cursor.clone().add(1,'day').startOf('day');
-            const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
             out.push({ ...clone(eventPayload), start: { dateTime: cursor.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any, end: { dateTime: endOfDay.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any, recurrence: undefined });
             // 中間スライス: 00:00〜24:00
             cursor = endOfDay.clone();
             while (cursor.isBefore(edt, 'day')) {
                 const next = cursor.clone().add(1,'day').startOf('day');
-                out.push({ ...clone(eventPayload), start: { dateTime: cursor.toISOString(true) }, end: { dateTime: next.toISOString(true) }, recurrence: undefined });
+                out.push({
+                    ...clone(eventPayload),
+                    start: { dateTime: cursor.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any,
+                    end:   { dateTime: next.format('YYYY-MM-DDTHH:mm:ss'),   timeZone: tz } as any,
+                    recurrence: undefined
+                });
                 cursor = next;
             }
             // 最終スライス: 00:00〜元の終了時刻
             const finalStart = cursor.startOf('day');
             if (finalStart.isBefore(edt)) {
-                const tz2 = Intl.DateTimeFormat().resolvedOptions().timeZone;
-                out.push({ ...clone(eventPayload), start: { dateTime: finalStart.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz2 } as any, end: { dateTime: edt.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz2 } as any, recurrence: undefined });
+                out.push({ ...clone(eventPayload), start: { dateTime: finalStart.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any, end: { dateTime: edt.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any, recurrence: undefined });
             }
             // 正規化: date を排除
             out.forEach(ev => { if ((ev.start as any).date) delete (ev.start as any).date; if ((ev.end as any).date) delete (ev.end as any).date; });
             return out;
         }
 
-        // 3) それ以外はそのまま単一
+        // 4) それ以外はそのまま単一
         out.push(eventPayload);
         return out;
     }
@@ -615,13 +767,17 @@ export class SyncLogic {
         const processed = new Set<string>();
 
         if (force) {
+            // [安全化] プラグイン管理対象 or taskMap が参照している ID のみ削除
+            const managedOrMapped = new Set<string>(Object.values(this.plugin.settings.taskMap || {}));
             existingGCalEvents.forEach(event => {
-                if (event.id) {
-                    const headers: Record<string, string> = {};
-                    if (event.etag) headers['If-Match'] = event.etag;
-                    batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(event.id)}`, headers, obsidianTaskId: 'force-delete', operationType: 'delete', originalGcalId: event.id });
-                    processed.add(event.id);
-                }
+                if (!event.id) return;
+                const isManaged = event.extendedProperties?.private?.['isGcalSync'] === 'true';
+                const isMapped = managedOrMapped.has(event.id);
+                if (!(isManaged || isMapped)) return;
+                const headers: Record<string, string> = {};
+                if (event.etag) headers['If-Match'] = event.etag;
+                batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(event.id)}`, headers, obsidianTaskId: 'force-delete', operationType: 'delete', originalGcalId: event.id });
+                processed.add(event.id);
             });
             return;
         }
@@ -632,6 +788,9 @@ export class SyncLogic {
             const gid = taskMap[id];
             if (gid) gIdsInUseByCurrent.add(gid);
         }
+
+        const byId = new Map<string, calendar_v3.Schema$Event>();
+        existingGCalEvents.forEach(e => { if (e.id) byId.set(e.id, e); });
 
         Object.entries(taskMap).forEach(([obsId, gId]) => {
             if (!gId) return;
@@ -646,7 +805,7 @@ export class SyncLogic {
                     return;
                 }
                 if (!processed.has(gId)) {
-                    const ev = existingGCalEvents.find(e => e.id === gId);
+                    const ev = byId.get(gId);
                     const headers: Record<string, string> = {};
                     if (ev?.etag) headers['If-Match'] = ev.etag;
                     batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(gId)}`, headers, obsidianTaskId: obsId, operationType: 'delete', originalGcalId: gId });
@@ -680,12 +839,22 @@ export class SyncLogic {
             statusCounts: {},
         };
 
-        const isTransient = (status: number) => [403, 429, 500, 502, 503, 504].includes(status);
         const treatAsSkipped = (req: BatchRequestItem, status: number) => {
             if (req.operationType === 'insert' && status === 409) return true; // 既存IDでの重複作成
-            if ((req.operationType === 'delete' || req.operationType === 'update' || req.operationType === 'patch') && (status === 404 || status === 410 || status === 412)) return true; // 412: ETag競合
+            if ((req.operationType === 'delete' || req.operationType === 'update' || req.operationType === 'patch') && (status === 404 || status === 410)) return true;
             return false;
         };
+
+        // 設定: ハード上限/開始サイズ/並列度/SLA
+        const hardCap = Math.max(1, Math.min(1000, this.plugin.settings.maxBatchPerHttp ?? 50));
+        let subBatchSize = Math.min(
+            Math.max(1, this.plugin.settings.desiredBatchSize ?? this.plugin.settings.batchSize ?? 50),
+            hardCap
+        );
+        const step = Math.max(1, Math.floor(subBatchSize * 0.2)); // +20%
+        const sla = this.plugin.settings.latencySLAms ?? 1500;
+        let maxInFlight = Math.max(1, this.plugin.settings.maxInFlightBatches ?? 2);
+        const cooldown = this.plugin.settings.rateErrorCooldownMs ?? 1000;
 
         // 送信対象のインデックス集合
         let pending = batchRequests.map((_, i) => i);
@@ -696,71 +865,138 @@ export class SyncLogic {
             this.retryCount = attempt - 1;
             metrics.attempts = attempt; // 最終回数で更新
 
-            for (let i = 0; i < pending.length; i += 50) {
-                const windowIdx = pending.slice(i, i + 50);
-                const subReq = windowIdx.map(idx => batchRequests[idx]);
-                const start = performance.now();
-                const subRes = await this.plugin.gcalApi.executeBatchRequest(subReq);
-                const end = performance.now();
-                metrics.sentSubBatches++;
-                metrics.batchLatenciesMs.push(end - start);
+            // pending を現行 subBatchSize で分割
+            const windows: number[][] = [];
+            for (let i = 0; i < pending.length; i += subBatchSize) {
+                windows.push(pending.slice(i, i + subBatchSize));
+            }
 
-                subRes.forEach((res, k) => {
-                    const origIdx = windowIdx[k];
-                    const req = batchRequests[origIdx];
+            let hadRateIssuesInWave = false;
+            const waveLatencies: number[] = [];
 
-                    metrics.statusCounts[res.status] = (metrics.statusCounts[res.status] || 0) + 1;
-                    if (res.status >= 200 && res.status < 300) {
-                        finalResults[origIdx] = res;
-                        switch (req.operationType) {
-                            case 'insert': created++; break;
-                            case 'update':
-                            case 'patch': updated++; break;
-                            case 'delete': deleted++; break;
+            for (let w = 0; w < windows.length; w += maxInFlight) {
+                const slice = windows.slice(w, w + maxInFlight);
+
+                const settled = await Promise.allSettled(slice.map(windowIdx => {
+                    const subReq = windowIdx.map(idx => batchRequests[idx]);
+                    const start = performance.now();
+                    return this.plugin.gcalApi.executeBatchRequest(subReq).then(subRes => {
+                        const end = performance.now();
+                        const latency = end - start;
+                        metrics.sentSubBatches++;
+                        metrics.batchLatenciesMs.push(latency);
+                        return { subRes, windowIdx, latency };
+                    });
+                }));
+
+                // 各サブバッチの結果を適用
+                settled.forEach(s => {
+                    if (s.status !== 'fulfilled') {
+                        hadRateIssuesInWave = true; // ネットワーク/未知の失敗
+                        return;
+                    }
+                    const { subRes, windowIdx, latency } = s.value;
+                    waveLatencies.push(latency);
+
+                    // Content-ID -> 元 index
+                    const cidToOrig = new Map<string, number>();
+                    windowIdx.forEach((orig, j) => cidToOrig.set(`item-${j + 1}`, orig));
+
+                    subRes.forEach((res, k) => {
+                        const mappedIdx = res.contentId ? cidToOrig.get(res.contentId) : undefined;
+                        if (res.contentId && mappedIdx === undefined) {
+                            console.warn('Unknown Content-ID in batch response:', res.contentId);
                         }
-                        return;
-                    }
+                        const origIdx = mappedIdx !== undefined ? mappedIdx : windowIdx[k];
+                        const req = batchRequests[origIdx];
 
-                    if (treatAsSkipped(req, res.status)) {
-                        finalResults[origIdx] = res; // スキップとして記録
-                        skipped++;
-                        return;
-                    }
+                        metrics.statusCounts[res.status] = (metrics.statusCounts[res.status] || 0) + 1;
+                        if (res.status >= 200 && res.status < 300) {
+                            if (!finalResults[origIdx]) {
+                                finalResults[origIdx] = res;
+                                switch (req.operationType) {
+                                    case 'insert': created++; break;
+                                    case 'update':
+                                    case 'patch':  updated++; break;
+                                    case 'delete': deleted++; break;
+                                }
+                            }
+                            return;
+                        }
 
-                    if (isTransient(res.status) && attempt <= this.MAX_RETRIES) {
-                        // 次のラウンドで再送（finalResults は未確定のまま）
-                        return;
-                    }
+                        // スキップ系
+                        if (treatAsSkipped(req, res.status)) {
+                            if (!finalResults[origIdx]) {
+                                finalResults[origIdx] = res;
+                                skipped++;
+                            }
+                            return;
+                        }
 
-                    // 恒久失敗として確定
-                    finalResults[origIdx] = res;
-                    errors++;
+                        // レート/一時障害 → 次ラウンド
+                        const reason = (res.body?.error?.errors?.[0]?.reason) || (res.body?.error?.status) || '';
+                        const retryable = this.shouldRetry(res.status, String(reason));
+                        if (retryable && attempt <= this.MAX_RETRIES) {
+                            hadRateIssuesInWave = true;
+                            return; // finalResults は未確定
+                        }
+
+                        if (res.status === 412) {
+                            finalResults[origIdx] = res; // フォールバック経路で処理
+                            return;
+                        }
+
+                        // 恒久失敗
+                        if (!finalResults[origIdx]) {
+                            finalResults[origIdx] = res;
+                            errors++;
+                        }
+                    });
                 });
 
-                // レート制限回避のためのインターバッチ遅延
-                if (i + 50 < pending.length && this.plugin.settings.interBatchDelay > 0) {
-                    metrics.totalWaitMs += this.plugin.settings.interBatchDelay;
-                    await new Promise(resolve => setTimeout(resolve, this.plugin.settings.interBatchDelay));
+                // ジッタ付きインターバッチ遅延（並列グループ間）
+                const base = this.plugin.settings.interBatchDelay ?? 0;
+                if (w + maxInFlight < windows.length && base > 0) {
+                    const jittered = Math.floor(base * (Math.random() * 0.5 + 0.75));
+                    metrics.totalWaitMs += jittered;
+                    await new Promise(r => setTimeout(r, jittered));
                 }
+            }
+
+            // 波（wave）単位の適応: p95 とレート状況
+            const latSorted = waveLatencies.slice().sort((a,b)=>a-b);
+            const p95 = latSorted.length ? latSorted[Math.min(latSorted.length - 1, Math.ceil(0.95 * latSorted.length) - 1)] : 0;
+            if (hadRateIssuesInWave || p95 > sla) {
+                subBatchSize = Math.max(Math.floor(subBatchSize / 2), 5);
+                maxInFlight = Math.max(1, Math.floor(maxInFlight / 2));
+                if (cooldown > 0) {
+                    metrics.totalWaitMs += cooldown;
+                    await new Promise(r => setTimeout(r, cooldown));
+                }
+            } else {
+                subBatchSize = Math.min(subBatchSize + step, hardCap);
+                // 目標上限まで少しずつ上げる
+                const limit = Math.max(1, this.plugin.settings.maxInFlightBatches ?? 2);
+                if (maxInFlight < limit) maxInFlight = Math.min(limit, maxInFlight + 1);
             }
 
             // 未確定（= transient 扱い）だけを次の試行に残す
             const nextPending: number[] = [];
-            for (const idx of pending) {
-                if (!finalResults[idx]) nextPending.push(idx);
+            for (const idx2 of pending) {
+                if (!finalResults[idx2]) nextPending.push(idx2);
             }
 
             if (nextPending.length === 0) break;
             if (attempt >= this.MAX_RETRIES) {
                 // これ以上の再送は行わない。残りはエラーで確定。
-                for (const idx of nextPending) {
-                    finalResults[idx] = { status: 500, body: { error: { message: 'Retry limit reached' } } };
+                for (const idx2 of nextPending) {
+                    finalResults[idx2] = { status: 500, body: { error: { message: 'Retry limit reached' } } };
                     errors++;
                 }
                 break;
             }
 
-            const delay = this.RETRY_DELAY_MS * Math.pow(2, attempt) + Math.floor(Math.random() * 250);
+            const delay = this.backoffDelayMs(attempt);
             metrics.totalWaitMs += delay;
             await new Promise(resolve => setTimeout(resolve, delay));
             pending = nextPending;
@@ -769,11 +1005,22 @@ export class SyncLogic {
         return { results: finalResults, created, updated, deleted, errors, skipped, metrics };
     }
 
-    // 安定イベントIDを生成（Googleの制約: 英小文字/数字/ハイフン/アンダースコア, 5-1024文字）
-    private generateStableEventId(obsidianTaskId: string): string {
-        const sha1 = createHash('sha1').update(`obsidian-task:${obsidianTaskId}`).digest('hex');
-        return `obs-${sha1}`; // 44文字程度、衝突実質無視可能
+    private shouldRetry(status: number, reason: string): boolean {
+        if (status === 429) return true;
+        if (status === 403 && /(rateLimitExceeded|userRateLimitExceeded)/i.test(reason)) return true;
+        if (/(RESOURCE_EXHAUSTED)/i.test(reason)) return true;
+        if (status === 500 || status === 502 || status === 503 || status === 504) return true;
+        return false;
     }
+
+    private backoffDelayMs(attempt: number, cap = 20_000): number {
+        const exp = Math.min(cap, this.BASE_BACKOFF_MS * Math.pow(2, attempt));
+        const jitter = exp * (Math.random() * 0.5 + 0.75); // 0.75x〜1.25x
+        return Math.floor(jitter);
+    }
+
+    // 安定イベントIDを生成（Googleの制約: 英小文字/数字/ハイフン/アンダースコア, 5-1024文字）
+    // generateStableEventId は未使用のため削除
 
     private handleDeleteError(request: BatchRequestItem, status: number): void {
         const errorType = status === 404 ? 'permanent' : 'transient';
@@ -1016,6 +1263,11 @@ export class SyncLogic {
                 includeRem2
             ),
         };
+        // 完了フラグが新Payloadに含まれる場合は反映
+        const newCompleted = (newPayload.extendedProperties as any)?.private?.isCompleted;
+        if (typeof newCompleted === 'string') {
+            priv.isCompleted = newCompleted;
+        }
         patch.extendedProperties = { private: priv } as any;
 
         // 何も差分がない場合は summary を noop として入れない（空オブジェクトのまま返す）
@@ -1138,7 +1390,7 @@ export class SyncLogic {
             return;
         }
 
-        const bp = new BatchProcessor(this.plugin.settings.calendarId, this.plugin.settings);
+        const bp = new BatchProcessor(this.plugin.settings);
         const result = await this.executeBatchesWithRetry(batch, bp);
         await this.plugin.saveData(this.plugin.settings); // 更新されたtaskMapを保存
         new Notice(`重複整理完了: 削除 ${result.deleted}, スキップ ${result.skipped}, エラー ${result.errors}`, 8000);

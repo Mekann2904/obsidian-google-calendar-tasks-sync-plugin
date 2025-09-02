@@ -17,6 +17,8 @@ export interface ObsidianTask {
 	// 🔁 拡張: 時間ウィンドウ (例: 15:00~24:00)
 	timeWindowStart?: string | null; // 'HH:mm'
 	timeWindowEnd?: string | null;   // 'HH:mm' または '24:00'
+	/** インデントされた継続行からの自由記述（説明欄へ） */
+	extraDetail?: string | null;
 	tags: string[]; // タグ (例: #tag1)
 	blockLink: string | null; // ブロックリンク (例: ^abcdef)
 	sourcePath: string; // タスクが存在するファイルのパス
@@ -34,7 +36,18 @@ export type GoogleCalendarEventInput = calendar_v3.Schema$Event & {
 export interface GoogleCalendarTasksSyncSettings {
 	clientId: string; // Google Cloud Console で取得したクライアントID
 	clientSecret: string; // Google Cloud Console で取得したクライアントシークレット
-	tokens: Credentials | null; // Google から取得した認証トークン (アクセストークン、リフレッシュトークンなど)
+	/**
+	 * 実行時にメモリ上で保持するトークン。ディスクには保存しない（saveData 時に除外）。
+	 */
+	tokens: Credentials | null;
+	/**
+	 * ディスク保存用の暗号化トークン（Electron safeStorage で暗号化した Base64 文字列）。
+	 */
+    tokensEncrypted?: string | null; // 'obf:<base64>' または 'aesgcm:<base64>' を格納
+    encryptionPassphrase?: string | null; // パスフレーズ保存（任意）
+    rememberPassphrase?: boolean; // パスフレーズを設定ファイルに保存（既定false）
+    obfuscationSalt?: string | null; // 難読化用のソルト（インストールごとにランダム）
+    devLogging?: boolean; // デベロッパーモード（詳細ログ）
 	calendarId: string; // 同期対象の Google Calendar ID (通常 'primary' または特定のカレンダーID)
 	syncIntervalMinutes: number; // 自動同期の間隔 (分単位)
 	autoSync: boolean; // 自動同期を有効にするか
@@ -51,8 +64,10 @@ export interface GoogleCalendarTasksSyncSettings {
 	syncScheduledDateToDescription: boolean; // 予定日 (Scheduled Date) を説明に追加するか
 	defaultEventDurationMinutes: number; // 開始時刻と終了時刻が指定されているが、終了が開始より前の場合に使用するデフォルトのイベント時間 (分)
 	useLoopbackServer: boolean; // 認証にローカルループバックサーバーを使用するか (現在はこの方法のみサポート)
-	loopbackPort: number; // ローカルループバックサーバーが使用するポート番号
-	showNotices: boolean; // 全通知のマスタースイッチ
+    loopbackPort: number; // ローカルループバックサーバーが使用するポート番号
+    requireRedirectUriRegistration?: boolean; // Webクライアント利用時にのみリダイレクトURI登録を促す
+    showNotices: boolean; // 全通知のマスタースイッチ
+    autoStopOnSuccess?: boolean; // OAuth 成功時にサーバーを自動停止
 	syncNoticeSettings: {
 		showManualSyncProgress: boolean; // 手動同期の進捗表示
 		showAutoSyncSummary: boolean; // 自動同期の要約のみ表示
@@ -60,8 +75,28 @@ export interface GoogleCalendarTasksSyncSettings {
 		minSyncDurationForNotice: number; // 通知を表示する最小同期時間（秒）
 	};
 	interBatchDelay: number; // バッチリクエスト間の遅延（ミリ秒）
-	recentErrors?: ErrorLog[]; // 最近のエラーサンプル（診断用）
-	useSyncToken?: boolean; // 可能な場合、syncToken による増分取得を使用
+	batchSize?: number; // 互換目的（旧設定）。未設定時は desiredBatchSize を使用
+	desiredBatchSize?: number;      // 目標サブバッチサイズ（既定50）
+	maxBatchPerHttp?: number;       // 1 HTTP バッチ内のハード上限（既定50）
+	maxInFlightBatches?: number;    // 同時送信サブバッチ数（既定2）
+    latencySLAms?: number;          // p95 レイテンシSLA（既定1500ms）
+    rateErrorCooldownMs?: number;    // レート/一時障害後のクールダウン（既定1000ms）
+    minDesiredBatchSize?: number;    // AIMD の最小単位（既定5, hardCap 以下にクランプ）
+
+        recentErrors?: ErrorLog[]; // 最近のエラーサンプル（診断用）
+        useSyncToken?: boolean; // 可能な場合、syncToken による増分取得を使用
+        syncToken?: string; // 増分取得に利用する syncToken
+        quotaUser?: string; // 任意: quota を論理分離するための識別子（Google グローバルパラメータ）
+        /**
+         * 初回フル取得時の events.list フィルタ署名（syncToken 条件固定の自己監査用）
+         */
+        listFilterSignature?: {
+                calendarId: string;
+		privateExtendedProperty: string[];
+		singleEvents: boolean;
+		fields: string;
+		quotaUser?: string;
+	};
 }
 
 // バッチリクエスト用のインターフェース
@@ -82,6 +117,7 @@ export interface BatchResponseItem {
 	status: number; // 個別リクエストのHTTPステータスコード
 	headers?: { [key: string]: string }; // 個別リクエストのレスポンスヘッダー (オプション)
 	body?: any; // 個別リクエストのレスポンスボディ (通常はJSONオブジェクト or エラーメッセージ)
+	contentId?: string; // 応答パートの Content-ID（どのリクエストに対応するかのヒント）
 }
 
 // バッチ処理全体の結果
@@ -107,7 +143,7 @@ export interface ErrorLog {
 
 // 同期メトリクス
 export interface SyncMetrics {
-    sentSubBatches: number;      // 送信したサブバッチ数（最大50件単位）
+    sentSubBatches: number;      // 送信したサブバッチ数（最大1000件/バッチ。各パートは個別リクエストとしてカウント）
     attempts: number;            // 再送を含む試行回数
     totalWaitMs: number;         // バックオフ + インターバッチ待機の合計
     batchLatenciesMs: number[];  // 各サブバッチの往復レイテンシ
