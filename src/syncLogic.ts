@@ -510,6 +510,7 @@ export class SyncLogic {
     private expandEventForInsertion(eventPayload: GoogleCalendarEventInput, task: ObsidianTask): GoogleCalendarEventInput[] {
         const out: GoogleCalendarEventInput[] = [];
         const clone = (e: GoogleCalendarEventInput): GoogleCalendarEventInput => JSON.parse(JSON.stringify(e));
+        const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
         const ruleStr = (eventPayload.recurrence || [])[0] || '';
         const hasRecurrence = !!ruleStr;
@@ -549,7 +550,6 @@ export class SyncLogic {
                     if (!e.isValid() || !e.isAfter(s)) {
                         e = s.clone().add(this.plugin.settings.defaultEventDurationMinutes, 'minute');
                     }
-                    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
                     const ev = clone(eventPayload);
                     // テスト期待に合わせ、offset なしのフォーマットを使用
                     ev.start = { dateTime: s.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any;
@@ -577,7 +577,6 @@ export class SyncLogic {
                 const twEnd = task.timeWindowEnd || (baseEnd ? baseEnd.format('HH:mm') : undefined);
                 const cursor = moment(task.startDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).startOf('day');
                 const end = moment(task.dueDate, [moment.ISO_8601, 'YYYY-MM-DD'], true).endOf('day');
-                const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
                 let d = cursor.clone();
                 while (d.isSameOrBefore(end, 'day')) {
                     if (targetDows.includes(d.day())) {
@@ -664,8 +663,8 @@ export class SyncLogic {
                         }
                         const ev = clone(eventPayload);
                         // テスト期待に合わせ、offset なしのフォーマットを使用
-                        ev.start = { dateTime: s.format('YYYY-MM-DDTHH:mm:ss'), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone } as any;
-                        ev.end = { dateTime: e.format('YYYY-MM-DDTHH:mm:ss'), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone } as any;
+                        ev.start = { dateTime: s.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any;
+                        ev.end = { dateTime: e.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any;
                         ev.recurrence = undefined;
                         if ((ev.start as any).date) delete (ev.start as any).date;
                         if ((ev.end as any).date) delete (ev.end as any).date;
@@ -685,17 +684,15 @@ export class SyncLogic {
             let cursor = sdt.clone();
             // 先頭スライス: 開始〜24:00
             let endOfDay = cursor.clone().add(1,'day').startOf('day');
-            const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
             out.push({ ...clone(eventPayload), start: { dateTime: cursor.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any, end: { dateTime: endOfDay.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any, recurrence: undefined });
             // 中間スライス: 00:00〜24:00
             cursor = endOfDay.clone();
             while (cursor.isBefore(edt, 'day')) {
                 const next = cursor.clone().add(1,'day').startOf('day');
-                const tzMid = Intl.DateTimeFormat().resolvedOptions().timeZone;
                 out.push({
                     ...clone(eventPayload),
-                    start: { dateTime: cursor.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tzMid } as any,
-                    end:   { dateTime: next.format('YYYY-MM-DDTHH:mm:ss'),   timeZone: tzMid } as any,
+                    start: { dateTime: cursor.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any,
+                    end:   { dateTime: next.format('YYYY-MM-DDTHH:mm:ss'),   timeZone: tz } as any,
                     recurrence: undefined
                 });
                 cursor = next;
@@ -703,8 +700,7 @@ export class SyncLogic {
             // 最終スライス: 00:00〜元の終了時刻
             const finalStart = cursor.startOf('day');
             if (finalStart.isBefore(edt)) {
-                const tz2 = Intl.DateTimeFormat().resolvedOptions().timeZone;
-                out.push({ ...clone(eventPayload), start: { dateTime: finalStart.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz2 } as any, end: { dateTime: edt.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz2 } as any, recurrence: undefined });
+                out.push({ ...clone(eventPayload), start: { dateTime: finalStart.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any, end: { dateTime: edt.format('YYYY-MM-DDTHH:mm:ss'), timeZone: tz } as any, recurrence: undefined });
             }
             // 正規化: date を排除
             out.forEach(ev => { if ((ev.start as any).date) delete (ev.start as any).date; if ((ev.end as any).date) delete (ev.end as any).date; });
