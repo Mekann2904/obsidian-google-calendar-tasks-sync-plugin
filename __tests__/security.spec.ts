@@ -20,19 +20,19 @@ function obfuscateLegacy(plain: string, saltB64: string): string {
 }
 
 describe('encryptWithPassphrase/decryptWithPassphrase', () => {
-  it('round-trips', () => {
-    const enc = encryptWithPassphrase('hello', 'pass');
-    const dec = decryptWithPassphrase(enc, 'pass');
+  it('round-trips', async () => {
+    const enc = await encryptWithPassphrase('hello', 'pass');
+    const dec = await decryptWithPassphrase(enc, 'pass');
     expect(dec).toBe('hello');
   });
 
-  it('fails on wrong passphrase', () => {
-    const enc = encryptWithPassphrase('hello', 'pass1');
-    expect(() => decryptWithPassphrase(enc, 'pass2')).toThrow();
+  it('fails on wrong passphrase', async () => {
+    const enc = await encryptWithPassphrase('hello', 'pass1');
+    await expect(decryptWithPassphrase(enc, 'pass2')).rejects.toThrow();
   });
 
-  it('fails on invalid format', () => {
-    expect(() => decryptWithPassphrase('foo', 'pass')).toThrow('Invalid encrypted format');
+  it('fails on invalid format', async () => {
+    await expect(decryptWithPassphrase('foo', 'pass')).rejects.toThrow('Invalid encrypted format');
   });
 });
 
