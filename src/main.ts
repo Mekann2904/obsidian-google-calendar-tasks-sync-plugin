@@ -150,7 +150,7 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
                 if (this.settings.tokensEncrypted.startsWith('aesgcm:')) {
                     const pass = this.passphraseCache || this.settings.encryptionPassphrase || null;
                     if (pass) {
-                        const inner = decryptWithPassphrase(this.settings.tokensEncrypted, pass);
+                        const inner = await decryptWithPassphrase(this.settings.tokensEncrypted, pass);
                         json = deobfuscateFromBase64(inner, this.settings.obfuscationSalt!);
                     } else {
                         console.warn('暗号化トークンが存在しますが、パスフレーズが未設定のため復号できません。');
@@ -201,7 +201,7 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
             const pass = this.passphraseCache || this.settings.encryptionPassphrase || null;
             if (pass && pass.length > 0) {
                 try {
-                    this.settings.tokensEncrypted = encryptWithPassphrase(obf, pass);
+                    this.settings.tokensEncrypted = await encryptWithPassphrase(obf, pass);
                     await super.saveData({ ...this.settings, tokens: null });
                 } catch (e) {
                     console.error('AES二重ラップに失敗:', e);

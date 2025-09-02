@@ -6,30 +6,33 @@ import {
   randomBytes,
   createCipheriv,
   createDecipheriv,
-  pbkdf2Sync,
+  pbkdf2,
   timingSafeEqual,
 } from 'crypto';
+import { promisify } from 'util';
 import os from 'os';
 
 // ------------------ パスフレーズAES-GCM ------------------
-export function encryptWithPassphrase(plain: string, passphrase: string): string {
+const pbkdf2Async = promisify(pbkdf2);
+
+export async function encryptWithPassphrase(plain: string, passphrase: string): Promise<string> {
   const salt = randomBytes(16);
   const iv = randomBytes(12);
-  const key = pbkdf2Sync(passphrase, salt, 120_000, 32, 'sha256');
+  const key = await pbkdf2Async(passphrase, salt, 120_000, 32, 'sha256');
   const cipher = createCipheriv('aes-256-gcm', key, iv);
   const enc = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
   const tag = cipher.getAuthTag();
   return 'aesgcm:' + Buffer.concat([salt, iv, tag, enc]).toString('base64');
 }
 
-export function decryptWithPassphrase(packed: string, passphrase: string): string {
+export async function decryptWithPassphrase(packed: string, passphrase: string): Promise<string> {
   if (!packed.startsWith('aesgcm:')) throw new Error('Invalid encrypted format');
   const buf = Buffer.from(packed.slice(7), 'base64');
   const salt = buf.subarray(0,16);
   const iv = buf.subarray(16,28);
   const tag = buf.subarray(28,44);
   const data = buf.subarray(44);
-  const key = pbkdf2Sync(passphrase, salt, 120_000, 32, 'sha256');
+  const key = await pbkdf2Async(passphrase, salt, 120_000, 32, 'sha256');
   const decipher = createDecipheriv('aes-256-gcm', key, iv);
   decipher.setAuthTag(tag);
   const dec = Buffer.concat([decipher.update(data), decipher.final()]);
