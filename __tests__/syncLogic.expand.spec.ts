@@ -21,7 +21,7 @@ const fakePlugin = {
     includeReminderInIdentity: false,
     interBatchDelay: 0,
     desiredBatchSize: 5,
-    maxBatchPerHttp: 50,
+    maxBatchPerHttp: 500,
     maxInFlightBatches: 1,
   },
   authService: { ensureAccessToken: async () => true },

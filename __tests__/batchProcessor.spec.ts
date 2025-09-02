@@ -4,7 +4,7 @@ import { setDevLogging } from '../src/logger';
 
 const settings = {
   showNotices: false,
-  maxBatchPerHttp: 50,
+  maxBatchPerHttp: 500,
   minDesiredBatchSize: 5,
   desiredBatchSize: 5,
   maxInFlightBatches: 1,

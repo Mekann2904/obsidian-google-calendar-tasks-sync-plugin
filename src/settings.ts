@@ -4,18 +4,7 @@ import moment from 'moment';
 import { GoogleCalendarTasksSyncSettings } from './types';
 import GoogleCalendarTasksSyncPlugin from './main'; // main.ts からインポート
 
-// Vitest 等の非 Obsidian 実行環境では PluginSettingTab が undefined になるためのフォールバック
-const PluginSettingTabBase: any = (PluginSettingTab as any) || class {
-	app: App;
-	plugin: any;
-	containerEl: any;
-	constructor(app: App, plugin: any) {
-		this.app = app;
-		this.plugin = plugin;
-		this.containerEl = { empty: () => {}, createEl: () => ({}), createDiv: () => ({}) };
-	}
-	display(): void {}
-};
+
 
 export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 	clientId: '',
@@ -53,7 +42,7 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 	interBatchDelay: 500, // バッチリクエスト間のデフォルト遅延（ミリ秒）
 	batchSize: 100, // 互換目的（旧設定）
 	desiredBatchSize: 50,
-	maxBatchPerHttp: 50, // Calendar は保守的に 50 を既定
+	maxBatchPerHttp: 500, // Calendar は保守的に 500 を既定
 	maxInFlightBatches: 2,
 	latencySLAms: 1500,
 	rateErrorCooldownMs: 1000,
@@ -62,9 +51,6 @@ export const DEFAULT_SETTINGS: GoogleCalendarTasksSyncSettings = {
 };
 
 
-
-export class GoogleCalendarSyncSettingTab extends (PluginSettingTabBase as any) {
-	plugin: GoogleCalendarTasksSyncPlugin; // 型をメインプラグインクラスに指定
 
 // Vitest などで `obsidian` モジュールをモックする際、`PluginSettingTab` が
 // undefined になるとクラス継承で TypeError が発生する。ランタイムでの

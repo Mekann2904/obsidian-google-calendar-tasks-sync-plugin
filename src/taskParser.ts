@@ -205,6 +205,15 @@ export class TaskParser {
             }
         }
 
+        // 追加仕様: startDate に時刻があり、時間帯指定がない場合、終日(24:00)までとする
+        if (startDate && startDate.includes(' ') && !timeWindowStart && !timeWindowEnd) {
+            const timePart = startDate.split(' ')[1];
+            if (timePart && timePart.includes(':')) {
+                timeWindowStart = timePart.substring(0, 5); // HH:mm
+                timeWindowEnd = '24:00';
+            }
+        }
+
         // ブロックリンクを抽出 (行末)
         const blockLinkMatch = remainingContent.match(/\s+(\^[a-zA-Z0-9-]+)$/);
         if (blockLinkMatch) {

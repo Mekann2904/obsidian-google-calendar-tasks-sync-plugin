@@ -39,6 +39,7 @@ const input = `
 - [ ] テスト13 📅 2025-08-31 全日
 
 - [ ] テスト14 📅 2025-08-31 all day
+- [ ] テスト15🛫 2025-08-31 15:00 📅 2025-08-31
 `.trim();
 
 function bySummary(tasks: Task[], summary: string): Task {
@@ -110,5 +111,11 @@ describe('TaskParser: 正しく解釈できること', () => {
     expect(t13.summary).toBe('テスト13');
     const t14 = bySummary(tasks, 'テスト14');
     expect(t14.summary).toBe('テスト14');
+
+    const t15 = bySummary(tasks, 'テスト15');
+    expect(t15.startDate).toBe('2025-08-31 15:00');
+    expect(t15.dueDate).toBe('2025-08-31');
+    expect(t15.timeWindowStart).toBe('15:00');
+    expect(t15.timeWindowEnd).toBe('24:00');
   });
 });

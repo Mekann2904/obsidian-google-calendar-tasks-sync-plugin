@@ -77,7 +77,7 @@ export interface GoogleCalendarTasksSyncSettings {
 	interBatchDelay: number; // バッチリクエスト間の遅延（ミリ秒）
 	batchSize?: number; // 互換目的（旧設定）。未設定時は desiredBatchSize を使用
 	desiredBatchSize?: number;      // 目標サブバッチサイズ（既定50）
-	maxBatchPerHttp?: number;       // 1 HTTP バッチ内のハード上限（既定50）
+	maxBatchPerHttp?: number;       // 1 HTTP バッチ内のハード上限（既定500）
 	maxInFlightBatches?: number;    // 同時送信サブバッチ数（既定2）
     latencySLAms?: number;          // p95 レイテンシSLA（既定1500ms）
     rateErrorCooldownMs?: number;    // レート/一時障害後のクールダウン（既定1000ms）

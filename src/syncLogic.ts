@@ -5,16 +5,76 @@ import { rrulestr } from 'rrule';
 import { calendar_v3 } from 'googleapis';
 import GoogleCalendarTasksSyncPlugin from './main';
 import { ObsidianTask, GoogleCalendarEventInput, BatchRequestItem, BatchResponseItem, BatchResult, ErrorLog, GoogleCalendarTasksSyncSettings, SyncMetrics } from './types';
-import { BatchProcessor } from './batchProcessor';
 import moment from 'moment';
 import { GCalMapper } from './gcalMapper';
 
+type EventIndex = {
+  byTaskId: Map<string, calendar_v3.Schema$Event>;
+  byId: Map<string, calendar_v3.Schema$Event>;
+  managedIdSet: Set<string>; // isGcalSync=true のID集合
+};
+
+function buildEventIndex(events: calendar_v3.Schema$Event[]): EventIndex {
+  const byTaskId = new Map<string, calendar_v3.Schema$Event>();
+  const byId = new Map<string, calendar_v3.Schema$Event>();
+  const managedIdSet = new Set<string>();
+
+  const newer = (a?: string | null, b?: string | null) =>
+    (a && b) ? (new Date(a).getTime() > new Date(b).getTime()) : (!!a && !b);
+
+  for (const ev of events) {
+    if (!ev || ev.status === 'cancelled' || !ev.id) continue;
+    byId.set(ev.id, ev);
+
+    const managed = ev.extendedProperties?.private?.['isGcalSync'] === 'true';
+    if (managed) managedIdSet.add(ev.id);
+
+    const tid = ev.extendedProperties?.private?.['obsidianTaskId']
+             ?? ev.extendedProperties?.private?.['taskId']; // 互換
+    if (!tid) continue;
+
+    const prev = byTaskId.get(tid);
+    if (!prev || newer(ev.updated, prev.updated)) byTaskId.set(tid, ev);
+  }
+  return { byTaskId, byId, managedIdSet };
+}
+
+function cloneEventInput(src: GoogleCalendarEventInput): GoogleCalendarEventInput {
+  const result: GoogleCalendarEventInput = {
+    summary: src.summary,
+    description: src.description,
+    status: src.status,
+    start: src.start ? { ...src.start } : undefined,
+    end:   src.end   ? { ...src.end }   : undefined,
+    recurrence: src.recurrence ? [...src.recurrence] : undefined,
+    extendedProperties: src.extendedProperties
+      ? { private: { ...(src.extendedProperties as any).private } } as any
+      : undefined,
+  };
+
+  // reminders は型互換性の問題があるため、安全に処理
+  if (src.reminders) {
+    result.reminders = {
+      useDefault: src.reminders.useDefault,
+      overrides: src.reminders.overrides ? src.reminders.overrides.map(o => ({
+        method: o.method,
+        minutes: o.minutes
+      })) : undefined
+    } as any; // 型アサーションで回避
+  }
+
+  return result;
+}
+
+
 export class SyncLogic {
     private plugin: GoogleCalendarTasksSyncPlugin;
+    private readonly localTz: string;
 
     constructor(plugin: GoogleCalendarTasksSyncPlugin) {
         this.plugin = plugin;
         this.errorLogs = [];
+        this.localTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
     }
 
     /**
@@ -42,7 +102,7 @@ export class SyncLogic {
 
         // --- FIX: ローカルインスタンスの生成 ---
         const gcalMapper = new GCalMapper(this.plugin.app, settings);
-        const batchProcessor = new BatchProcessor(settings);
+        // BatchProcessor is no longer used directly - handled by executeBatchesWithRetry
 
         // FIX: 強制同期の場合は lastSyncTime をクリアしてフル同期を実行
         if (force) {
@@ -70,8 +130,9 @@ export class SyncLogic {
         }
 
         console.log(`カレンダー ID: ${settings.calendarId} と同期を開始 (強制: ${force})`);
+        const sns = settings.syncNoticeSettings ?? { showManualSyncProgress: false, showAutoSyncSummary: true, minSyncDurationForNotice: 1, showErrors: true };
         const isManualSync = !settings.autoSync || force;
-        if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
+        if (isManualSync && sns.showManualSyncProgress) {
             new Notice(force ? '強制同期を開始しました...' : '同期を開始しました...', 3000);
         }
 
@@ -83,27 +144,27 @@ export class SyncLogic {
         try {
             const obsidianTasks = await this.fetchObsidianTasks(isManualSync, settings);
             const {
-                existingEvents,
                 googleEventMap,
                 dedupeIndex,
                 existingGIdSet,
                 eventById,
+                managedIdSet,
             } = await this.fetchGoogleEvents(settings, force, taskMap, isManualSync);
 
-            if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
+            if (isManualSync && sns.showManualSyncProgress) {
                 new Notice(`${obsidianTasks.length} 件のタスクを処理中...`, 3000);
             }
             console.time("Sync: Prepare Batch Requests");
-            const { currentObsidianTaskIds, skipped } = this.prepareBatchRequests(
+            const { skipped, survivors, matchedGIds } = this.prepareBatchRequests(
                 obsidianTasks, googleEventMap, taskMap, batchRequests, gcalMapper, settings, force, dedupeIndex
             );
             skippedCount += skipped;
             console.timeEnd("Sync: Prepare Batch Requests");
 
-            this.prepareDeletions(taskMap, currentObsidianTaskIds, existingEvents, existingGIdSet, batchRequests, settings, force);
+            this.prepareDeletions(survivors, matchedGIds, existingGIdSet, managedIdSet, eventById, batchRequests, settings, force);
 
             const counts = await this.processBatchRequests(
-                batchRequests, batchProcessor, taskMap, eventById, settings, isManualSync
+                batchRequests, taskMap, eventById, settings, isManualSync
             );
             createdCount += counts.createdCount;
             updatedCount += counts.updatedCount;
@@ -118,13 +179,13 @@ export class SyncLogic {
             await this.plugin.saveData(this.plugin.settings);
 
             const durationSeconds = moment(syncEndTime).diff(syncStartTime, 'seconds');
-            const shouldShowSummary = 
-                (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) ||
-                (!isManualSync && settings.syncNoticeSettings.showAutoSyncSummary &&
-                 durationSeconds >= settings.syncNoticeSettings.minSyncDurationForNotice);
+            const shouldShowSummary =
+                (isManualSync && sns.showManualSyncProgress) ||
+                (!isManualSync && sns.showAutoSyncSummary &&
+                 durationSeconds >= sns.minSyncDurationForNotice);
             
-            if (shouldShowSummary || (errorCount > 0 && settings.syncNoticeSettings.showErrors)) {
-                new Notice(`同期完了 (${durationSeconds.toFixed(1)}秒): ${createdCount}追加, ${updatedCount}更新, ${deletedCount}削除, ${skippedCount}スキップ, ${errorCount}エラー`,
+            if (shouldShowSummary || (errorCount > 0 && sns.showErrors)) {
+                new Notice(`同期完了 (${Math.round(durationSeconds)}秒): ${createdCount}追加, ${updatedCount}更新, ${deletedCount}削除, ${skippedCount}スキップ, ${errorCount}エラー`,
                     errorCount ? 15000 : 7000);
             }
         } catch (fatal) {
@@ -139,7 +200,8 @@ export class SyncLogic {
     }
 
     private async fetchObsidianTasks(isManualSync: boolean, settings: GoogleCalendarTasksSyncSettings): Promise<ObsidianTask[]> {
-        if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
+        const sns = settings.syncNoticeSettings ?? { showManualSyncProgress: false, showAutoSyncSummary: true, minSyncDurationForNotice: 1, showErrors: true };
+        if (isManualSync && sns.showManualSyncProgress) {
             new Notice('Obsidian タスクを取得中...', 2000);
         }
         console.time('Sync: Fetch Obsidian Tasks');
@@ -159,8 +221,10 @@ export class SyncLogic {
         dedupeIndex: Map<string, calendar_v3.Schema$Event>;
         existingGIdSet: Set<string>;
         eventById: Map<string, calendar_v3.Schema$Event>;
+        managedIdSet: Set<string>;
     }> {
-        if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
+        const sns = settings.syncNoticeSettings ?? { showManualSyncProgress: false, showAutoSyncSummary: true, minSyncDurationForNotice: 1, showErrors: true };
+        if (isManualSync && sns.showManualSyncProgress) {
             new Notice('GCal イベントを取得中...', 2000);
         }
         console.time('Sync: Fetch GCal Events');
@@ -175,38 +239,45 @@ export class SyncLogic {
         } catch (e) {
             console.warn('取得イベントの仕分けで警告:', e);
         }
-        let googleEventMap = new Map<string, calendar_v3.Schema$Event>();
+        
+        // buildEventIndex を使用して効率的なインデックス構築
+        const index = buildEventIndex(existingEvents);
+        
+        // force でなければ taskMap を同期（従来 mapGoogleEvents の副作用を維持）
         if (!force) {
-            googleEventMap = this.mapGoogleEvents(existingEvents, taskMap);
+            for (const [obsId, ev] of index.byTaskId) {
+                if (ev.id && (!taskMap[obsId] || taskMap[obsId] !== ev.id)) {
+                    taskMap[obsId] = ev.id;
+                }
+            }
         }
-        const dedupeIndex = this.buildDedupeIndex(existingEvents);
-        console.timeEnd('Sync: Fetch GCal Events');
 
-        const existingGIdSet = new Set<string>(
-            existingEvents.map(e => e.id).filter((v): v is string => !!v)
-        );
-        const eventById = new Map<string, calendar_v3.Schema$Event>();
-        existingEvents.forEach(ev => { if (ev.id) eventById.set(ev.id, ev); });
-        return { existingEvents, googleEventMap, dedupeIndex, existingGIdSet, eventById };
+        const googleEventMap = index.byTaskId;
+        const dedupeIndex = this.buildDedupeIndex(existingEvents);
+        const existingGIdSet = new Set<string>([...index.byId.keys()]);
+        const eventById = index.byId;
+
+        console.timeEnd('Sync: Fetch GCal Events');
+        return { existingEvents, googleEventMap, dedupeIndex, existingGIdSet, eventById, managedIdSet: index.managedIdSet };
     }
 
     private prepareDeletions(
-        taskMap: { [obsidianTaskId: string]: string },
-        currentObsidianTaskIds: Set<string>,
-        existingEvents: calendar_v3.Schema$Event[],
+        survivors: Map<string, calendar_v3.Schema$Event>,
+        matchedGIds: Set<string>,
         existingGIdSet: Set<string>,
+        managedIdSet: Set<string>,
+        eventById: Map<string, calendar_v3.Schema$Event>,
         batchRequests: BatchRequestItem[],
         settings: GoogleCalendarTasksSyncSettings,
         force: boolean
     ): void {
         console.time('Sync: Prepare Deletions');
-        this.prepareDeletionRequests(taskMap, currentObsidianTaskIds, existingEvents, existingGIdSet, batchRequests, settings, force);
+        this.prepareDeletionRequests(survivors, matchedGIds, existingGIdSet, managedIdSet, eventById, batchRequests, settings, force);
         console.timeEnd('Sync: Prepare Deletions');
     }
 
     private async processBatchRequests(
         batchRequests: BatchRequestItem[],
-        batchProcessor: BatchProcessor,
         taskMap: { [obsidianTaskId: string]: string },
         eventById: Map<string, calendar_v3.Schema$Event>,
         settings: GoogleCalendarTasksSyncSettings,
@@ -228,7 +299,7 @@ export class SyncLogic {
 
         if (batchRequests.length > 0) {
             const { results, created, updated, deleted, errors, skipped, metrics } =
-                await this.executeBatchesWithRetry(batchRequests, batchProcessor);
+                await this.executeBatchesWithRetry(batchRequests);
 
             createdCount += created;
             updatedCount += updated;
@@ -344,7 +415,7 @@ export class SyncLogic {
 
             if (fallbackInserts.length > 0) {
                 console.log(`再作成フォールバック: ${fallbackInserts.length} 件をPOST`);
-                const fb = await this.executeBatchesWithRetry(fallbackInserts, batchProcessor);
+                const fb = await this.executeBatchesWithRetry(fallbackInserts);
                 createdCount += fb.created;
                 updatedCount += fb.updated;
                 deletedCount += fb.deleted;
@@ -361,7 +432,7 @@ export class SyncLogic {
 
             if (fallbackNoIfMatch.length > 0) {
                 console.log(`412再試行(If-Match無): ${fallbackNoIfMatch.length} 件を再送`);
-                const fb2 = await this.executeBatchesWithRetry(fallbackNoIfMatch, batchProcessor);
+                const fb2 = await this.executeBatchesWithRetry(fallbackNoIfMatch);
                 createdCount += fb2.created;
                 updatedCount += fb2.updated;
                 deletedCount += fb2.deleted;
@@ -371,7 +442,7 @@ export class SyncLogic {
 
             if (fallbackDeleteNoIfMatch.length > 0) {
                 console.log(`412削除再試行(If-Match無): ${fallbackDeleteNoIfMatch.length} 件を再送`);
-                const fb3 = await this.executeBatchesWithRetry(fallbackDeleteNoIfMatch, batchProcessor);
+                const fb3 = await this.executeBatchesWithRetry(fallbackDeleteNoIfMatch);
                 createdCount += fb3.created;
                 updatedCount += fb3.updated;
                 deletedCount += fb3.deleted;
@@ -384,40 +455,17 @@ export class SyncLogic {
                     }
                 });
             }
-        } else if (isManualSync && settings.syncNoticeSettings.showManualSyncProgress) {
-            new Notice('変更なし。', 2000);
+        }
+
+        const sns = settings.syncNoticeSettings ?? { showManualSyncProgress: false, showAutoSyncSummary: true, minSyncDurationForNotice: 1, showErrors: true };
+        if (isManualSync && sns.showManualSyncProgress) {
+            const noChanges = (createdCount + updatedCount + deletedCount) === 0;
+            if (noChanges) new Notice('変更なし。', 2000);
         }
 
         return { createdCount, updatedCount, deletedCount, skippedCount, errorCount };
     }
 
-    private mapGoogleEvents(
-        existingEvents: calendar_v3.Schema$Event[],
-        taskMap: { [obsidianTaskId: string]: string }
-    ): Map<string, calendar_v3.Schema$Event> {
-        const googleEventMap = new Map<string, calendar_v3.Schema$Event>();
-        existingEvents.forEach(event => {
-            const obsId = event.extendedProperties?.private?.['obsidianTaskId'];
-            const gcalId = event.id;
-
-            if (event.status === 'cancelled') return;
-
-            if (obsId && gcalId) {
-                const prev = googleEventMap.get(obsId);
-                if (!prev) {
-                    googleEventMap.set(obsId, event);
-                } else {
-                    const a = prev.updated ? DateUtils.parseDate(prev.updated) : DateUtils.parseDate('1970-01-01');
-                    const b = event.updated ? DateUtils.parseDate(event.updated) : DateUtils.parseDate('1970-01-01');
-                    if (b.isAfter(a)) googleEventMap.set(obsId, event);
-                }
-                if (!taskMap[obsId] || taskMap[obsId] !== gcalId) {
-                    taskMap[obsId] = gcalId;
-                }
-            }
-        });
-        return googleEventMap;
-    }
 
     private prepareBatchRequests(
         obsidianTasks: ObsidianTask[],
@@ -428,13 +476,15 @@ export class SyncLogic {
         settings: GoogleCalendarTasksSyncSettings,
         force: boolean = false,
         dedupeIndex?: Map<string, calendar_v3.Schema$Event>
-    ): { currentObsidianTaskIds: Set<string>, skipped: number } {
-        const currentObsidianTaskIds = new Set<string>();
+    ): { skipped: number, survivors: Map<string, calendar_v3.Schema$Event>, matchedGIds: Set<string> } {
         let skippedCount = 0;
         const calendarPath = `/calendar/v3/calendars/${encodeURIComponent(settings.calendarId)}/events`;
+        
+        // サバイバー方式: 照合済みを除外して残りを削除候補に
+        const survivors = new Map(googleEventMap);
+        const matchedGIds = new Set<string>();
 
         for (const task of obsidianTasks) {
-            currentObsidianTaskIds.add(task.id);
             const obsId = task.id;
 
             if (!task.startDate || !task.dueDate) {
@@ -444,8 +494,10 @@ export class SyncLogic {
 
             if (task.isCompleted) {
                 if (!force) {
-                    const existingEvent = googleEventMap.get(obsId);
+                    const existingEvent = survivors.get(obsId);
                     if (existingEvent) {
+                        survivors.delete(obsId); // 照合済みを除外
+                        if (existingEvent.id) matchedGIds.add(existingEvent.id);
                         const gcalId = existingEvent.id!;
                         const headers: Record<string, string> = {};
                         if (existingEvent.etag) headers['If-Match'] = existingEvent.etag;
@@ -463,7 +515,7 @@ export class SyncLogic {
             }
 
             const eventPayload = gcalMapper.mapObsidianTaskToGoogleEvent(task);
-            const existingEvent = googleEventMap.get(obsId);
+            const existingEvent = survivors.get(obsId); // ← O(1)照合はsurvivorsで
 
             if (force) {
                 // Google Calendar の events.insert は body.id を受け付けないため付与しない
@@ -473,6 +525,10 @@ export class SyncLogic {
             }
 
             if (existingEvent) {
+                // 照合済みは survivors から除外し、誤削除を防ぐ
+                survivors.delete(obsId);
+                if (existingEvent.id) matchedGIds.add(existingEvent.id);
+
                 if (this.needsUpdate(existingEvent, eventPayload)) {
                     const gcalId = existingEvent.id!;
                     // 展開条件: 日次時間帯 or 日付跨ぎの時間指定
@@ -545,14 +601,14 @@ export class SyncLogic {
                 }
             }
         }
-        return { currentObsidianTaskIds, skipped: skippedCount };
+        return { skipped: skippedCount, survivors, matchedGIds };
     }
 
     // 挿入時に必要なら日次スライスや毎日展開に分割
     private expandEventForInsertion(eventPayload: GoogleCalendarEventInput, task: ObsidianTask): GoogleCalendarEventInput[] {
         const out: GoogleCalendarEventInput[] = [];
-        const clone = (e: GoogleCalendarEventInput): GoogleCalendarEventInput => JSON.parse(JSON.stringify(e));
-        const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        const clone = cloneEventInput; // JSON.parse(JSON.stringify(...)) から高速なクローン関数に置換
+        const tz = this.localTz; // 関数外で一度だけ計算
 
         const ruleStr = (eventPayload.recurrence || [])[0] || '';
         const hasRecurrence = !!ruleStr;
@@ -755,10 +811,11 @@ export class SyncLogic {
     }
 
     private prepareDeletionRequests(
-        taskMap: { [obsidianTaskId: string]: string },
-        currentObsidianTaskIds: Set<string>,
-        existingGCalEvents: calendar_v3.Schema$Event[],
+        survivors: Map<string, calendar_v3.Schema$Event>,
+        matchedGIds: Set<string>,
         existingGIdSet: Set<string>,
+        managedIdSet: Set<string>,
+        eventById: Map<string, calendar_v3.Schema$Event>,
         batchRequests: BatchRequestItem[],
         settings: GoogleCalendarTasksSyncSettings,
         force: boolean = false
@@ -767,67 +824,61 @@ export class SyncLogic {
         const processed = new Set<string>();
 
         if (force) {
-            // [安全化] プラグイン管理対象 or taskMap が参照している ID のみ削除
-            const managedOrMapped = new Set<string>(Object.values(this.plugin.settings.taskMap || {}));
-            existingGCalEvents.forEach(event => {
-                if (!event.id) return;
-                const isManaged = event.extendedProperties?.private?.['isGcalSync'] === 'true';
-                const isMapped = managedOrMapped.has(event.id);
-                if (!(isManaged || isMapped)) return;
+            // ① 管理対象（isGcalSync=true）の全ID
+            for (const id of managedIdSet) {
+                const ev = eventById.get(id);
+                if (!ev || processed.has(id)) continue;
                 const headers: Record<string, string> = {};
-                if (event.etag) headers['If-Match'] = event.etag;
-                batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(event.id)}`, headers, obsidianTaskId: 'force-delete', operationType: 'delete', originalGcalId: event.id });
-                processed.add(event.id);
-            });
+                if (ev.etag) headers['If-Match'] = ev.etag;
+                batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(id)}`, headers, obsidianTaskId: 'force-delete', operationType: 'delete', originalGcalId: id });
+                processed.add(id);
+            }
+            // ② さらに taskMap が参照しているID（念のため）
+            for (const id of Object.values(this.plugin.settings.taskMap || {})) {
+                if (!id || processed.has(id)) continue;
+                const ev = eventById.get(id);
+                if (!ev) continue;
+                const headers: Record<string, string> = {};
+                if (ev.etag) headers['If-Match'] = ev.etag;
+                batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(id)}`, headers, obsidianTaskId: 'force-delete', operationType: 'delete', originalGcalId: id });
+                processed.add(id);
+            }
             return;
         }
 
-        // 現在のタスクが参照中の gId を収集
-        const gIdsInUseByCurrent = new Set<string>();
-        for (const id of currentObsidianTaskIds) {
-            const gid = taskMap[id];
-            if (gid) gIdsInUseByCurrent.add(gid);
-        }
-
-        const byId = new Map<string, calendar_v3.Schema$Event>();
-        existingGCalEvents.forEach(e => { if (e.id) byId.set(e.id, e); });
-
-        Object.entries(taskMap).forEach(([obsId, gId]) => {
-            if (!gId) return;
-            if (!currentObsidianTaskIds.has(obsId)) {
-                if (!existingGIdSet.has(gId)) {
-                    delete taskMap[obsId];
-                    return;
-                }
-                // 他の現行タスクが同じ gId を使用している場合は削除しない
-                if (gIdsInUseByCurrent.has(gId)) {
-                    delete taskMap[obsId]; // 古い片方のマップは掃除
-                    return;
-                }
-                if (!processed.has(gId)) {
-                    const ev = byId.get(gId);
-                    const headers: Record<string, string> = {};
-                    if (ev?.etag) headers['If-Match'] = ev.etag;
-                    batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(gId)}`, headers, obsidianTaskId: obsId, operationType: 'delete', originalGcalId: gId });
-                    processed.add(gId);
-                }
-            }
-        });
-
-        existingGCalEvents.forEach(event => {
-            const id = event.id;
-            const obsId = event.extendedProperties?.private?.['obsidianTaskId'];
-            if (id && event.extendedProperties?.private?.['isGcalSync'] === 'true' && !processed.has(id) && (!obsId || !taskMap[obsId])) {
-                if (gIdsInUseByCurrent.has(id)) return; // 現行タスクが参照中なら孤児扱いにしない
+        // サバイバー方式: 残ったイベントのみを削除候補として処理
+        if (!survivors) return; // 念のため
+        // Map 以外（配列/プレーンオブジェクト）で渡されても安全に走るよう正規化
+        const survivorEntries: Iterable<[string, calendar_v3.Schema$Event]> =
+            survivors instanceof Map
+                ? survivors
+                : Array.isArray(survivors as any)
+                    ? (survivors as any)
+                    : Object.entries((survivors as any) ?? {});
+        for (const [obsId, event] of survivorEntries) {
+            if (!event.id || !existingGIdSet.has(event.id)) continue;
+            
+            // 安全条件チェック
+            const isGcalSync = event.extendedProperties?.private?.['isGcalSync'] === 'true';
+            const isNotMatched = !matchedGIds.has(event.id);
+            
+            if (isGcalSync && isNotMatched && !processed.has(event.id)) {
                 const headers: Record<string, string> = {};
                 if (event.etag) headers['If-Match'] = event.etag;
-                batchRequests.push({ method: 'DELETE', path: `${calendarPath}/${encodeURIComponent(id)}`, headers, obsidianTaskId: obsId || 'orphan', operationType: 'delete', originalGcalId: id });
-                processed.add(id);
+                batchRequests.push({
+                    method: 'DELETE',
+                    path: `${calendarPath}/${encodeURIComponent(event.id)}`,
+                    headers,
+                    obsidianTaskId: obsId,
+                    operationType: 'delete',
+                    originalGcalId: event.id,
+                });
+                processed.add(event.id);
             }
-        });
+        }
     }
 
-    private async executeBatchesWithRetry(batchRequests: BatchRequestItem[], _batchProcessor: BatchProcessor): Promise<BatchResult> {
+    private async executeBatchesWithRetry(batchRequests: BatchRequestItem[]): Promise<BatchResult> {
         // 選択的リトライ: 成功/恒久失敗は確定し、403/429/5xx のみ再送
         const finalResults: BatchResponseItem[] = new Array(batchRequests.length);
         let created = 0, updated = 0, deleted = 0, errors = 0, skipped = 0;
@@ -846,10 +897,11 @@ export class SyncLogic {
         };
 
         // 設定: ハード上限/開始サイズ/並列度/SLA
-        const hardCap = Math.max(1, Math.min(1000, this.plugin.settings.maxBatchPerHttp ?? 50));
+        const API_BATCH_LIMIT = 50; // Google Calendar APIの公式上限
+        const hardCap = Math.max(1, Math.min(1000, this.plugin.settings.maxBatchPerHttp ?? 500));
         let subBatchSize = Math.min(
-            Math.max(1, this.plugin.settings.desiredBatchSize ?? this.plugin.settings.batchSize ?? 50),
-            hardCap
+            Math.max(1, this.plugin.settings.desiredBatchSize ?? this.plugin.settings.batchSize ?? 500),
+            Math.min(hardCap, API_BATCH_LIMIT) // Google API上限と設定値の小さい方
         );
         const step = Math.max(1, Math.floor(subBatchSize * 0.2)); // +20%
         const sla = this.plugin.settings.latencySLAms ?? 1500;
@@ -1040,7 +1092,11 @@ export class SyncLogic {
         const keyTime = (t?: calendar_v3.Schema$EventDateTime) => {
             if (!t) return 'N';
             if (t.date) return `D:${t.date}`; // 終日: exclusive end は比較側でも同じ仕様
-            if (t.dateTime) return `T:${moment(t.dateTime).toISOString(true)}`; // keep offset
+            if (t.dateTime) {
+                // タイムゾーン一貫性: 入力オフセットを保持してUTC固定で正規化
+                const m = moment.parseZone(t.dateTime);
+                return `T:${m.utc().format('YYYY-MM-DDTHH:mm:ss')}`; // UTC固定でオフセットなし
+            }
             return 'N';
         };
         const startK = keyTime(payload.start);
@@ -1059,7 +1115,11 @@ export class SyncLogic {
         const keyTime = (t?: calendar_v3.Schema$EventDateTime) => {
             if (!t) return 'N';
             if ((t as any).date) return `D:${(t as any).date}`;
-            if ((t as any).dateTime) return `T:${moment((t as any).dateTime).toISOString(true)}`;
+            if ((t as any).dateTime) {
+                // タイムゾーン一貫性: 入力オフセットを保持してUTC固定で正規化
+                const m = moment.parseZone((t as any).dateTime);
+                return `T:${m.utc().format('YYYY-MM-DDTHH:mm:ss')}`; // UTC固定でオフセットなし
+            }
             return 'N';
         };
         const startK = keyTime(ev.start);
@@ -1145,8 +1205,11 @@ export class SyncLogic {
         const newUseDefault = newPayload.reminders?.useDefault ?? true;
         if (oldUseDefault !== newUseDefault) return true;
         if (!newUseDefault) {
-            const oldOverrides = existingEvent.reminders?.overrides || [];
-            const newOverrides = newPayload.reminders?.overrides || [];
+            const sortRem = (a?: any[]) => (a||[]).slice()
+                .map(o => ({ method: o?.method || 'popup', minutes: o?.minutes ?? 0 }))
+                .sort((x, y) => (x.method.localeCompare(y.method) || x.minutes - y.minutes));
+            const oldOverrides = sortRem(existingEvent.reminders?.overrides);
+            const newOverrides = sortRem(newPayload.reminders?.overrides);
             if (oldOverrides.length !== newOverrides.length) return true;
             if (oldOverrides.some((o, i) => o.minutes !== newOverrides[i].minutes || o.method !== newOverrides[i].method)) return true;
         }
@@ -1185,8 +1248,11 @@ export class SyncLogic {
         const newUseDefault = newPayload.reminders?.useDefault ?? true;
         if (oldUseDefault !== newUseDefault) return true;
         if (!newUseDefault) {
-            const oldOverrides = existingEvent.reminders?.overrides || [];
-            const newOverrides = newPayload.reminders?.overrides || [];
+            const sortRem = (a?: any[]) => (a||[]).slice()
+                .map(o => ({ method: o?.method || 'popup', minutes: o?.minutes ?? 0 }))
+                .sort((x, y) => (x.method.localeCompare(y.method) || x.minutes - y.minutes));
+            const oldOverrides = sortRem(existingEvent.reminders?.overrides);
+            const newOverrides = sortRem(newPayload.reminders?.overrides);
             if (oldOverrides.length !== newOverrides.length) return true;
             if (oldOverrides.some((o, i) => o.minutes !== newOverrides[i].minutes || o.method !== newOverrides[i].method)) return true;
         }
@@ -1285,8 +1351,10 @@ export class SyncLogic {
     }
 
     // メトリクスのp50/p95/p99を計算して要約ログを出力
-    private logMetricsSummary(title: string, metrics: SyncMetrics): void {
-        const lat = metrics.batchLatenciesMs.slice().sort((a,b)=>a-b);
+    private logMetricsSummary(title: string, metrics: Partial<SyncMetrics>): void {
+        const lat = Array.isArray(metrics?.batchLatenciesMs)
+            ? metrics!.batchLatenciesMs!.slice().sort((a,b)=>a-b)
+            : [];
         const pct = (p: number) => {
             if (lat.length === 0) return 0;
             const idx = Math.min(lat.length - 1, Math.ceil((p/100)*lat.length)-1);
@@ -1297,9 +1365,12 @@ export class SyncLogic {
         const p99 = pct(99);
         const sum = lat.reduce((s,v)=>s+v,0);
         const avg = lat.length ? sum/lat.length : 0;
-        const sc = metrics.statusCounts;
-        const scStr = Object.keys(sc).sort().map(k=>`${k}:${sc[+k]}`).join(', ');
-        console.log(`[Metrics] ${title}: batches=${metrics.sentSubBatches}, attempts=${metrics.attempts}, waitMs=${metrics.totalWaitMs}, avg=${avg.toFixed(1)}ms, p50=${p50.toFixed(1)}ms, p95=${p95.toFixed(1)}ms, p99=${p99.toFixed(1)}ms, statuses={ ${scStr} }`);
+        const sc = metrics?.statusCounts ?? {};
+        const scStr = Object.keys(sc as any).sort().map(k=>`${k}:${(sc as any)[+k]}`).join(', ');
+        const sent = metrics?.sentSubBatches ?? 0;
+        const atmp = metrics?.attempts ?? 0;
+        const wait = metrics?.totalWaitMs ?? 0;
+        console.log(`[Metrics] ${title}: batches=${sent}, attempts=${atmp}, waitMs=${wait}, avg=${avg.toFixed(1)}ms, p50=${p50.toFixed(1)}ms, p95=${p95.toFixed(1)}ms, p99=${p99.toFixed(1)}ms, statuses={ ${scStr} }`);
     }
 
     // 重複整理（ドライラン/実行）
@@ -1390,8 +1461,7 @@ export class SyncLogic {
             return;
         }
 
-        const bp = new BatchProcessor(this.plugin.settings);
-        const result = await this.executeBatchesWithRetry(batch, bp);
+        const result = await this.executeBatchesWithRetry(batch);
         await this.plugin.saveData(this.plugin.settings); // 更新されたtaskMapを保存
         new Notice(`重複整理完了: 削除 ${result.deleted}, スキップ ${result.skipped}, エラー ${result.errors}`, 8000);
     }

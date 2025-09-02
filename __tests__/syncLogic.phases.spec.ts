@@ -8,7 +8,7 @@ const baseSettings = {
   includeReminderInIdentity: false,
   interBatchDelay: 0,
   desiredBatchSize: 5,
-  maxBatchPerHttp: 50,
+  maxBatchPerHttp: 500,
   maxInFlightBatches: 1,
   syncNoticeSettings: { showManualSyncProgress: false, showAutoSyncSummary: false, showErrors: false, minSyncDurationForNotice: 0 },
 };
@@ -56,8 +56,9 @@ describe('SyncLogic phase helpers', () => {
       deleted: 1,
       errors: 0,
       skipped: 0,
+      metrics: { sentSubBatches: 1, attempts: 1, retriedItems: 0, retryDelays: [] },
     });
-    const counts = await (sync as any).processBatchRequests(batchRequests, {} as any, taskMap, new Map(), plugin.settings, false);
+    const counts = await (sync as any).processBatchRequests(batchRequests, taskMap, new Map(), plugin.settings, false);
     expect(counts.createdCount).toBe(1);
     expect(counts.deletedCount).toBe(1);
     expect(taskMap['t1']).toBe('new1');
