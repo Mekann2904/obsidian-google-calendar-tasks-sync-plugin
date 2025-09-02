@@ -61,6 +61,10 @@ export class HttpServerManager {
 
                 if (error.code === 'EADDRINUSE') {
                     console.warn(`ポート ${portToTry} は使用中です。次のポート (${portToTry + 1}) を試します...`);
+                    try {
+                        newServer.close();
+                        console.log(`サーバーをクリーンアップしました: ポート ${portToTry}`);
+                    } catch {}
                     attemptListen(portToTry + 1);
                 } else if (error.code === 'EACCES') {
                     console.error(`ポート ${portToTry} へのバインドに権限がありません。`, error);
