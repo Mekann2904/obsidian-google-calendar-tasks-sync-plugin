@@ -1,3 +1,5 @@
+import { vi } from 'vitest';
+
 export class Notice {
   message: string;
   timeout?: number;
@@ -9,4 +11,6 @@ export class Notice {
 
 export type App = any;
 
+// Mocked HTTP helper to avoid outbound requests during tests
+export const requestUrl = vi.fn();
 
