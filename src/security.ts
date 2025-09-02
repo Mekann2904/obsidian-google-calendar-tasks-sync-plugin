@@ -66,9 +66,11 @@ export function obfuscateToBase64(plain: string, saltB64: string): string {
   const nonce = randomBytes(12);
   const data = Buffer.from(plain, 'utf8');
   const out = Buffer.allocUnsafe(data.length);
+  const counterBuf = Buffer.alloc(4);
   let counter = 0, offset = 0;
   while (offset < data.length) {
-    const block = createHash('sha256').update(key).update(nonce).update(Buffer.from([counter & 0xff])).digest();
+    counterBuf.writeUInt32BE(counter);
+    const block = createHash('sha256').update(key).update(nonce).update(counterBuf).digest();
     const n = Math.min(32, data.length - offset);
     for (let i=0;i<n;i++) out[offset + i] = data[offset + i] ^ block[i];
     offset += n; counter++;
@@ -89,9 +91,11 @@ export function deobfuscateFromBase64(obf: string, saltB64: string): string {
   const mac2 = createHmac('sha256', key).update('obf1|').update(nonce).update(body).digest();
   if (!cryptoTimingSafeEqual(mac, mac2)) throw new Error('MAC mismatch');
   const out = Buffer.allocUnsafe(body.length);
+  const counterBuf = Buffer.alloc(4);
   let counter = 0, offset = 0;
   while (offset < body.length) {
-    const block = createHash('sha256').update(key).update(nonce).update(Buffer.from([counter & 0xff])).digest();
+    counterBuf.writeUInt32BE(counter);
+    const block = createHash('sha256').update(key).update(nonce).update(counterBuf).digest();
     const n = Math.min(32, body.length - offset);
     for (let i=0;i<n;i++) out[offset + i] = body[offset + i] ^ block[i];
     offset += n; counter++;

@@ -53,6 +53,16 @@ describe('obfuscateToBase64/deobfuscateFromBase64', () => {
     const obf = obfuscateToBase64('hello', SALT).replace(/^obf1:/, 'xxx:');
     expect(() => deobfuscateFromBase64(obf, SALT)).toThrow('Invalid obfuscation format');
   });
+
+  it('does not repeat keystream blocks for large buffers', () => {
+    const plain = '\0'.repeat(9000);
+    const obf = obfuscateToBase64(plain, SALT);
+    const packed = Buffer.from(obf.slice('obf1:'.length), 'base64');
+    const body = packed.subarray(12 + 32);
+    const block0 = body.subarray(0, 32);
+    const block256 = body.subarray(256 * 32, 257 * 32);
+    expect(block0.equals(block256)).toBe(false);
+  });
 });
 
 describe('deobfuscateLegacyFromBase64', () => {
