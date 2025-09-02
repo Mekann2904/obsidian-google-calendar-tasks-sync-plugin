@@ -157,7 +157,7 @@ export class GCalApiService {
         do {
             console.log(`GCal イベントページ ${page} を取得中...${label}`);
             params.pageToken = nextPageToken;
-            const response: GaxiosResponse<calendar_v3.Schema$Events> = await this.eventsListWithRetry(params);
+            const response: GaxiosResponse<calendar_v3.Schema$Events> = await this.eventsListWithRetry({ ...params });
             if (response.data.items) events.push(...response.data.items);
             if (response.data.nextSyncToken) nextSyncToken = response.data.nextSyncToken;
             nextPageToken = response.data.nextPageToken ?? undefined;
