@@ -2,6 +2,7 @@ import { Notice } from 'obsidian';
 import * as http from 'http';
 import { URL } from 'url';
 import * as net from 'net';
+import { promises as dns } from 'dns';
 import GoogleCalendarTasksSyncPlugin from './main'; // main.ts からインポート
 
 export class HttpServerManager {
@@ -170,7 +171,24 @@ export class HttpServerManager {
 
         // Host ヘッダの厳密チェック（ローカル以外は拒否）
         const hostHdr = (req.headers.host || '').toLowerCase();
-        if (!/^127\.0\.0\.1:\d+$/.test(hostHdr)) {
+        let hostAllowed = false;
+
+        const hostMatch = hostHdr.match(/^(.+):(\d+)$/);
+        if (hostMatch) {
+            const hostname = hostMatch[1];
+            if (hostname === '127.0.0.1' || hostname === '[::1]') {
+                hostAllowed = true;
+            } else if (hostname === 'localhost') {
+                try {
+                    const addresses = await dns.lookup('localhost', { all: true });
+                    hostAllowed = addresses.some(a => a.address === '127.0.0.1' || a.address === '::1');
+                } catch {
+                    hostAllowed = false;
+                }
+            }
+        }
+
+        if (!hostAllowed) {
             res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
             res.end('Bad Request: Host not allowed');
             return;
