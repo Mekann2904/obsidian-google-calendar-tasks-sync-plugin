@@ -1,6 +1,14 @@
 // security.ts
 // 暗号化/難読化ユーティリティ（safeStorage は未使用）
-import { createHash, createHmac, randomBytes, createCipheriv, createDecipheriv, pbkdf2Sync } from 'crypto';
+import {
+  createHash,
+  createHmac,
+  randomBytes,
+  createCipheriv,
+  createDecipheriv,
+  pbkdf2Sync,
+  timingSafeEqual,
+} from 'crypto';
 import os from 'os';
 
 // ------------------ パスフレーズAES-GCM ------------------
@@ -38,9 +46,11 @@ const OBF1_MAGIC = 'obf1:';
 
 function cryptoTimingSafeEqual(a: Buffer, b: Buffer): boolean {
   if (a.length !== b.length) return false;
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { timingSafeEqual } = require('crypto') as typeof import('crypto');
-  try { return timingSafeEqual(a, b); } catch { return false; }
+  try {
+    return timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
 }
 
 function deriveKeyFromSalt(saltB64: string): Buffer {
