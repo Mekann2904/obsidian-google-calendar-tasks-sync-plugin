@@ -1,3 +1,4 @@
+import { performance } from 'perf_hooks';
 import { Notice } from 'obsidian';
 import { ErrorHandler, DateUtils, FingerprintUtils } from './commonUtils';
 import { rrulestr } from 'rrule';
