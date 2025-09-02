@@ -43,71 +43,74 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
     }
 
 
-	async onload() {
-		console.log('Google Calendar Sync プラグインをロード中');
-		await this.loadSettings();
-        setDevLogging(!!this.settings.devLogging);
+        async onload() {
+                console.log('Google Calendar Sync プラグインをロード中');
+                await this.loadSettings();
+                setDevLogging(!!this.settings.devLogging);
 
-        // 設定がロードされた後に、設定に依存するクラスをインスタンス化
-        this.syncLogic = new SyncLogic(this);
+                // 設定がロードされた後に、設定に依存するクラスをインスタンス化
+                this.syncLogic = new SyncLogic(this);
 
-		// useLoopbackServer の強制 (現在は不要だが念のため)
-		if (!this.settings.useLoopbackServer) {
-			console.log("'useLoopbackServer' を true に強制します (唯一のサポート方法)。");
-			this.settings.useLoopbackServer = true;
-		}
+                this.initializeOAuth();
+                await this.startHttpServer();
+                this.registerCommands();
+                this.addSettingTab(new GoogleCalendarSyncSettingTab(this.app, this));
+                this.setupAutoSync();
 
-		// OAuth クライアントと API クライアントの初期化
-		this.authService.reconfigureOAuthClient();
-		this.authService.initializeCalendarApi();
+                console.log('Google Calendar Sync プラグインがロードされました。');
+        }
 
-		// HTTP サーバーの起動
-		await this.httpServerManager.stopServer(); // 念のため既存を停止
-		this.httpServerManager.startServer();
+        private initializeOAuth(): void {
+                // useLoopbackServer の強制 (現在は不要だが念のため)
+                if (!this.settings.useLoopbackServer) {
+                        console.log("'useLoopbackServer' を true に強制します (唯一のサポート方法)。");
+                        this.settings.useLoopbackServer = true;
+                }
+                // OAuth クライアントと API クライアントの初期化
+                this.authService.reconfigureOAuthClient();
+                this.authService.initializeCalendarApi();
+        }
 
-		// コマンド登録
-		this.addCommand({
-			id: 'authenticate-with-google',
-			name: 'Google で認証する',
-			callback: () => this.authService.authenticate(),
-		});
+        private async startHttpServer(): Promise<void> {
+                await this.httpServerManager.stopServer(); // 念のため既存を停止
+                this.httpServerManager.startServer();
+        }
 
-		this.addCommand({
-			id: 'sync-tasks-now',
-			name: 'Google Calendar と今すぐタスクを同期する',
-			callback: async () => this.triggerSync(),
-		});
+        private registerCommands(): void {
+                this.addCommand({
+                        id: 'authenticate-with-google',
+                        name: 'Google で認証する',
+                        callback: () => this.authService.authenticate(),
+                });
 
-		// 重複整理（ドライラン）
-		this.addCommand({
-			id: 'dedupe-cleanup-dry-run',
-			name: '重複イベントを整理（ドライラン）',
-			callback: async () => {
-				if (this.isCurrentlySyncing()) { new Notice('処理中のため実行できない。'); return; }
-				await this.syncLogic.runDedupeCleanup(true);
-			}
-		});
+                this.addCommand({
+                        id: 'sync-tasks-now',
+                        name: 'Google Calendar と今すぐタスクを同期する',
+                        callback: async () => this.triggerSync(),
+                });
 
-		// 重複整理（実行）
-		this.addCommand({
-			id: 'dedupe-cleanup-exec',
-			name: '重複イベントを整理（実行）',
-			callback: async () => {
-				if (this.isCurrentlySyncing()) { new Notice('処理中のため実行できない。'); return; }
-				const ok = confirm('重複イベントの削除を実行しますか？ この操作は元に戻せません。');
-				if (!ok) return;
-				await this.syncLogic.runDedupeCleanup(false);
-			}
-		});
+                // 重複整理（ドライラン）
+                this.addCommand({
+                        id: 'dedupe-cleanup-dry-run',
+                        name: '重複イベントを整理（ドライラン）',
+                        callback: async () => {
+                                if (this.isCurrentlySyncing()) { new Notice('処理中のため実行できない。'); return; }
+                                await this.syncLogic.runDedupeCleanup(true);
+                        }
+                });
 
-		// 設定タブの追加
-		this.addSettingTab(new GoogleCalendarSyncSettingTab(this.app, this));
-
-		// 自動同期のセットアップ
-		this.setupAutoSync();
-
-		console.log('Google Calendar Sync プラグインがロードされました。');
-	}
+                // 重複整理（実行）
+                this.addCommand({
+                        id: 'dedupe-cleanup-exec',
+                        name: '重複イベントを整理（実行）',
+                        callback: async () => {
+                                if (this.isCurrentlySyncing()) { new Notice('処理中のため実行できない。'); return; }
+                                const ok = confirm('重複イベントの削除を実行しますか？ この操作は元に戻せません。');
+                                if (!ok) return;
+                                await this.syncLogic.runDedupeCleanup(false);
+                        }
+                });
+        }
 
 	async onunload() {
 		console.log('Google Calendar Sync プラグインをアンロード中');
@@ -322,8 +325,8 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
         await this.syncLogic.runSync(JSON.parse(JSON.stringify(this.settings)), { force: true });
     }
 
-	/** 自動同期を設定 */
-	setupAutoSync() {
+        /** 自動同期を設定 */
+        setupAutoSync() {
 		this.clearAutoSync();
 		if (this.settings.autoSync && this.settings.syncIntervalMinutes >= 1) {
 			const intervalMillis = this.settings.syncIntervalMinutes * 60 * 1000;
@@ -358,8 +361,8 @@ export default class GoogleCalendarTasksSyncPlugin extends Plugin {
         }
 	}
 
-	/** 自動同期を停止 */
-	clearAutoSync() {
+        /** 自動同期を停止 */
+        clearAutoSync() {
 		if (this.syncIntervalId !== null) {
 			window.clearInterval(this.syncIntervalId);
 			this.syncIntervalId = null;
